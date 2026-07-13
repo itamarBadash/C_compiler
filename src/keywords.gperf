@@ -1,0 +1,39 @@
+%{
+#include "token.h"
+#include <string.h>
+%}
+
+struct keyword_map {
+    const char *name;
+    token_type type;
+};
+
+%%
+break, TOKEN_BREAK
+case, TOKEN_CASE
+char, TOKEN_CHAR
+const, TOKEN_CONST
+continue, TOKEN_CONTINUE
+default, TOKEN_DEFAULT
+do, TOKEN_DO
+double, TOKEN_DOUBLE
+else, TOKEN_ELSE
+enum, TOKEN_ENUM
+extern, TOKEN_EXTERN
+float, TOKEN_FLOAT
+for, TOKEN_FOR
+if, TOKEN_IF
+int, TOKEN_INT
+long, TOKEN_LONG
+return, TOKEN_RETURN
+short, TOKEN_SHORT
+signed, TOKEN_SIGNED
+sizeof, TOKEN_SIZEOF
+static, TOKEN_STATIC
+struct, TOKEN_STRUCT
+switch, TOKEN_SWITCH
+typedef, TOKEN_TYPEDEF
+union, TOKEN_UNION
+unsigned, TOKEN_UNSIGNED
+void, TOKEN_VOID
+while, TOKEN_WHILE
