@@ -32,12 +32,21 @@ typedef enum token_type {
     TOKEN_DEFAULT,
     TOKEN_BREAK,
     TOKEN_CONTINUE,
+    TOKEN_GOTO,
+    TOKEN_ELLIPSIS,
 
     // Keywords - storage/qualifiers
     TOKEN_CONST,
     TOKEN_STATIC,
     TOKEN_EXTERN,
     TOKEN_TYPEDEF,
+    TOKEN_VOLATILE,
+    TOKEN_RESTRICT,
+    TOKEN_REGISTER,
+    TOKEN_INLINE,
+    TOKEN_COMPLEX,
+    TOKEN_IMAGINARY,
+    TOKEN_BOOL,
 
     // Keywords - composite types
     TOKEN_STRUCT,
@@ -65,6 +74,11 @@ typedef enum token_type {
     TOKEN_STAR_ASSIGN,      // *=
     TOKEN_SLASH_ASSIGN,     // /=
     TOKEN_PERCENT_ASSIGN,   // %=
+    TOKEN_AMPERSAND_ASSIGN, // &=
+    TOKEN_PIPE_ASSIGN,      // |=
+    TOKEN_CARET_ASSIGN,     // ^=
+    TOKEN_LSHIFT_ASSIGN,    // <<=
+    TOKEN_RSHIFT_ASSIGN,    // >>=
 
     // Comparison operators
     TOKEN_EQ,               // ==
@@ -83,6 +97,9 @@ typedef enum token_type {
     TOKEN_AMPERSAND,        // &
     TOKEN_PIPE,             // |
     TOKEN_TILDE,            // ~
+    TOKEN_CARET,            // ^
+    TOKEN_LSHIFT,           // <<
+    TOKEN_RSHIFT,           // >>
 
     // Member access
     TOKEN_DOT,              // .

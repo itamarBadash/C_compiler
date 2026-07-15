@@ -124,7 +124,43 @@ static token lexer_collect_string(lexer *lex) {
 static token lexer_collect_number(lexer *lex) {
     int start_position = lex->position;
 
-    while (isdigit(lex->current_char)) {
+    int has_dot = 0;
+    int is_hex = 0;
+    
+    if (lex->current_char == '0') {
+        char next = lex->source[lex->position + 1];
+        if (next == 'x' || next == 'X') {
+            is_hex = 1;
+            lexer_advance(lex); // consume '0'
+            lexer_advance(lex); // consume 'x'
+        }
+    }
+
+    while (1) {
+        char c = lex->current_char;
+        if (isdigit(c) || (is_hex && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))) {
+            lexer_advance(lex);
+        } else if (c == '.' && !has_dot) {
+            has_dot = 1;
+            lexer_advance(lex);
+        } else if ((!is_hex && (c == 'e' || c == 'E')) || (is_hex && (c == 'p' || c == 'P'))) {
+            // Exponent part
+            lexer_advance(lex);
+            if (lex->current_char == '+' || lex->current_char == '-') {
+                lexer_advance(lex);
+            }
+            // Exponent must have at least one digit
+            while (isdigit(lex->current_char)) {
+                lexer_advance(lex);
+            }
+            break; // Number ends after exponent
+        } else {
+            break; // Suffixes like 'f', 'u', 'l' can be appended
+        }
+    }
+    
+    // Consume suffixes (e.g., u, l, ll, f, F)
+    while (isalpha(lex->current_char)) {
         lexer_advance(lex);
     }
 
@@ -162,6 +198,22 @@ static token lexer_collect_identifier(lexer *lex) {
     token_type type;
     if (kw != NULL) {
         type = kw->type;
+    } else if (strcmp(temp_str, "goto") == 0) {
+        type = TOKEN_GOTO;
+    } else if (strcmp(temp_str, "volatile") == 0) {
+        type = TOKEN_VOLATILE;
+    } else if (strcmp(temp_str, "restrict") == 0) {
+        type = TOKEN_RESTRICT;
+    } else if (strcmp(temp_str, "register") == 0) {
+        type = TOKEN_REGISTER;
+    } else if (strcmp(temp_str, "inline") == 0) {
+        type = TOKEN_INLINE;
+    } else if (strcmp(temp_str, "_Complex") == 0) {
+        type = TOKEN_COMPLEX;
+    } else if (strcmp(temp_str, "_Imaginary") == 0) {
+        type = TOKEN_IMAGINARY;
+    } else if (strcmp(temp_str, "_Bool") == 0) {
+        type = TOKEN_BOOL;
     } else {
         type = TOKEN_IDENTIFIER;
     }
@@ -351,14 +403,33 @@ token lexer_next_token(lexer *lex)
             lexer_advance(lex);
         break;
         case '.':
-            tok = lexer_make_token(lex, TOKEN_DOT, ".");
+        if (lex->source[lex->position] == '.' && lex->source[lex->position+1] == '.') {
             lexer_advance(lex);
+            lexer_advance(lex);
+            lexer_advance(lex);
+            tok.type = TOKEN_ELLIPSIS;
+            tok.value = strdup("...");
+        } else {
+            tok.type = TOKEN_DOT;
+            tok.value = strdup(".");
+            lexer_advance(lex);
+        }
         break;
         case '<':
             if (lexer_peek (lex) == '=')
             {
                 tok = lexer_make_token (lex, TOKEN_LTE, "<=");
                 lexer_advance (lex);
+            }
+            else if (lexer_peek(lex) == '<') 
+            {
+                lexer_advance(lex);
+                if (lexer_peek(lex) == '=') {
+                    tok = lexer_make_token(lex, TOKEN_LSHIFT_ASSIGN, "<<=");
+                    lexer_advance(lex);
+                } else {
+                    tok = lexer_make_token(lex, TOKEN_LSHIFT, "<<");
+                }
             }
             else
             {
@@ -371,6 +442,16 @@ token lexer_next_token(lexer *lex)
             {
                 tok = lexer_make_token (lex, TOKEN_GTE, ">=");
                 lexer_advance (lex);
+            }
+            else if (lexer_peek(lex) == '>') 
+            {
+                lexer_advance(lex);
+                if (lexer_peek(lex) == '=') {
+                    tok = lexer_make_token(lex, TOKEN_RSHIFT_ASSIGN, ">>=");
+                    lexer_advance(lex);
+                } else {
+                    tok = lexer_make_token(lex, TOKEN_RSHIFT, ">>");
+                }
             }
             else
             {
@@ -396,6 +477,11 @@ token lexer_next_token(lexer *lex)
                 tok = lexer_make_token (lex, TOKEN_AND, "&&");
                 lexer_advance (lex);
             }
+            else if (lexer_peek(lex) == '=') 
+            {
+                tok = lexer_make_token(lex, TOKEN_AMPERSAND_ASSIGN, "&=");
+                lexer_advance(lex);
+            }
             else
             {
                 tok = lexer_make_token(lex, TOKEN_AMPERSAND, "&");
@@ -408,11 +494,25 @@ token lexer_next_token(lexer *lex)
                 tok = lexer_make_token (lex, TOKEN_OR, "||");
                 lexer_advance (lex);
             }
+            else if (lexer_peek(lex) == '=') 
+            {
+                tok = lexer_make_token(lex, TOKEN_PIPE_ASSIGN, "|=");
+                lexer_advance(lex);
+            }
             else
             {
                 tok = lexer_make_token(lex, TOKEN_PIPE, "|");
             }
         lexer_advance (lex);
+        break;
+        case '^':
+            if (lexer_peek(lex) == '=') {
+                tok = lexer_make_token(lex, TOKEN_CARET_ASSIGN, "^=");
+                lexer_advance(lex);
+            } else {
+                tok = lexer_make_token(lex, TOKEN_CARET, "^");
+            }
+            lexer_advance(lex);
         break;
         case '\'':
             tok = lexer_collect_char_literal(lex);
