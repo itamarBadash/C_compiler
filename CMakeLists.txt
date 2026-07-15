@@ -12,7 +12,12 @@ file(GLOB SOURCES "src/*.c")
 # 1. קובץ ההרצה המקורי שלנו - רק קבצי המקור, נקי לחלוטין מטסטים!
 add_executable(C_compiler ${SOURCES}
         include/token.h
-        include/lexer.h)
+        include/lexer.h
+        include/parser.h
+        src/parser.c
+        include/ast.h
+        src/ast.c
+)
 
 # ==========================================
 # --- תשתית הטסטים (GoogleTest) ---
@@ -37,3 +42,10 @@ target_link_libraries(LexerTests gtest_main)
 # 4. חשיפת הטסטים ל-CLion כדי שנוכל להריץ אותם מהממשק הגרפי
 include(GoogleTest)
 gtest_discover_tests(LexerTests)
+
+# ==========================================
+# 5. טסטים עבור ה-Parser
+# ==========================================
+add_executable(ParserTests tests/test_parser.cpp src/lexer.c src/lex_keywords.c src/parser.c src/ast.c)
+target_link_libraries(ParserTests gtest_main)
+gtest_discover_tests(ParserTests)
