@@ -17,6 +17,8 @@ add_executable(C_compiler ${SOURCES}
         src/parser.c
         include/ast.h
         src/ast.c
+        include/symbol_table.h
+        src/symbol_table.c
 )
 
 # ==========================================
@@ -49,3 +51,10 @@ gtest_discover_tests(LexerTests)
 add_executable(ParserTests tests/test_parser.cpp src/lexer.c src/lex_keywords.c src/parser.c src/ast.c)
 target_link_libraries(ParserTests gtest_main)
 gtest_discover_tests(ParserTests)
+
+# ==========================================
+# 6. טסטים עבור טבלת הסמלים (Symbol Table)
+# ==========================================
+add_executable(SymbolTableTests tests/test_symbol_table.cpp src/symbol_table.c src/ast.c)
+target_link_libraries(SymbolTableTests gtest_main)
+gtest_discover_tests(SymbolTableTests)
