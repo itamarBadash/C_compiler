@@ -3,8 +3,6 @@
 #include <string.h>
 static int is_type_token(parser *p);
 static ast_node* parse_var_decl(parser *p);
-ast_node *parse_expression (parser *p);
-ast_node *parse_assignment (parser *p);
 static int is_type_token(parser *p) {
   token_type type = p->current_token.type;
   if (type == TOKEN_INT || type == TOKEN_FLOAT || type == TOKEN_CHAR ||
