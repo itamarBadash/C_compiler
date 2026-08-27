@@ -403,7 +403,9 @@ token lexer_next_token(lexer *lex)
             lexer_advance(lex);
         break;
         case '.':
-        if (lex->source[lex->position] == '.' && lex->source[lex->position+1] == '.') {
+        if (isdigit((unsigned char)lexer_peek(lex))) {
+            tok = lexer_collect_number(lex);
+        } else if (lexer_peek(lex) == '.' && lex->source[lex->position + 2] == '.') {
             lexer_advance(lex);
             lexer_advance(lex);
             lexer_advance(lex);
@@ -522,7 +524,11 @@ token lexer_next_token(lexer *lex)
         break;
 
         default:
-            if (isalpha(lex->current_char) || lex->current_char == '_') {
+            if (lex->current_char == 'L' && (lexer_peek(lex) == '"' || lexer_peek(lex) == '\'')) {
+                lexer_advance(lex);
+                tok = (lex->current_char == '"') ? lexer_collect_string(lex)
+                                                 : lexer_collect_char_literal(lex);
+            } else if (isalpha(lex->current_char) || lex->current_char == '_') {
                 tok = lexer_collect_identifier(lex);
             } else if (isdigit(lex->current_char)) {
                 tok = lexer_collect_number(lex);

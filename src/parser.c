@@ -1,28 +1,33 @@
 #include "parser.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 static int is_type_token(parser *p);
 static ast_node* parse_var_decl(parser *p);
+static type_info* parse_declarator(parser *p, type_info *base_type, char **out_name);
+static int token_starts_type(parser *p, token tok) {
+  switch (tok.type) {
+    case TOKEN_INT: case TOKEN_FLOAT: case TOKEN_CHAR: case TOKEN_DOUBLE:
+    case TOKEN_VOID: case TOKEN_LONG: case TOKEN_SHORT: case TOKEN_UNSIGNED:
+    case TOKEN_SIGNED: case TOKEN_STRUCT: case TOKEN_UNION: case TOKEN_ENUM:
+    case TOKEN_CONST: case TOKEN_VOLATILE: case TOKEN_RESTRICT:
+    case TOKEN_COMPLEX: case TOKEN_IMAGINARY: case TOKEN_BOOL:
+      return 1;
+    case TOKEN_IDENTIFIER: {
+      symbol *sym = parser_lookup_symbol(p, tok.value);
+      return sym && sym->kind == SYMBOL_TYPEDEF;
+    }
+    default:
+      return 0;
+  }
+}
 static int is_type_token(parser *p) {
   token_type type = p->current_token.type;
-  if (type == TOKEN_INT || type == TOKEN_FLOAT || type == TOKEN_CHAR ||
-      type == TOKEN_DOUBLE || type == TOKEN_VOID || type == TOKEN_LONG ||
-      type == TOKEN_SHORT || type == TOKEN_UNSIGNED || type == TOKEN_SIGNED ||
-      type == TOKEN_STRUCT || type == TOKEN_UNION || type == TOKEN_ENUM ||
-      type == TOKEN_TYPEDEF || type == TOKEN_CONST || type == TOKEN_VOLATILE ||
-      type == TOKEN_RESTRICT || type == TOKEN_STATIC || type == TOKEN_EXTERN ||
-      type == TOKEN_REGISTER || type == TOKEN_INLINE ||
-      type == TOKEN_COMPLEX || type == TOKEN_IMAGINARY ||
-      type == TOKEN_BOOL) {
+  if (type == TOKEN_TYPEDEF || type == TOKEN_STATIC || type == TOKEN_EXTERN ||
+      type == TOKEN_REGISTER || type == TOKEN_INLINE) {
       return 1;
   }
-  if (type == TOKEN_IDENTIFIER) {
-      symbol *sym = parser_lookup_symbol(p, p->current_token.value);
-      if (sym && sym->kind == SYMBOL_TYPEDEF) {
-          return 1;
-      }
-  }
-  return 0;
+  return token_starts_type(p, p->current_token);
 }
 static token clone_token (token t)
 {
@@ -33,6 +38,15 @@ static token clone_token (token t)
   }
   return new_t;
 }
+void parser_error (parser *p, const char *message)
+{
+  if (!p) return;
+  p->had_error++;
+  fprintf (stderr, "%d:%d: error: %s (at '%s')\n",
+           p->current_token.line, p->current_token.column, message,
+           p->current_token.value ? p->current_token.value : "<eof>");
+}
+
 static type_info* clone_type_info(type_info *type) {
   if (!type) return NULL;
   type_info *new_type = create_type_info(type->kind);
@@ -56,6 +70,13 @@ static type_info* clone_type_info(type_info *type) {
     new_type->param_types = malloc(sizeof(type_info*) * type->param_count);
     for (int i = 0; i < type->param_count; i++) {
       new_type->param_types[i] = clone_type_info(type->param_types[i]);
+    }
+  }
+  if (type->param_names) {
+    new_type->param_count = type->param_count;
+    new_type->param_names = malloc(sizeof(char*) * type->param_count);
+    for (int i = 0; i < type->param_count; i++) {
+      new_type->param_names[i] = type->param_names[i] ? strdup(type->param_names[i]) : NULL;
     }
   }
   return new_type;
@@ -207,64 +228,172 @@ static type_info* parse_type_specifier(parser *p, ast_node **out_def) {
   return type;
 }
 
-static type_info* parse_declarator(parser *p, type_info *base_type, char **out_name) {
-  type_info *current_type = base_type;
-  
-  while (p->current_token.type == TOKEN_STAR) {
-    type_info *ptr = create_type_info(TYPE_POINTER);
+static int parse_param_list(parser *p, type_info *fn) {
+  if (p->current_token.type == TOKEN_RPAREN) {
     parser_advance(p);
+    return 1;
+  }
+
+  do {
+    if (p->current_token.type == TOKEN_ELLIPSIS) {
+      parser_advance(p);
+      fn->is_variadic = 1;
+      break;
+    }
+
+    type_info *p_base = parse_type_specifier(p, NULL);
+    if (!p_base) {
+      parser_error(p, "expected a parameter type");
+      return 0;
+    }
+
+    char *p_name = NULL;
+    type_info *p_type = parse_declarator(p, clone_type_info(p_base), &p_name);
+    free_type_info(p_base);
+    if (!p_type) {
+      free(p_name);
+      return 0;
+    }
+
+    fn->param_types = realloc(fn->param_types, sizeof(type_info*) * (fn->param_count + 1));
+    fn->param_names = realloc(fn->param_names, sizeof(char*) * (fn->param_count + 1));
+    fn->param_types[fn->param_count] = p_type;
+    fn->param_names[fn->param_count] = p_name;
+    fn->param_count++;
+
+    if (p->current_token.type != TOKEN_COMMA) break;
+    parser_advance(p);
+  } while (1);
+
+  if (fn->param_count == 1 && !fn->param_names[0] &&
+      fn->param_types[0]->kind == TYPE_PRIMITIVE &&
+      fn->param_types[0]->base_type.type == TOKEN_VOID) {
+    free_type_info(fn->param_types[0]);
+    free(fn->param_types); fn->param_types = NULL;
+    free(fn->param_names); fn->param_names = NULL;
+    fn->param_count = 0;
+  }
+
+  if (p->current_token.type != TOKEN_RPAREN) {
+    parser_error(p, "expected ')' after parameter list");
+    return 0;
+  }
+  parser_advance(p);
+  return 1;
+}
+
+static type_info* parse_declarator(parser *p, type_info *base_type, char **out_name) {
+  type_info *type = base_type;
+  if (out_name) *out_name = NULL;
+
+  while (p->current_token.type == TOKEN_STAR) {
+    parser_advance(p);
+    type_info *ptr = create_type_info(TYPE_POINTER);
     while (p->current_token.type == TOKEN_CONST || p->current_token.type == TOKEN_VOLATILE || p->current_token.type == TOKEN_RESTRICT) {
       if (p->current_token.type == TOKEN_CONST) ptr->is_const = 1;
       if (p->current_token.type == TOKEN_VOLATILE) ptr->is_volatile = 1;
       if (p->current_token.type == TOKEN_RESTRICT) ptr->is_restrict = 1;
       parser_advance(p);
     }
-    ptr->ptr_to = current_type;
-    current_type = ptr;
+    ptr->ptr_to = type;
+    type = ptr;
   }
 
-  if (p->current_token.type == TOKEN_IDENTIFIER) {
-    if (out_name) *out_name = strdup(p->current_token.value);
-    parser_advance(p);
-  } else {
-    if (out_name) *out_name = NULL;
-  }
+  type_info *placeholder = NULL;
+  type_info *inner = NULL;
 
-  type_info *arr_head = NULL;
-  type_info *arr_tail = NULL;
-
-  while (p->current_token.type == TOKEN_LBRACKET) {
+  if (p->current_token.type == TOKEN_LPAREN) {
     parser_advance(p);
-    type_info *arr = create_type_info(TYPE_ARRAY);
-    
-    if (p->current_token.type != TOKEN_RBRACKET) {
-      arr->array_size_expr = parse_expression(p);
-      if (arr->array_size_expr && arr->array_size_expr->type == AST_NODE_TYPE_NUMBER) {
-          arr->array_size = atoi(arr->array_size_expr->tok.value);
-      }
+    placeholder = create_type_info(TYPE_UNKNOWN);
+    inner = parse_declarator(p, placeholder, out_name);
+    if (!inner) {
+      free_type_info(type);
+      return NULL;
     }
-    
-    if (p->current_token.type != TOKEN_RBRACKET) {
-      free_type_info(arr);
+    if (p->current_token.type != TOKEN_RPAREN) {
+      parser_error(p, "expected ')' closing declarator");
+      free_type_info(inner);
+      free_type_info(type);
       return NULL;
     }
     parser_advance(p);
-    
-    if (!arr_head) {
-        arr_head = arr;
-        arr_tail = arr;
-    } else {
-        arr_tail->ptr_to = arr;
-        arr_tail = arr;
-    }
-  }
-  
-  if (arr_head) {
-      arr_tail->ptr_to = current_type;
-      current_type = arr_head;
+  } else if (p->current_token.type == TOKEN_IDENTIFIER) {
+    if (out_name) *out_name = strdup(p->current_token.value);
+    parser_advance(p);
   }
 
-  return current_type;
+  type_info *sfx_head = NULL;
+  type_info *sfx_tail = NULL;
+  int suffix_failed = 0;
+
+  while (p->current_token.type == TOKEN_LBRACKET || p->current_token.type == TOKEN_LPAREN) {
+    type_info *sfx;
+
+    if (p->current_token.type == TOKEN_LBRACKET) {
+      parser_advance(p);
+      sfx = create_type_info(TYPE_ARRAY);
+      while (p->current_token.type == TOKEN_CONST || p->current_token.type == TOKEN_VOLATILE ||
+             p->current_token.type == TOKEN_RESTRICT || p->current_token.type == TOKEN_STATIC) {
+        parser_advance(p);
+      }
+      if (p->current_token.type != TOKEN_RBRACKET) {
+        sfx->array_size_expr = parse_expression(p);
+        if (sfx->array_size_expr && sfx->array_size_expr->type == AST_NODE_TYPE_NUMBER) {
+          sfx->array_size = atoi(sfx->array_size_expr->tok.value);
+        }
+      }
+      if (p->current_token.type != TOKEN_RBRACKET) {
+        parser_error(p, "expected ']' after array size");
+        free_type_info(sfx);
+        suffix_failed = 1;
+        break;
+      }
+      parser_advance(p);
+    } else {
+      parser_advance(p);
+      sfx = create_type_info(TYPE_FUNCTION);
+      if (!parse_param_list(p, sfx)) {
+        free_type_info(sfx);
+        suffix_failed = 1;
+        break;
+      }
+    }
+
+    if (!sfx_head) { sfx_head = sfx; sfx_tail = sfx; }
+    else { sfx_tail->ptr_to = sfx; sfx_tail = sfx; }
+  }
+
+  if (suffix_failed) {
+    if (sfx_head) free_type_info(sfx_head);
+    free_type_info(type);
+    if (inner) free_type_info(inner);
+    return NULL;
+  }
+
+  if (sfx_head) {
+    sfx_tail->ptr_to = type;
+    type = sfx_head;
+  }
+
+  if (placeholder) {
+    if (inner == placeholder) {
+      free_type_info(placeholder);
+      return type;
+    }
+    type_info *it = inner;
+    while (it->ptr_to && it->ptr_to != placeholder) it = it->ptr_to;
+    if (it->ptr_to != placeholder) {
+      parser_error(p, "malformed declarator");
+      free_type_info(inner);
+      free_type_info(type);
+      return NULL;
+    }
+    it->ptr_to = type;
+    free_type_info(placeholder);
+    return inner;
+  }
+
+  return type;
 }
 
 static ast_node *parse_initializer(parser *p) {
@@ -336,8 +465,24 @@ static ast_node* parse_var_decl(parser *p) {
   do {
     char *name = NULL;
     type_info *decl_type = parse_declarator(p, clone_type_info(base_type), &name);
-    
-    if (!name) {
+
+    if (!decl_type) {
+      free(name);
+      break;
+    }
+
+    ast_node *bitfield_width = NULL;
+    if (p->current_token.type == TOKEN_COLON) {
+      parser_advance(p);
+      bitfield_width = parse_ternary(p);
+      if (!bitfield_width) {
+        free_type_info(decl_type);
+        free(name);
+        break;
+      }
+    }
+
+    if (!name && !bitfield_width) {
       free_type_info(decl_type);
       if (def_node && p->current_token.type == TOKEN_SEMICOLON) {
           parser_advance(p);
@@ -348,7 +493,7 @@ static ast_node* parse_var_decl(parser *p) {
       break;
     }
 
-    if (is_typedef) {
+    if (is_typedef && name) {
       parser_define_symbol(p, name, SYMBOL_TYPEDEF);
     }
 
@@ -362,6 +507,7 @@ static ast_node* parse_var_decl(parser *p) {
     decl->var_decl.type = decl_type;
     decl->var_decl.var_name = name;
     decl->var_decl.init_value = init_expr;
+    decl->var_decl.bitfield_width = bitfield_width;
     decl->var_decl.is_typedef = is_typedef;
 
     block->block.statements = realloc(block->block.statements, sizeof(ast_node*) * (block->block.count + 1));
@@ -375,6 +521,7 @@ static ast_node* parse_var_decl(parser *p) {
   } while (1);
 
   if (p->current_token.type != TOKEN_SEMICOLON) {
+    parser_error (p, "expected ';' after declaration");
     free_type_info(base_type);
     free_ast(block);
     if (def_node) free_ast(def_node);
@@ -415,6 +562,13 @@ static ast_node* parse_top_level_declaration(parser *p) {
   char *name = NULL;
   type_info *decl_type = parse_declarator(p, clone_type_info(base_type), &name);
 
+  if (!decl_type) {
+    free(name);
+    free_type_info(base_type);
+    if (def_node) free_ast(def_node);
+    return NULL;
+  }
+
   if (!name) {
     free_type_info(decl_type);
     free_type_info(base_type);
@@ -422,6 +576,7 @@ static ast_node* parse_top_level_declaration(parser *p) {
         parser_advance(p);
         return def_node;
     }
+    parser_error (p, "expected a name in this declaration");
     if (def_node) free_ast(def_node);
     return NULL;
   }
@@ -430,101 +585,50 @@ static ast_node* parse_top_level_declaration(parser *p) {
     parser_define_symbol(p, name, SYMBOL_TYPEDEF);
   }
 
-  // Is it a function definition?
-  if (p->current_token.type == TOKEN_LPAREN) {
-    parser_advance(p);
+  if (decl_type->kind == TYPE_FUNCTION) {
+    type_info *return_type = decl_type->ptr_to;
+    char **params = decl_type->param_names;
+    type_info **param_types = decl_type->param_types;
+    int param_count = decl_type->param_count;
+    int is_variadic = decl_type->is_variadic;
 
-    char **params = NULL;
-    type_info **param_types = NULL;
-    int param_count = 0;
+    decl_type->ptr_to = NULL;
+    decl_type->param_names = NULL;
+    decl_type->param_types = NULL;
+    decl_type->param_count = 0;
+    free_type_info(decl_type);
 
-    if (p->current_token.type != TOKEN_RPAREN) {
-      do {
-        type_info *p_base_type = parse_type_specifier(p, NULL);
-        if (!p_base_type) break;
+    if (return_type) return_type->is_variadic = is_variadic;
 
-        char *p_name = NULL;
-        type_info *p_decl_type = parse_declarator(p, clone_type_info(p_base_type), &p_name);
-        free_type_info(p_base_type);
-
-        if (p_decl_type) {
-          params = realloc(params, sizeof(char*) * (param_count + 1));
-          param_types = realloc(param_types, sizeof(type_info*) * (param_count + 1));
-          params[param_count] = p_name; // Could be NULL for anonymous parameters
-          param_types[param_count] = p_decl_type;
-          param_count++;
-        } else {
-          if (p_name) free(p_name);
-          break;
-        }
-
-        if (p->current_token.type == TOKEN_COMMA) {
-            parser_advance(p);
-            if (p->current_token.type == TOKEN_ELLIPSIS) {
-                parser_advance(p);
-                decl_type->is_variadic = 1;
-                break;
-            }
-        } else {
-            break;
-        }
-      } while (1);
-    }
-
-    if (p->current_token.type != TOKEN_RPAREN) {
-      free_type_info(base_type);
-      free_type_info(decl_type);
-      free(name);
-      for(int i = 0; i < param_count; i++) { free(params[i]); free_type_info(param_types[i]); }
-      free(params); free(param_types);
-      return NULL;
-    }
-    parser_advance(p);
-
+    ast_node *body = NULL;
     if (p->current_token.type == TOKEN_SEMICOLON) {
       parser_advance(p);
-      // For now, prototype parsed as function def with no body
-      ast_node *node = create_ast_node(AST_NODE_TYPE_FUNCTION_DEF);
-      node->function_def.name = name;
-      node->function_def.return_type = decl_type;
-      node->function_def.parameters = params;
-      node->function_def.param_types = param_types;
-      node->function_def.param_count = param_count;
-      node->function_def.body = NULL;
-      free_type_info(base_type);
-      
-      if (def_node) {
-          ast_node *b = create_ast_node(AST_NODE_TYPE_BLOCK);
-          b->block.count = 2;
-          b->block.statements = malloc(sizeof(ast_node*) * 2);
-          b->block.statements[0] = def_node;
-          b->block.statements[1] = node;
-          return b;
+    } else {
+      int errors_before = p->had_error;
+      body = parse_block(p);
+      if (!body) {
+        if (p->had_error == errors_before)
+          parser_error(p, "expected ';' or a function body");
+        free_type_info(base_type);
+        free_type_info(return_type);
+        free(name);
+        for (int i = 0; i < param_count; i++) { free(params[i]); free_type_info(param_types[i]); }
+        free(params); free(param_types);
+        if (def_node) free_ast(def_node);
+        return NULL;
       }
-      return node;
-    }
-
-    ast_node *body = parse_block(p);
-    if (!body) {
-      free_type_info(base_type);
-      free_type_info(decl_type);
-      free(name);
-      for(int i = 0; i < param_count; i++) { free(params[i]); free_type_info(param_types[i]); }
-      free(params); free(param_types);
-      if (def_node) free_ast(def_node);
-      return NULL;
     }
 
     ast_node *node = create_ast_node(AST_NODE_TYPE_FUNCTION_DEF);
     node->function_def.name = name;
-    node->function_def.return_type = decl_type;
+    node->function_def.return_type = return_type;
     node->function_def.parameters = params;
     node->function_def.param_types = param_types;
     node->function_def.param_count = param_count;
     node->function_def.body = body;
 
     free_type_info(base_type);
-    
+
     if (def_node) {
         ast_node *b = create_ast_node(AST_NODE_TYPE_BLOCK);
         b->block.count = 2;
@@ -579,6 +683,7 @@ static ast_node* parse_top_level_declaration(parser *p) {
     }
 
     if(p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error (p, "expected ';' after declaration");
       free_type_info(base_type);
       free_ast(block);
       if (def_node) free_ast(def_node);
@@ -673,6 +778,7 @@ void parser_init (parser *p, lexer *lex)
   if (!p || !lex) return;
   p->lex = lex;
   p->current_scope = NULL;
+  p->had_error = 0;
   parser_enter_scope(p);
   p->current_token = lexer_next_token (lex);
   p->next_token = lexer_next_token (lex);
@@ -765,6 +871,19 @@ ast_node *parse_primary (parser *p)
       ast_node *node = create_ast_node (AST_NODE_TYPE_STRING);
       node->tok = clone_token (p->current_token);
       parser_advance (p);
+      while (p->current_token.type == TOKEN_STRING)
+      {
+        size_t have = node->tok.value ? strlen (node->tok.value) : 0;
+        size_t add = p->current_token.value ? strlen (p->current_token.value) : 0;
+        char *joined = malloc (have + add + 1);
+        if (!joined) break;
+        if (node->tok.value) memcpy (joined, node->tok.value, have);
+        if (p->current_token.value) memcpy (joined + have, p->current_token.value, add);
+        joined[have + add] = '\0';
+        free (node->tok.value);
+        node->tok.value = joined;
+        parser_advance (p);
+      }
       return node;
     }
     case TOKEN_CHAR_LITERAL:
@@ -780,13 +899,15 @@ ast_node *parse_primary (parser *p)
       ast_node *node = parse_expression (p);
       if (p->current_token.type != TOKEN_RPAREN)
       {
-        // Handle error: expected closing parenthesis
+        parser_error (p, "expected ')' to close parenthesised expression");
+        free_ast (node);
         return NULL;
       }
       parser_advance (p);
       return node;
     }
     default:
+      parser_error (p, "expected an expression");
       return NULL;
   }
 }
@@ -1007,7 +1128,7 @@ ast_node *parse_block (parser *p)
 {
   if (p->current_token.type != TOKEN_LBRACE)
   {
-    // Handle error: expected opening brace
+    parser_error (p, "expected '{' to open a block");
     return NULL;
   }
   parser_advance (p);
@@ -1031,7 +1152,6 @@ ast_node *parse_block (parser *p)
     }
     else
     {
-      // Handle error: failed to parse statement
       parser_leave_scope(p);
       free_ast (node);
       return NULL;
@@ -1042,7 +1162,7 @@ ast_node *parse_block (parser *p)
 
   if (p->current_token.type != TOKEN_RBRACE)
   {
-    // Handle error: expected closing brace
+    parser_error (p, "expected '}' to close a block");
     free_ast (node);
     return NULL;
   }
@@ -1060,14 +1180,24 @@ ast_node *parse_statement (parser *p)
 
   switch (p->current_token.type)
   {
+    case TOKEN_SEMICOLON:
+    {
+      parser_advance (p);
+      ast_node *node = create_ast_node (AST_NODE_TYPE_EMPTY);
+      return node;
+    }
     case TOKEN_RETURN:
     {
       parser_advance (p);
       ast_node *node = create_ast_node (AST_NODE_TYPE_RETURN);
-      node->return_stmt.return_value = parse_expression (p);
       if (p->current_token.type != TOKEN_SEMICOLON)
       {
-        // Handle error: expected semicolon
+        node->return_stmt.return_value = parse_expression (p);
+      }
+      if (p->current_token.type != TOKEN_SEMICOLON)
+      {
+        parser_error (p, "expected ';' after return statement");
+        free_ast (node);
         return NULL;
       }
       parser_advance (p);
@@ -1080,14 +1210,14 @@ ast_node *parse_statement (parser *p)
       parser_advance (p);
       if (p->current_token.type != TOKEN_LPAREN)
       {
-        // Handle error: expected '(' after 'if'
+        parser_error (p, "expected '(' after 'if'");
         return NULL;
       }
       parser_advance (p);
       ast_node *condition = parse_expression (p);
       if (p->current_token.type != TOKEN_RPAREN)
       {
-        // Handle error: expected ')' after condition
+        parser_error (p, "expected ')' after condition");
         return NULL;
       }
       parser_advance (p);
@@ -1110,14 +1240,14 @@ ast_node *parse_statement (parser *p)
       parser_advance (p);
       if (p->current_token.type != TOKEN_LPAREN)
       {
-        // Handle error: expected '(' after 'while'
+        parser_error (p, "expected '(' after 'while'");
         return NULL;
       }
       parser_advance (p);
       ast_node *condition = parse_expression (p);
       if (p->current_token.type != TOKEN_RPAREN)
       {
-        // Handle error: expected ')' after condition
+        parser_error (p, "expected ')' after condition");
         return NULL;
       }
       parser_advance (p);
@@ -1134,7 +1264,7 @@ ast_node *parse_statement (parser *p)
       parser_advance (p);
       if (p->current_token.type != TOKEN_LPAREN)
       {
-        // Handle error: expected '(' after 'for'
+        parser_error (p, "expected '(' after 'for'");
         return NULL;
       }
       parser_advance (p);
@@ -1150,7 +1280,7 @@ ast_node *parse_statement (parser *p)
         }
         if (p->current_token.type != TOKEN_SEMICOLON)
         {
-          // Handle error: expected ';' after init
+          parser_error (p, "expected ';' after the initialiser in 'for'");
           return NULL;
         }
         parser_advance (p);
@@ -1164,7 +1294,7 @@ ast_node *parse_statement (parser *p)
       }
       if (p->current_token.type != TOKEN_SEMICOLON)
       {
-        // Handle error: expected ';' after condition
+        parser_error (p, "expected ';' after the condition in 'for'");
         return NULL;
       }
       parser_advance (p);
@@ -1177,7 +1307,7 @@ ast_node *parse_statement (parser *p)
       }
       if (p->current_token.type != TOKEN_RPAREN)
       {
-        // Handle error: expected ')' after increment
+        parser_error (p, "expected ')' after the increment in 'for'");
         return NULL;
       }
       parser_advance (p);
@@ -1197,14 +1327,14 @@ ast_node *parse_statement (parser *p)
     {
       parser_advance (p);
       ast_node *body = parse_statement (p);
-      if (p->current_token.type != TOKEN_WHILE) return NULL;
+      if (p->current_token.type != TOKEN_WHILE) { parser_error (p, "expected 'while' after the body of 'do'"); return NULL; }
       parser_advance (p);
-      if (p->current_token.type != TOKEN_LPAREN) return NULL;
+      if (p->current_token.type != TOKEN_LPAREN) { parser_error (p, "expected '(' after 'while'"); return NULL; }
       parser_advance (p);
       ast_node *condition = parse_expression (p);
-      if (p->current_token.type != TOKEN_RPAREN) return NULL;
+      if (p->current_token.type != TOKEN_RPAREN) { parser_error (p, "expected ')' after condition"); return NULL; }
       parser_advance (p);
-      if (p->current_token.type != TOKEN_SEMICOLON) return NULL;
+      if (p->current_token.type != TOKEN_SEMICOLON) { parser_error (p, "expected ';' after 'do ... while (...)'"); return NULL; }
       parser_advance (p);
       
       ast_node *node = create_ast_node (AST_NODE_TYPE_DO_WHILE);
@@ -1216,10 +1346,10 @@ ast_node *parse_statement (parser *p)
     case TOKEN_SWITCH:
     {
       parser_advance (p);
-      if (p->current_token.type != TOKEN_LPAREN) return NULL;
+      if (p->current_token.type != TOKEN_LPAREN) { parser_error (p, "expected '(' after 'switch'"); return NULL; }
       parser_advance (p);
       ast_node *condition = parse_expression (p);
-      if (p->current_token.type != TOKEN_RPAREN) return NULL;
+      if (p->current_token.type != TOKEN_RPAREN) { parser_error (p, "expected ')' after the switch expression"); return NULL; }
       parser_advance (p);
       ast_node *body = parse_statement (p);
       
@@ -1233,7 +1363,7 @@ ast_node *parse_statement (parser *p)
     {
       parser_advance (p);
       ast_node *value = parse_expression (p);
-      if (p->current_token.type != TOKEN_COLON) return NULL;
+      if (p->current_token.type != TOKEN_COLON) { parser_error (p, "expected ':' after the case label"); free_ast (value); return NULL; }
       parser_advance (p);
       ast_node *body = parse_statement (p);
       
@@ -1246,10 +1376,10 @@ ast_node *parse_statement (parser *p)
     case TOKEN_DEFAULT:
     {
       parser_advance (p);
-      if (p->current_token.type != TOKEN_COLON) return NULL;
+      if (p->current_token.type != TOKEN_COLON) { parser_error (p, "expected ':' after 'default'"); return NULL; }
       parser_advance (p);
       ast_node *body = parse_statement (p);
-      
+
       ast_node *node = create_ast_node (AST_NODE_TYPE_DEFAULT);
       node->default_stmt.body = body;
       return node;
@@ -1258,11 +1388,12 @@ ast_node *parse_statement (parser *p)
     case TOKEN_GOTO:
     {
       parser_advance (p);
-      if (p->current_token.type != TOKEN_IDENTIFIER) return NULL;
+      if (p->current_token.type != TOKEN_IDENTIFIER) { parser_error (p, "expected a label name after 'goto'"); return NULL; }
       ast_node *node = create_ast_node(AST_NODE_TYPE_GOTO);
       node->goto_stmt.label_name = strdup(p->current_token.value);
       parser_advance (p);
       if (p->current_token.type != TOKEN_SEMICOLON) {
+          parser_error (p, "expected ';' after 'goto'");
           free_ast(node);
           return NULL;
       }
@@ -1273,7 +1404,7 @@ ast_node *parse_statement (parser *p)
     case TOKEN_BREAK:
     {
       parser_advance (p);
-      if (p->current_token.type != TOKEN_SEMICOLON) return NULL;
+      if (p->current_token.type != TOKEN_SEMICOLON) { parser_error (p, "expected ';' after 'break'"); return NULL; }
       parser_advance (p);
       return create_ast_node (AST_NODE_TYPE_BREAK);
     }
@@ -1281,7 +1412,7 @@ ast_node *parse_statement (parser *p)
     case TOKEN_CONTINUE:
     {
       parser_advance (p);
-      if (p->current_token.type != TOKEN_SEMICOLON) return NULL;
+      if (p->current_token.type != TOKEN_SEMICOLON) { parser_error (p, "expected ';' after 'continue'"); return NULL; }
       parser_advance (p);
       return create_ast_node (AST_NODE_TYPE_CONTINUE);
     }
@@ -1300,7 +1431,8 @@ ast_node *parse_statement (parser *p)
       ast_node *node = parse_expression (p);
       if (p->current_token.type != TOKEN_SEMICOLON)
       {
-        // Handle error: expected semicolon
+        parser_error (p, "expected ';' after expression statement");
+        free_ast (node);
         return NULL;
       }
       parser_advance (p);
@@ -1409,14 +1541,7 @@ static type_info* parse_type_name(parser *p) {
 ast_node *parse_unary (parser *p)
 {
   if (p->current_token.type == TOKEN_LPAREN) {
-    int next_is_type = 0;
-    token_type t = p->next_token.type;
-    if (t == TOKEN_INT || t == TOKEN_FLOAT || t == TOKEN_CHAR || t == TOKEN_DOUBLE || t == TOKEN_VOID || t == TOKEN_LONG || t == TOKEN_SHORT || t == TOKEN_UNSIGNED || t == TOKEN_SIGNED || t == TOKEN_STRUCT || t == TOKEN_ENUM) {
-        next_is_type = 1;
-    } else if (t == TOKEN_IDENTIFIER) {
-        symbol *sym = parser_lookup_symbol(p, p->next_token.value);
-        if (sym && sym->kind == SYMBOL_TYPEDEF) next_is_type = 1;
-    }
+    int next_is_type = token_starts_type(p, p->next_token);
 
     if (next_is_type) {
         parser_advance(p); // Consume '('
@@ -1448,14 +1573,7 @@ ast_node *parse_unary (parser *p)
     parser_advance(p);
 
     if (p->current_token.type == TOKEN_LPAREN) {
-        int next_is_type = 0;
-        token_type t = p->next_token.type;
-        if (t == TOKEN_INT || t == TOKEN_FLOAT || t == TOKEN_CHAR || t == TOKEN_DOUBLE || t == TOKEN_VOID || t == TOKEN_LONG || t == TOKEN_SHORT || t == TOKEN_UNSIGNED || t == TOKEN_SIGNED || t == TOKEN_STRUCT || t == TOKEN_ENUM) {
-            next_is_type = 1;
-        } else if (t == TOKEN_IDENTIFIER) {
-            symbol *sym = parser_lookup_symbol(p, p->next_token.value);
-            if (sym && sym->kind == SYMBOL_TYPEDEF) next_is_type = 1;
-        }
+        int next_is_type = token_starts_type(p, p->next_token);
 
         if (next_is_type) {
             parser_advance(p); // '('
@@ -1507,6 +1625,22 @@ ast_node *parse_unary (parser *p)
     return parse_postfix (p);
   }
 }
+static void parser_recover_top_level(parser *p) {
+  int depth = 0;
+  while (p->current_token.type != TOKEN_EOF) {
+    if (p->current_token.type == TOKEN_LBRACE) {
+      depth++;
+    } else if (p->current_token.type == TOKEN_RBRACE) {
+      if (depth > 0) depth--;
+      if (depth == 0) { parser_advance(p); return; }
+    } else if (p->current_token.type == TOKEN_SEMICOLON && depth == 0) {
+      parser_advance(p);
+      return;
+    }
+    parser_advance(p);
+  }
+}
+
 ast_node *parse_program(parser *p) {
   if(!p) return NULL;
 
@@ -1514,8 +1648,11 @@ ast_node *parse_program(parser *p) {
   prog_node->program.declarations = NULL;
   prog_node->program.count = 0;
 
+  int stray_reported = 0;
+
   while (p->current_token.type != TOKEN_EOF) {
     if (is_type_token(p) || p->current_token.type == TOKEN_TYPEDEF) {
+      stray_reported = 0;
       ast_node *decl = parse_top_level_declaration(p);
       if (decl) {
         ast_node **temp = realloc(prog_node->program.declarations,
@@ -1525,9 +1662,13 @@ ast_node *parse_program(parser *p) {
           prog_node->program.declarations[prog_node->program.count++] = decl;
         }
       } else {
-        parser_advance(p);
+        parser_recover_top_level(p);
       }
     } else {
+      if (!stray_reported) {
+        parser_error(p, "expected a declaration at file scope");
+        stray_reported = 1;
+      }
       parser_advance(p);
     }
   }

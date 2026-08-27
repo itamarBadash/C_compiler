@@ -2,7 +2,7 @@
 #define _AST_H_
 #include "token.h"
 typedef enum ast_node_type {
-    AST_NODE_TYPE_UNKNOWN,
+    AST_NODE_TYPE_EMPTY,
     AST_NODE_TYPE_PROGRAM,
     AST_NODE_TYPE_NUMBER,
     AST_NODE_TYPE_IDENTIFIER,
@@ -65,6 +65,7 @@ typedef struct type_info {
     int array_size; // For arrays (-1 if unspecified)
     struct ast_node *array_size_expr; // For Variable Length Arrays (VLAs)
     struct type_info **param_types; // For functions
+    char **param_names;
     int param_count; // For functions
     int is_variadic; // For functions (e.g. printf)
 } type_info;
@@ -139,6 +140,7 @@ typedef struct ast_node {
             struct type_info *type;
             char *var_name;
             struct ast_node *init_value;
+            struct ast_node *bitfield_width;
             int is_typedef;
         } var_decl;
 

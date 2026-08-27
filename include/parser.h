@@ -25,6 +25,7 @@ typedef struct parser {
     token current_token;
     token next_token;
     scope *current_scope;
+    int had_error;
 } parser;
 
 void parser_init(parser *p, lexer *lex);
@@ -35,6 +36,7 @@ void parser_enter_scope(parser *p);
 void parser_leave_scope(parser *p);
 void parser_define_symbol(parser *p, const char *name, symbol_kind kind);
 symbol* parser_lookup_symbol(parser *p, const char *name);
+void parser_error(parser *p, const char *message);
 
 ast_node* parse_primary(parser *p);
 ast_node* parse_postfix(parser *p);
