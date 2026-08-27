@@ -127,6 +127,7 @@ void free_ast(ast_node *node) {
         free(node->var_decl.var_name);
       }
       free_ast(node->var_decl.init_value);
+      free_ast(node->var_decl.bitfield_width);
       break;
     case AST_NODE_TYPE_PROGRAM:
       if (node->program.declarations != NULL) {
@@ -236,7 +237,7 @@ void free_ast(ast_node *node) {
       free_ast(node->label_stmt.statement);
       break;
 
-    case AST_NODE_TYPE_UNKNOWN:
+    case AST_NODE_TYPE_EMPTY:
     default:
       break;
   }
@@ -266,6 +267,12 @@ void free_type_info(type_info *type) {
       free_type_info(type->param_types[i]);
     }
     free(type->param_types);
+  }
+  if (type->param_names) {
+    for (int i = 0; i < type->param_count; i++) {
+      free(type->param_names[i]);
+    }
+    free(type->param_names);
   }
   if (type->array_size_expr) {
       free_ast(type->array_size_expr);
