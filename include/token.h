@@ -1,129 +1,134 @@
 #ifndef _TOKEN_H_
 #define _TOKEN_H_
 typedef enum token_type {
-    TOKEN_EOF,
+  TOKEN_EOF,
 
-    // Literals and identifiers
-    TOKEN_IDENTIFIER,
-    TOKEN_NUMBER,
-    TOKEN_STRING,
-    TOKEN_CHAR_LITERAL,
+  // Literals and identifiers
+  TOKEN_IDENTIFIER,
+  TOKEN_NUMBER,
+  TOKEN_STRING,
+  TOKEN_CHAR_LITERAL,
+  TOKEN_WIDE_STRING,
+  TOKEN_WIDE_CHAR,
 
-    // Keywords - types
-    TOKEN_INT,
-    TOKEN_VOID,
-    TOKEN_CHAR,
-    TOKEN_FLOAT,
-    TOKEN_DOUBLE,
-    TOKEN_LONG,
-    TOKEN_SHORT,
-    TOKEN_UNSIGNED,
-    TOKEN_SIGNED,
+  // Keywords - types
+  TOKEN_INT,
+  TOKEN_VOID,
+  TOKEN_CHAR,
+  TOKEN_FLOAT,
+  TOKEN_DOUBLE,
+  TOKEN_LONG,
+  TOKEN_SHORT,
+  TOKEN_UNSIGNED,
+  TOKEN_SIGNED,
 
-    // Keywords - control flow
-    TOKEN_RETURN,
-    TOKEN_IF,
-    TOKEN_ELSE,
-    TOKEN_WHILE,
-    TOKEN_FOR,
-    TOKEN_DO,
-    TOKEN_SWITCH,
-    TOKEN_CASE,
-    TOKEN_DEFAULT,
-    TOKEN_BREAK,
-    TOKEN_CONTINUE,
-    TOKEN_GOTO,
-    TOKEN_ELLIPSIS,
+  // Keywords - control flow
+  TOKEN_RETURN,
+  TOKEN_IF,
+  TOKEN_ELSE,
+  TOKEN_WHILE,
+  TOKEN_FOR,
+  TOKEN_DO,
+  TOKEN_SWITCH,
+  TOKEN_CASE,
+  TOKEN_DEFAULT,
+  TOKEN_BREAK,
+  TOKEN_CONTINUE,
+  TOKEN_GOTO,
+  TOKEN_ELLIPSIS,
 
-    // Keywords - storage/qualifiers
-    TOKEN_CONST,
-    TOKEN_STATIC,
-    TOKEN_EXTERN,
-    TOKEN_TYPEDEF,
-    TOKEN_VOLATILE,
-    TOKEN_RESTRICT,
-    TOKEN_REGISTER,
-    TOKEN_INLINE,
-    TOKEN_COMPLEX,
-    TOKEN_IMAGINARY,
-    TOKEN_BOOL,
+  // Keywords - storage/qualifiers
+  TOKEN_CONST,
+  TOKEN_STATIC,
+  TOKEN_EXTERN,
+  TOKEN_TYPEDEF,
+  TOKEN_VOLATILE,
+  TOKEN_RESTRICT,
+  TOKEN_REGISTER,
+  TOKEN_INLINE,
+  TOKEN_COMPLEX,
+  TOKEN_IMAGINARY,
+  TOKEN_BOOL,
 
-    // Keywords - composite types
-    TOKEN_STRUCT,
-    TOKEN_ENUM,
-    TOKEN_UNION,
+  // Keywords - composite types
+  TOKEN_STRUCT,
+  TOKEN_ENUM,
+  TOKEN_UNION,
 
-    // Keywords - operators
-    TOKEN_SIZEOF,
+  // Keywords - operators
+  TOKEN_SIZEOF,
 
-    // Arithmetic operators
-    TOKEN_ASSIGN,           // =
-    TOKEN_PLUS,             // +
-    TOKEN_MINUS,            // -
-    TOKEN_STAR,             // *
-    TOKEN_SLASH,            // /
-    TOKEN_PERCENT,          // %
+  // Arithmetic operators
+  TOKEN_ASSIGN,  // =
+  TOKEN_PLUS,    // +
+  TOKEN_MINUS,   // -
+  TOKEN_STAR,    // *
+  TOKEN_SLASH,   // /
+  TOKEN_PERCENT, // %
 
-    // Increment/decrement
-    TOKEN_PLUS_PLUS,        // ++
-    TOKEN_MINUS_MINUS,      // --
+  // Increment/decrement
+  TOKEN_PLUS_PLUS,   // ++
+  TOKEN_MINUS_MINUS, // --
 
-    // Compound assignment
-    TOKEN_PLUS_ASSIGN,      // +=
-    TOKEN_MINUS_ASSIGN,     // -=
-    TOKEN_STAR_ASSIGN,      // *=
-    TOKEN_SLASH_ASSIGN,     // /=
-    TOKEN_PERCENT_ASSIGN,   // %=
-    TOKEN_AMPERSAND_ASSIGN, // &=
-    TOKEN_PIPE_ASSIGN,      // |=
-    TOKEN_CARET_ASSIGN,     // ^=
-    TOKEN_LSHIFT_ASSIGN,    // <<=
-    TOKEN_RSHIFT_ASSIGN,    // >>=
+  // Compound assignment
+  TOKEN_PLUS_ASSIGN,      // +=
+  TOKEN_MINUS_ASSIGN,     // -=
+  TOKEN_STAR_ASSIGN,      // *=
+  TOKEN_SLASH_ASSIGN,     // /=
+  TOKEN_PERCENT_ASSIGN,   // %=
+  TOKEN_AMPERSAND_ASSIGN, // &=
+  TOKEN_PIPE_ASSIGN,      // |=
+  TOKEN_CARET_ASSIGN,     // ^=
+  TOKEN_LSHIFT_ASSIGN,    // <<=
+  TOKEN_RSHIFT_ASSIGN,    // >>=
 
-    // Comparison operators
-    TOKEN_EQ,               // ==
-    TOKEN_NEQ,              // !=
-    TOKEN_LT,               // <
-    TOKEN_GT,               // >
-    TOKEN_LTE,              // <=
-    TOKEN_GTE,              // >=
+  // Comparison operators
+  TOKEN_EQ,  // ==
+  TOKEN_NEQ, // !=
+  TOKEN_LT,  // <
+  TOKEN_GT,  // >
+  TOKEN_LTE, // <=
+  TOKEN_GTE, // >=
 
-    // Logical operators
-    TOKEN_AND,              // &&
-    TOKEN_OR,               // ||
-    TOKEN_NOT,              // !
+  // Logical operators
+  TOKEN_AND, // &&
+  TOKEN_OR,  // ||
+  TOKEN_NOT, // !
 
-    // Bitwise operators
-    TOKEN_AMPERSAND,        // &
-    TOKEN_PIPE,             // |
-    TOKEN_TILDE,            // ~
-    TOKEN_CARET,            // ^
-    TOKEN_LSHIFT,           // <<
-    TOKEN_RSHIFT,           // >>
+  // Bitwise operators
+  TOKEN_AMPERSAND, // &
+  TOKEN_PIPE,      // |
+  TOKEN_TILDE,     // ~
+  TOKEN_CARET,     // ^
+  TOKEN_LSHIFT,    // <<
+  TOKEN_RSHIFT,    // >>
 
-    // Member access
-    TOKEN_DOT,              // .
-    TOKEN_ARROW,            // ->
+  // Member access
+  TOKEN_DOT,   // .
+  TOKEN_ARROW, // ->
 
-    // Punctuation
-    TOKEN_SEMICOLON,        // ;
-    TOKEN_COMMA,            // ,
-    TOKEN_COLON,            // :
-    TOKEN_QUESTION,         // ?
-    TOKEN_LPAREN,           // (
-    TOKEN_RPAREN,           // )
-    TOKEN_LBRACE,           // {
-    TOKEN_RBRACE,           // }
-    TOKEN_LBRACKET,         // [
-    TOKEN_RBRACKET,         // ]
+  // Punctuation
+  TOKEN_SEMICOLON, // ;
+  TOKEN_COMMA,     // ,
+  TOKEN_COLON,     // :
+  TOKEN_QUESTION,  // ?
+  TOKEN_LPAREN,    // (
+  TOKEN_RPAREN,    // )
+  TOKEN_LBRACE,    // {
+  TOKEN_RBRACE,    // }
+  TOKEN_LBRACKET,  // [
+  TOKEN_RBRACKET,  // ]
 
-    TOKEN_UNKNOWN
+  TOKEN_HASH,
+  TOKEN_HASH_HASH,
+  TOKEN_UNKNOWN
 } token_type;
 
 typedef struct token {
-    token_type type;
-    char *value;
-    int line;
-    int column;
+  token_type type;
+  char *value;
+  int line;
+  int column;
+  int at_line_start;
 } token;
 #endif //_TOKEN_H_

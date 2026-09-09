@@ -19,6 +19,10 @@ add_executable(C_compiler ${SOURCES}
         src/ast.c
         include/symbol_table.h
         src/symbol_table.c
+        include/token_buf.h
+        src/token_buf.c
+        include/preprocessor.h
+        src/preprocessor.c
 )
 
 # ==========================================
@@ -58,3 +62,15 @@ gtest_discover_tests(ParserTests)
 add_executable(SymbolTableTests tests/test_symbol_table.cpp src/symbol_table.c src/ast.c)
 target_link_libraries(SymbolTableTests gtest_main)
 gtest_discover_tests(SymbolTableTests)
+
+add_executable(AstTests tests/test_ast.cpp src/ast.c src/parser.c src/lexer.c src/lex_keywords.c)
+target_link_libraries(AstTests gtest_main)
+target_link_options(AstTests PRIVATE -Wl,--wrap=free)
+gtest_discover_tests(AstTests)
+
+add_executable(PreprocessorTests tests/test_preprocessor.cpp src/token_buf.c src/lexer.c src/lex_keywords.c
+        include/preprocessor.h
+        src/preprocessor.c)
+target_link_libraries(PreprocessorTests gtest_main)
+target_link_options(PreprocessorTests PRIVATE -Wl,--wrap=free,--wrap=realloc)
+gtest_discover_tests(PreprocessorTests)
