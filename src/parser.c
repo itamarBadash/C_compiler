@@ -1,54 +1,191 @@
 #include "parser.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 static int is_type_token(parser *p);
-static ast_node* parse_var_decl(parser *p);
-static type_info* parse_declarator(parser *p, type_info *base_type, char **out_name);
+static ast_node *parse_var_decl(parser *p);
+static type_info *parse_declarator(parser *p, type_info *base_type, char **out_name);
 static int token_starts_type(parser *p, token tok) {
   switch (tok.type) {
-    case TOKEN_INT: case TOKEN_FLOAT: case TOKEN_CHAR: case TOKEN_DOUBLE:
-    case TOKEN_VOID: case TOKEN_LONG: case TOKEN_SHORT: case TOKEN_UNSIGNED:
-    case TOKEN_SIGNED: case TOKEN_STRUCT: case TOKEN_UNION: case TOKEN_ENUM:
-    case TOKEN_CONST: case TOKEN_VOLATILE: case TOKEN_RESTRICT:
-    case TOKEN_COMPLEX: case TOKEN_IMAGINARY: case TOKEN_BOOL:
-      return 1;
-    case TOKEN_IDENTIFIER: {
-      symbol *sym = parser_lookup_symbol(p, tok.value);
-      return sym && sym->kind == SYMBOL_TYPEDEF;
-    }
-    default:
-      return 0;
+  case TOKEN_INT:
+  case TOKEN_FLOAT:
+  case TOKEN_CHAR:
+  case TOKEN_DOUBLE:
+  case TOKEN_VOID:
+  case TOKEN_LONG:
+  case TOKEN_SHORT:
+  case TOKEN_UNSIGNED:
+  case TOKEN_SIGNED:
+  case TOKEN_STRUCT:
+  case TOKEN_UNION:
+  case TOKEN_ENUM:
+  case TOKEN_CONST:
+  case TOKEN_VOLATILE:
+  case TOKEN_RESTRICT:
+  case TOKEN_COMPLEX:
+  case TOKEN_IMAGINARY:
+  case TOKEN_BOOL:
+    return 1;
+  case TOKEN_IDENTIFIER: {
+    symbol *sym = parser_lookup_symbol(p, tok.value);
+    return sym && sym->kind == SYMBOL_TYPEDEF;
+  }
+  default:
+    return 0;
   }
 }
 static int is_type_token(parser *p) {
   token_type type = p->current_token.type;
   if (type == TOKEN_TYPEDEF || type == TOKEN_STATIC || type == TOKEN_EXTERN ||
       type == TOKEN_REGISTER || type == TOKEN_INLINE) {
-      return 1;
+    return 1;
   }
   return token_starts_type(p, p->current_token);
 }
-static token clone_token (token t)
-{
+static int hex_digit_value(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+static char *decode_escapes(parser *p, const char *s, int wide, int *out_length) {
+  size_t n = s ? strlen(s) : 0;
+  char *out = malloc(n + 1);
+  if (!out)
+    return NULL;
+
+  size_t i = 0;
+  int len = 0;
+  while (s && s[i] != '\0') {
+    if (s[i] != '\\') {
+      out[len++] = s[i++];
+      continue;
+    }
+
+    i++;
+    if (s[i] == '\0') {
+      parser_error(p, "stray backslash at end of literal");
+      break;
+    }
+
+    switch (s[i]) {
+    case 'n':
+      out[len++] = '\n';
+      i++;
+      break;
+    case 't':
+      out[len++] = '\t';
+      i++;
+      break;
+    case 'r':
+      out[len++] = '\r';
+      i++;
+      break;
+    case '0':
+    case '1':
+    case '2':
+    case '3':
+    case '4':
+    case '5':
+    case '6':
+    case '7': {
+      int value = 0;
+      int digits = 0;
+      while (digits < 3 && s[i] >= '0' && s[i] <= '7') {
+        value = value * 8 + (s[i] - '0');
+        i++;
+        digits++;
+      }
+      if (!wide && value > 255) {
+        parser_error(p, "octal escape sequence out of range");
+      }
+      out[len++] = (char)value;
+      break;
+    }
+    case 'x': {
+      i++;
+      if (hex_digit_value(s[i]) < 0) {
+        parser_error(p, "\\x used with no following hex digits");
+        break;
+      }
+      int value = 0;
+      while (hex_digit_value(s[i]) >= 0) {
+        value = value * 16 + hex_digit_value(s[i]);
+        i++;
+      }
+      if (!wide && value > 255) {
+        parser_error(p, "hex escape sequence out of range");
+      }
+      out[len++] = (char)value;
+      break;
+    }
+    case '\\':
+      out[len++] = '\\';
+      i++;
+      break;
+    case '\'':
+      out[len++] = '\'';
+      i++;
+      break;
+    case '"':
+      out[len++] = '"';
+      i++;
+      break;
+    case '?':
+      out[len++] = '?';
+      i++;
+      break;
+    case 'a':
+      out[len++] = '\a';
+      i++;
+      break;
+    case 'b':
+      out[len++] = '\b';
+      i++;
+      break;
+    case 'f':
+      out[len++] = '\f';
+      i++;
+      break;
+    case 'v':
+      out[len++] = '\v';
+      i++;
+      break;
+    default:
+      parser_error(p, "unknown escape sequence in literal");
+      out[len++] = s[i++];
+      break;
+    }
+  }
+
+  out[len] = '\0';
+  if (out_length)
+    *out_length = len;
+  return out;
+}
+
+static token clone_token(token t) {
   token new_t = t;
-  if (t.value)
-  {
-    new_t.value = strdup (t.value);
+  if (t.value) {
+    new_t.value = strdup(t.value);
   }
   return new_t;
 }
-void parser_error (parser *p, const char *message)
-{
-  if (!p) return;
+void parser_error(parser *p, const char *message) {
+  if (!p)
+    return;
   p->had_error++;
-  fprintf (stderr, "%d:%d: error: %s (at '%s')\n",
-           p->current_token.line, p->current_token.column, message,
-           p->current_token.value ? p->current_token.value : "<eof>");
+  fprintf(stderr, "%d:%d: error: %s (at '%s')\n", p->current_token.line, p->current_token.column,
+          message, p->current_token.value ? p->current_token.value : "<eof>");
 }
 
-static type_info* clone_type_info(type_info *type) {
-  if (!type) return NULL;
+static type_info *clone_type_info(type_info *type) {
+  if (!type)
+    return NULL;
   type_info *new_type = create_type_info(type->kind);
   new_type->is_const = type->is_const;
   new_type->is_volatile = type->is_volatile;
@@ -61,20 +198,20 @@ static type_info* clone_type_info(type_info *type) {
   new_type->storage_class = type->storage_class;
   new_type->base_type = clone_token(type->base_type);
   if (type->tag_name) {
-      new_type->tag_name = strdup(type->tag_name);
+    new_type->tag_name = strdup(type->tag_name);
   }
   new_type->array_size = type->array_size;
   new_type->ptr_to = clone_type_info(type->ptr_to);
   if (type->param_types) {
     new_type->param_count = type->param_count;
-    new_type->param_types = malloc(sizeof(type_info*) * type->param_count);
+    new_type->param_types = malloc(sizeof(type_info *) * type->param_count);
     for (int i = 0; i < type->param_count; i++) {
       new_type->param_types[i] = clone_type_info(type->param_types[i]);
     }
   }
   if (type->param_names) {
     new_type->param_count = type->param_count;
-    new_type->param_names = malloc(sizeof(char*) * type->param_count);
+    new_type->param_names = malloc(sizeof(char *) * type->param_count);
     for (int i = 0; i < type->param_count; i++) {
       new_type->param_names[i] = type->param_names[i] ? strdup(type->param_names[i]) : NULL;
     }
@@ -82,10 +219,12 @@ static type_info* clone_type_info(type_info *type) {
   return new_type;
 }
 
-static type_info* parse_type_specifier(parser *p, ast_node **out_def) {
-  if (out_def) *out_def = NULL;
-  if (!is_type_token(p)) return NULL;
-  
+static type_info *parse_type_specifier(parser *p, ast_node **out_def) {
+  if (out_def)
+    *out_def = NULL;
+  if (!is_type_token(p))
+    return NULL;
+
   type_info *type = create_type_info(TYPE_PRIMITIVE);
   type->storage_class = 0;
   type->is_const = 0;
@@ -93,138 +232,174 @@ static type_info* parse_type_specifier(parser *p, ast_node **out_def) {
   type->is_restrict = 0;
   type->base_type.type = TOKEN_UNKNOWN;
   type->base_type.value = NULL;
-  
+
   int has_base_type = 0;
   int long_count = 0;
 
   while (is_type_token(p) && p->current_token.type != TOKEN_EOF) {
     token_type t = p->current_token.type;
-    
-    if (t == TOKEN_CONST) { type->is_const = 1; parser_advance(p); continue; }
-    if (t == TOKEN_VOLATILE) { type->is_volatile = 1; parser_advance(p); continue; }
-    if (t == TOKEN_RESTRICT) { type->is_restrict = 1; parser_advance(p); continue; }
-    
-    if (t == TOKEN_COMPLEX) { type->is_complex = 1; parser_advance(p); continue; }
-    if (t == TOKEN_IMAGINARY) { type->is_imaginary = 1; parser_advance(p); continue; }
-    if (t == TOKEN_INLINE) { type->is_inline = 1; parser_advance(p); continue; }
 
-    if (t == TOKEN_STATIC || t == TOKEN_EXTERN || t == TOKEN_REGISTER) {
-      type->storage_class = t; 
+    if (t == TOKEN_CONST) {
+      type->is_const = 1;
       parser_advance(p);
       continue;
     }
-    
+    if (t == TOKEN_VOLATILE) {
+      type->is_volatile = 1;
+      parser_advance(p);
+      continue;
+    }
+    if (t == TOKEN_RESTRICT) {
+      type->is_restrict = 1;
+      parser_advance(p);
+      continue;
+    }
+
+    if (t == TOKEN_COMPLEX) {
+      type->is_complex = 1;
+      parser_advance(p);
+      continue;
+    }
+    if (t == TOKEN_IMAGINARY) {
+      type->is_imaginary = 1;
+      parser_advance(p);
+      continue;
+    }
+    if (t == TOKEN_INLINE) {
+      type->is_inline = 1;
+      parser_advance(p);
+      continue;
+    }
+
+    if (t == TOKEN_STATIC || t == TOKEN_EXTERN || t == TOKEN_REGISTER) {
+      type->storage_class = t;
+      parser_advance(p);
+      continue;
+    }
+
     if (t == TOKEN_STRUCT || t == TOKEN_UNION) {
       type->kind = TYPE_STRUCT;
       type->base_type = clone_token(p->current_token);
       parser_advance(p);
       if (p->current_token.type == TOKEN_IDENTIFIER) {
-          type->tag_name = strdup(p->current_token.value);
-          parser_advance(p);
+        type->tag_name = strdup(p->current_token.value);
+        parser_advance(p);
       }
       if (p->current_token.type == TOKEN_LBRACE && out_def && *out_def == NULL) {
-          parser_advance(p);
-          ast_node *def = create_ast_node(AST_NODE_TYPE_STRUCT_DEF);
-          def->struct_def.tag_name = type->tag_name ? strdup(type->tag_name) : NULL;
-          def->struct_def.members = NULL;
-          def->struct_def.member_count = 0;
-          
-          while (p->current_token.type != TOKEN_RBRACE && p->current_token.type != TOKEN_EOF) {
-              ast_node *member = parse_var_decl(p);
-              if (member) {
-                  def->struct_def.members = realloc(def->struct_def.members, sizeof(ast_node*) * (def->struct_def.member_count + 1));
-                  def->struct_def.members[def->struct_def.member_count++] = member;
-              } else {
-                  parser_advance(p);
-              }
+        parser_advance(p);
+        ast_node *def = create_ast_node(AST_NODE_TYPE_STRUCT_DEF);
+        def->struct_def.tag_name = type->tag_name ? strdup(type->tag_name) : NULL;
+        def->struct_def.members = NULL;
+        def->struct_def.member_count = 0;
+
+        while (p->current_token.type != TOKEN_RBRACE && p->current_token.type != TOKEN_EOF) {
+          ast_node *member = parse_var_decl(p);
+          if (member) {
+            def->struct_def.members = realloc(
+                def->struct_def.members, sizeof(ast_node *) * (def->struct_def.member_count + 1));
+            def->struct_def.members[def->struct_def.member_count++] = member;
+          } else {
+            parser_advance(p);
           }
-          if (p->current_token.type == TOKEN_RBRACE) parser_advance(p);
-          *out_def = def;
+        }
+        if (p->current_token.type == TOKEN_RBRACE)
+          parser_advance(p);
+        *out_def = def;
       }
       has_base_type = 1;
       continue;
     }
-    
+
     if (t == TOKEN_ENUM) {
       type->kind = TYPE_ENUM;
       type->base_type = clone_token(p->current_token);
       parser_advance(p);
       if (p->current_token.type == TOKEN_IDENTIFIER) {
-          type->tag_name = strdup(p->current_token.value);
-          parser_advance(p);
+        type->tag_name = strdup(p->current_token.value);
+        parser_advance(p);
       }
       if (p->current_token.type == TOKEN_LBRACE && out_def && *out_def == NULL) {
-          parser_advance(p);
-          ast_node *def = create_ast_node(AST_NODE_TYPE_ENUM_DEF);
-          def->enum_def.tag_name = type->tag_name ? strdup(type->tag_name) : NULL;
-          def->enum_def.enumerators = NULL;
-          def->enum_def.values = NULL;
-          def->enum_def.enumerator_count = 0;
-          
-          while (p->current_token.type != TOKEN_RBRACE && p->current_token.type != TOKEN_EOF) {
-              if (p->current_token.type == TOKEN_IDENTIFIER) {
-                  def->enum_def.enumerators = realloc(def->enum_def.enumerators, sizeof(char*) * (def->enum_def.enumerator_count + 1));
-                  def->enum_def.values = realloc(def->enum_def.values, sizeof(ast_node*) * (def->enum_def.enumerator_count + 1));
-                  def->enum_def.enumerators[def->enum_def.enumerator_count] = strdup(p->current_token.value);
-                  def->enum_def.values[def->enum_def.enumerator_count] = NULL;
-                  
-                  parser_advance(p);
-                  if (p->current_token.type == TOKEN_ASSIGN) {
-                      parser_advance(p);
-                      ast_node *val = parse_assignment(p);
-                      def->enum_def.values[def->enum_def.enumerator_count] = val;
-                  }
-                  def->enum_def.enumerator_count++;
-              }
-              if (p->current_token.type == TOKEN_COMMA) parser_advance(p);
-              else break;
+        parser_advance(p);
+        ast_node *def = create_ast_node(AST_NODE_TYPE_ENUM_DEF);
+        def->enum_def.tag_name = type->tag_name ? strdup(type->tag_name) : NULL;
+        def->enum_def.enumerators = NULL;
+        def->enum_def.values = NULL;
+        def->enum_def.enumerator_count = 0;
+
+        while (p->current_token.type != TOKEN_RBRACE && p->current_token.type != TOKEN_EOF) {
+          if (p->current_token.type == TOKEN_IDENTIFIER) {
+            def->enum_def.enumerators = realloc(
+                def->enum_def.enumerators, sizeof(char *) * (def->enum_def.enumerator_count + 1));
+            def->enum_def.values = realloc(
+                def->enum_def.values, sizeof(ast_node *) * (def->enum_def.enumerator_count + 1));
+            def->enum_def.enumerators[def->enum_def.enumerator_count] =
+                strdup(p->current_token.value);
+            def->enum_def.values[def->enum_def.enumerator_count] = NULL;
+
+            parser_advance(p);
+            if (p->current_token.type == TOKEN_ASSIGN) {
+              parser_advance(p);
+              ast_node *val = parse_assignment(p);
+              def->enum_def.values[def->enum_def.enumerator_count] = val;
+            }
+            def->enum_def.enumerator_count++;
           }
-          if (p->current_token.type == TOKEN_RBRACE) parser_advance(p);
-          *out_def = def;
+          if (p->current_token.type == TOKEN_COMMA)
+            parser_advance(p);
+          else
+            break;
+        }
+        if (p->current_token.type == TOKEN_RBRACE)
+          parser_advance(p);
+        *out_def = def;
       }
       has_base_type = 1;
       continue;
     }
-    
+
     if (t == TOKEN_IDENTIFIER) {
-        if (!has_base_type) {
-            symbol *sym = parser_lookup_symbol(p, p->current_token.value);
-            if (sym && sym->kind == SYMBOL_TYPEDEF) {
-                type->kind = TYPE_TYPEDEF;
-                type->tag_name = strdup(p->current_token.value);
-                parser_advance(p);
-                has_base_type = 1;
-                continue;
-            }
+      if (!has_base_type) {
+        symbol *sym = parser_lookup_symbol(p, p->current_token.value);
+        if (sym && sym->kind == SYMBOL_TYPEDEF) {
+          type->kind = TYPE_TYPEDEF;
+          type->tag_name = strdup(p->current_token.value);
+          parser_advance(p);
+          has_base_type = 1;
+          continue;
         }
-        break; // Stop parsing types if it's an identifier that is not part of the type specifier (e.g. variable name)
+      }
+      break; // Stop parsing types if it's an identifier that is not part of the type specifier
+             // (e.g. variable name)
     }
-    
+
     // Primitive types
-    if (t == TOKEN_INT || t == TOKEN_FLOAT || t == TOKEN_CHAR || t == TOKEN_DOUBLE || t == TOKEN_VOID || t == TOKEN_LONG || t == TOKEN_SHORT || t == TOKEN_UNSIGNED || t == TOKEN_SIGNED || t == TOKEN_BOOL) {
-        if (t == TOKEN_LONG) {
-            long_count++;
-            if (long_count == 2) {
-                type->is_long_long = 1;
-            }
+    if (t == TOKEN_INT || t == TOKEN_FLOAT || t == TOKEN_CHAR || t == TOKEN_DOUBLE ||
+        t == TOKEN_VOID || t == TOKEN_LONG || t == TOKEN_SHORT || t == TOKEN_UNSIGNED ||
+        t == TOKEN_SIGNED || t == TOKEN_BOOL) {
+      if (t == TOKEN_LONG) {
+        long_count++;
+        if (long_count == 2) {
+          type->is_long_long = 1;
         }
-        if (!has_base_type) {
-            type->base_type = clone_token(p->current_token); // Just keep the first primitive keyword for now
-            has_base_type = 1;
-        }
-        parser_advance(p);
-        continue;
+      }
+      if (!has_base_type) {
+        type->base_type =
+            clone_token(p->current_token); // Just keep the first primitive keyword for now
+        has_base_type = 1;
+      }
+      parser_advance(p);
+      continue;
     }
-    
+
     // If we reach here, and it's a type token, break to be safe
     break;
   }
-  
+
   if (!has_base_type) {
-      type->base_type.type = TOKEN_INT;
-      type->base_type.value = strdup("int");
+    type->base_type.type = TOKEN_INT;
+    type->base_type.value = strdup("int");
   }
-  
+
   return type;
 }
 
@@ -255,22 +430,24 @@ static int parse_param_list(parser *p, type_info *fn) {
       return 0;
     }
 
-    fn->param_types = realloc(fn->param_types, sizeof(type_info*) * (fn->param_count + 1));
-    fn->param_names = realloc(fn->param_names, sizeof(char*) * (fn->param_count + 1));
+    fn->param_types = realloc(fn->param_types, sizeof(type_info *) * (fn->param_count + 1));
+    fn->param_names = realloc(fn->param_names, sizeof(char *) * (fn->param_count + 1));
     fn->param_types[fn->param_count] = p_type;
     fn->param_names[fn->param_count] = p_name;
     fn->param_count++;
 
-    if (p->current_token.type != TOKEN_COMMA) break;
+    if (p->current_token.type != TOKEN_COMMA)
+      break;
     parser_advance(p);
   } while (1);
 
-  if (fn->param_count == 1 && !fn->param_names[0] &&
-      fn->param_types[0]->kind == TYPE_PRIMITIVE &&
+  if (fn->param_count == 1 && !fn->param_names[0] && fn->param_types[0]->kind == TYPE_PRIMITIVE &&
       fn->param_types[0]->base_type.type == TOKEN_VOID) {
     free_type_info(fn->param_types[0]);
-    free(fn->param_types); fn->param_types = NULL;
-    free(fn->param_names); fn->param_names = NULL;
+    free(fn->param_types);
+    fn->param_types = NULL;
+    free(fn->param_names);
+    fn->param_names = NULL;
     fn->param_count = 0;
   }
 
@@ -282,17 +459,22 @@ static int parse_param_list(parser *p, type_info *fn) {
   return 1;
 }
 
-static type_info* parse_declarator(parser *p, type_info *base_type, char **out_name) {
+static type_info *parse_declarator(parser *p, type_info *base_type, char **out_name) {
   type_info *type = base_type;
-  if (out_name) *out_name = NULL;
+  if (out_name)
+    *out_name = NULL;
 
   while (p->current_token.type == TOKEN_STAR) {
     parser_advance(p);
     type_info *ptr = create_type_info(TYPE_POINTER);
-    while (p->current_token.type == TOKEN_CONST || p->current_token.type == TOKEN_VOLATILE || p->current_token.type == TOKEN_RESTRICT) {
-      if (p->current_token.type == TOKEN_CONST) ptr->is_const = 1;
-      if (p->current_token.type == TOKEN_VOLATILE) ptr->is_volatile = 1;
-      if (p->current_token.type == TOKEN_RESTRICT) ptr->is_restrict = 1;
+    while (p->current_token.type == TOKEN_CONST || p->current_token.type == TOKEN_VOLATILE ||
+           p->current_token.type == TOKEN_RESTRICT) {
+      if (p->current_token.type == TOKEN_CONST)
+        ptr->is_const = 1;
+      if (p->current_token.type == TOKEN_VOLATILE)
+        ptr->is_volatile = 1;
+      if (p->current_token.type == TOKEN_RESTRICT)
+        ptr->is_restrict = 1;
       parser_advance(p);
     }
     ptr->ptr_to = type;
@@ -318,7 +500,8 @@ static type_info* parse_declarator(parser *p, type_info *base_type, char **out_n
     }
     parser_advance(p);
   } else if (p->current_token.type == TOKEN_IDENTIFIER) {
-    if (out_name) *out_name = strdup(p->current_token.value);
+    if (out_name)
+      *out_name = strdup(p->current_token.value);
     parser_advance(p);
   }
 
@@ -359,14 +542,21 @@ static type_info* parse_declarator(parser *p, type_info *base_type, char **out_n
       }
     }
 
-    if (!sfx_head) { sfx_head = sfx; sfx_tail = sfx; }
-    else { sfx_tail->ptr_to = sfx; sfx_tail = sfx; }
+    if (!sfx_head) {
+      sfx_head = sfx;
+      sfx_tail = sfx;
+    } else {
+      sfx_tail->ptr_to = sfx;
+      sfx_tail = sfx;
+    }
   }
 
   if (suffix_failed) {
-    if (sfx_head) free_type_info(sfx_head);
+    if (sfx_head)
+      free_type_info(sfx_head);
     free_type_info(type);
-    if (inner) free_type_info(inner);
+    if (inner)
+      free_type_info(inner);
     return NULL;
   }
 
@@ -381,7 +571,8 @@ static type_info* parse_declarator(parser *p, type_info *base_type, char **out_n
       return type;
     }
     type_info *it = inner;
-    while (it->ptr_to && it->ptr_to != placeholder) it = it->ptr_to;
+    while (it->ptr_to && it->ptr_to != placeholder)
+      it = it->ptr_to;
     if (it->ptr_to != placeholder) {
       parser_error(p, "malformed declarator");
       free_type_info(inner);
@@ -397,57 +588,123 @@ static type_info* parse_declarator(parser *p, type_info *base_type, char **out_n
 }
 
 static ast_node *parse_initializer(parser *p) {
-    if (p->current_token.type == TOKEN_LBRACE) {
-        parser_advance(p);
-        ast_node *node = create_ast_node(AST_NODE_TYPE_INIT_LIST);
-        node->init_list.items = NULL;
-        node->init_list.count = 0;
-        
-        while (p->current_token.type != TOKEN_RBRACE && p->current_token.type != TOKEN_EOF) {
-            char *member_name = NULL;
-            ast_node *index = NULL;
-            
-            if (p->current_token.type == TOKEN_DOT) {
-                parser_advance(p);
-                if (p->current_token.type == TOKEN_IDENTIFIER) {
-                    member_name = strdup(p->current_token.value);
-                    parser_advance(p);
-                }
-                if (p->current_token.type == TOKEN_ASSIGN) parser_advance(p);
-            } else if (p->current_token.type == TOKEN_LBRACKET) {
-                parser_advance(p);
-                index = parse_expression(p);
-                if (p->current_token.type == TOKEN_RBRACKET) parser_advance(p);
-                if (p->current_token.type == TOKEN_ASSIGN) parser_advance(p);
-            }
-            
-            ast_node *val = parse_initializer(p);
-            if (val) {
-                node->init_list.items = realloc(node->init_list.items, sizeof(*node->init_list.items) * (node->init_list.count + 1));
-                node->init_list.items[node->init_list.count].member_name = member_name;
-                node->init_list.items[node->init_list.count].index = index;
-                node->init_list.items[node->init_list.count].value = val;
-                node->init_list.count++;
-            } else {
-                if (member_name) free(member_name);
-                if (index) free_ast(index);
-                parser_advance(p); // Skip errors
-            }
-            if (p->current_token.type == TOKEN_COMMA) {
-                parser_advance(p);
-            } else {
-                break;
-            }
-        }
-        if (p->current_token.type == TOKEN_RBRACE) {
+  if (p->current_token.type == TOKEN_LBRACE) {
+    parser_advance(p);
+    ast_node *node = create_ast_node(AST_NODE_TYPE_INIT_LIST);
+    node->init_list.items = NULL;
+    node->init_list.count = 0;
+
+    while (p->current_token.type != TOKEN_RBRACE && p->current_token.type != TOKEN_EOF) {
+      char *member_name = NULL;
+      ast_node *index = NULL;
+
+      char **chain_names = NULL;
+      ast_node **chain_indices = NULL;
+      int chain_count = 0;
+
+      while (p->current_token.type == TOKEN_DOT || p->current_token.type == TOKEN_LBRACKET) {
+        char *this_name = NULL;
+        ast_node *this_index = NULL;
+
+        if (p->current_token.type == TOKEN_DOT) {
+          parser_advance(p);
+          if (p->current_token.type != TOKEN_IDENTIFIER) {
+            parser_error(p, "expected a member name after '.' in an initializer");
+            break;
+          }
+          this_name = strdup(p->current_token.value);
+          parser_advance(p);
+        } else {
+          parser_advance(p);
+          this_index = parse_expression(p);
+          if (p->current_token.type == TOKEN_RBRACKET) {
             parser_advance(p);
+          } else {
+            parser_error(p, "expected ']' after an array designator");
+          }
         }
-        return node;
+
+        char **tmp_names = realloc(chain_names, sizeof(char *) * (chain_count + 1));
+        ast_node **tmp_indices = realloc(chain_indices, sizeof(ast_node *) * (chain_count + 1));
+        if (!tmp_names || !tmp_indices) {
+          free(tmp_names ? tmp_names : chain_names);
+          free(tmp_indices ? tmp_indices : chain_indices);
+          chain_names = NULL;
+          chain_indices = NULL;
+          chain_count = 0;
+          free(this_name);
+          free_ast(this_index);
+          break;
+        }
+        chain_names = tmp_names;
+        chain_indices = tmp_indices;
+        chain_names[chain_count] = this_name;
+        chain_indices[chain_count] = this_index;
+        chain_count++;
+      }
+
+      if (chain_count > 0 && p->current_token.type == TOKEN_ASSIGN) {
+        parser_advance(p);
+      }
+
+      ast_node *val = parse_initializer(p);
+
+      if (val) {
+        for (int k = chain_count - 1; k >= 1; k--) {
+          ast_node *wrap = create_ast_node(AST_NODE_TYPE_INIT_LIST);
+          wrap->init_list.items = malloc(sizeof(*wrap->init_list.items));
+          if (!wrap->init_list.items) {
+            free_ast(wrap);
+            break;
+          }
+          wrap->init_list.items[0].member_name = chain_names[k];
+          wrap->init_list.items[0].index = chain_indices[k];
+          wrap->init_list.items[0].value = val;
+          wrap->init_list.count = 1;
+          val = wrap;
+        }
+        if (chain_count > 0) {
+          member_name = chain_names[0];
+          index = chain_indices[0];
+        }
+      } else {
+        for (int k = 0; k < chain_count; k++) {
+          free(chain_names[k]);
+          free_ast(chain_indices[k]);
+        }
+      }
+      free(chain_names);
+      free(chain_indices);
+
+      if (val) {
+        node->init_list.items = realloc(node->init_list.items, sizeof(*node->init_list.items) *
+                                                                   (node->init_list.count + 1));
+        node->init_list.items[node->init_list.count].member_name = member_name;
+        node->init_list.items[node->init_list.count].index = index;
+        node->init_list.items[node->init_list.count].value = val;
+        node->init_list.count++;
+      } else {
+        if (member_name)
+          free(member_name);
+        if (index)
+          free_ast(index);
+        parser_advance(p); // Skip errors
+      }
+      if (p->current_token.type == TOKEN_COMMA) {
+        parser_advance(p);
+      } else {
+        break;
+      }
     }
-    return parse_assignment(p);
+    if (p->current_token.type == TOKEN_RBRACE) {
+      parser_advance(p);
+    }
+    return node;
+  }
+  return parse_assignment(p);
 }
 
-static ast_node* parse_var_decl(parser *p) {
+static ast_node *parse_var_decl(parser *p) {
   int is_typedef = 0;
   if (p->current_token.type == TOKEN_TYPEDEF) {
     is_typedef = 1;
@@ -456,7 +713,8 @@ static ast_node* parse_var_decl(parser *p) {
 
   ast_node *def_node = NULL;
   type_info *base_type = parse_type_specifier(p, &def_node);
-  if (!base_type) return NULL;
+  if (!base_type)
+    return NULL;
 
   ast_node *block = create_ast_node(AST_NODE_TYPE_BLOCK);
   block->block.statements = NULL;
@@ -485,10 +743,10 @@ static ast_node* parse_var_decl(parser *p) {
     if (!name && !bitfield_width) {
       free_type_info(decl_type);
       if (def_node && p->current_token.type == TOKEN_SEMICOLON) {
-          parser_advance(p);
-          free_type_info(base_type);
-          free_ast(block);
-          return def_node;
+        parser_advance(p);
+        free_type_info(base_type);
+        free_ast(block);
+        return def_node;
       }
       break;
     }
@@ -510,7 +768,8 @@ static ast_node* parse_var_decl(parser *p) {
     decl->var_decl.bitfield_width = bitfield_width;
     decl->var_decl.is_typedef = is_typedef;
 
-    block->block.statements = realloc(block->block.statements, sizeof(ast_node*) * (block->block.count + 1));
+    block->block.statements =
+        realloc(block->block.statements, sizeof(ast_node *) * (block->block.count + 1));
     block->block.statements[block->block.count++] = decl;
 
     if (p->current_token.type == TOKEN_COMMA) {
@@ -521,34 +780,36 @@ static ast_node* parse_var_decl(parser *p) {
   } while (1);
 
   if (p->current_token.type != TOKEN_SEMICOLON) {
-    parser_error (p, "expected ';' after declaration");
+    parser_error(p, "expected ';' after declaration");
     free_type_info(base_type);
     free_ast(block);
-    if (def_node) free_ast(def_node);
+    if (def_node)
+      free_ast(def_node);
     return NULL;
   }
   parser_advance(p);
   free_type_info(base_type);
 
   if (def_node) {
-      ast_node **new_stmts = malloc(sizeof(ast_node*) * (block->block.count + 1));
-      new_stmts[0] = def_node;
-      for (int i = 0; i < block->block.count; i++) new_stmts[i + 1] = block->block.statements[i];
-      free(block->block.statements);
-      block->block.statements = new_stmts;
-      block->block.count++;
+    ast_node **new_stmts = malloc(sizeof(ast_node *) * (block->block.count + 1));
+    new_stmts[0] = def_node;
+    for (int i = 0; i < block->block.count; i++)
+      new_stmts[i + 1] = block->block.statements[i];
+    free(block->block.statements);
+    block->block.statements = new_stmts;
+    block->block.count++;
   }
 
   if (block->block.count == 1) {
     ast_node *single_decl = block->block.statements[0];
     free(block->block.statements);
-    free(block); 
+    free(block);
     return single_decl;
   }
   return block;
 }
 
-static ast_node* parse_top_level_declaration(parser *p) {
+static ast_node *parse_top_level_declaration(parser *p) {
   int is_typedef = 0;
   if (p->current_token.type == TOKEN_TYPEDEF) {
     is_typedef = 1;
@@ -557,7 +818,8 @@ static ast_node* parse_top_level_declaration(parser *p) {
 
   ast_node *def_node = NULL;
   type_info *base_type = parse_type_specifier(p, &def_node);
-  if (!base_type) return NULL;
+  if (!base_type)
+    return NULL;
 
   char *name = NULL;
   type_info *decl_type = parse_declarator(p, clone_type_info(base_type), &name);
@@ -565,19 +827,35 @@ static ast_node* parse_top_level_declaration(parser *p) {
   if (!decl_type) {
     free(name);
     free_type_info(base_type);
-    if (def_node) free_ast(def_node);
+    if (def_node)
+      free_ast(def_node);
     return NULL;
   }
 
   if (!name) {
+    if (def_node && p->current_token.type == TOKEN_SEMICOLON) {
+      free_type_info(decl_type);
+      free_type_info(base_type);
+      parser_advance(p);
+      return def_node;
+    }
+    if (!def_node && p->current_token.type == TOKEN_SEMICOLON && base_type->kind == TYPE_STRUCT &&
+        base_type->tag_name != NULL) {
+      ast_node *forward = create_ast_node(AST_NODE_TYPE_STRUCT_DEF);
+      forward->struct_def.tag_name = strdup(base_type->tag_name);
+      forward->struct_def.members = NULL;
+      forward->struct_def.member_count = 0;
+      forward->struct_def.is_forward = 1;
+      free_type_info(decl_type);
+      free_type_info(base_type);
+      parser_advance(p);
+      return forward;
+    }
     free_type_info(decl_type);
     free_type_info(base_type);
-    if (def_node && p->current_token.type == TOKEN_SEMICOLON) {
-        parser_advance(p);
-        return def_node;
-    }
-    parser_error (p, "expected a name in this declaration");
-    if (def_node) free_ast(def_node);
+    parser_error(p, "expected a name in this declaration");
+    if (def_node)
+      free_ast(def_node);
     return NULL;
   }
 
@@ -598,7 +876,8 @@ static ast_node* parse_top_level_declaration(parser *p) {
     decl_type->param_count = 0;
     free_type_info(decl_type);
 
-    if (return_type) return_type->is_variadic = is_variadic;
+    if (return_type)
+      return_type->is_variadic = is_variadic;
 
     ast_node *body = NULL;
     if (p->current_token.type == TOKEN_SEMICOLON) {
@@ -612,9 +891,14 @@ static ast_node* parse_top_level_declaration(parser *p) {
         free_type_info(base_type);
         free_type_info(return_type);
         free(name);
-        for (int i = 0; i < param_count; i++) { free(params[i]); free_type_info(param_types[i]); }
-        free(params); free(param_types);
-        if (def_node) free_ast(def_node);
+        for (int i = 0; i < param_count; i++) {
+          free(params[i]);
+          free_type_info(param_types[i]);
+        }
+        free(params);
+        free(param_types);
+        if (def_node)
+          free_ast(def_node);
         return NULL;
       }
     }
@@ -630,12 +914,12 @@ static ast_node* parse_top_level_declaration(parser *p) {
     free_type_info(base_type);
 
     if (def_node) {
-        ast_node *b = create_ast_node(AST_NODE_TYPE_BLOCK);
-        b->block.count = 2;
-        b->block.statements = malloc(sizeof(ast_node*) * 2);
-        b->block.statements[0] = def_node;
-        b->block.statements[1] = node;
-        return b;
+      ast_node *b = create_ast_node(AST_NODE_TYPE_BLOCK);
+      b->block.count = 2;
+      b->block.statements = malloc(sizeof(ast_node *) * 2);
+      b->block.statements[0] = def_node;
+      b->block.statements[1] = node;
+      return b;
     }
     return node;
   } else {
@@ -645,7 +929,7 @@ static ast_node* parse_top_level_declaration(parser *p) {
     block->block.count = 0;
 
     ast_node *init_expr = NULL;
-    if(p->current_token.type == TOKEN_ASSIGN) {
+    if (p->current_token.type == TOKEN_ASSIGN) {
       parser_advance(p);
       init_expr = parse_initializer(p);
     }
@@ -655,8 +939,9 @@ static ast_node* parse_top_level_declaration(parser *p) {
     decl->var_decl.var_name = name;
     decl->var_decl.init_value = init_expr;
     decl->var_decl.is_typedef = is_typedef;
-    
-    block->block.statements = realloc(block->block.statements, sizeof(ast_node*) * (block->block.count + 1));
+
+    block->block.statements =
+        realloc(block->block.statements, sizeof(ast_node *) * (block->block.count + 1));
     block->block.statements[block->block.count++] = decl;
 
     while (p->current_token.type == TOKEN_COMMA) {
@@ -677,34 +962,37 @@ static ast_node* parse_top_level_declaration(parser *p) {
       next_decl->var_decl.var_name = next_name;
       next_decl->var_decl.init_value = next_init_expr;
       next_decl->var_decl.is_typedef = is_typedef;
-      
-      block->block.statements = realloc(block->block.statements, sizeof(ast_node*) * (block->block.count + 1));
+
+      block->block.statements =
+          realloc(block->block.statements, sizeof(ast_node *) * (block->block.count + 1));
       block->block.statements[block->block.count++] = next_decl;
     }
 
-    if(p->current_token.type != TOKEN_SEMICOLON) {
-      parser_error (p, "expected ';' after declaration");
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error(p, "expected ';' after declaration");
       free_type_info(base_type);
       free_ast(block);
-      if (def_node) free_ast(def_node);
+      if (def_node)
+        free_ast(def_node);
       return NULL;
     }
     parser_advance(p);
     free_type_info(base_type);
 
     if (def_node) {
-        ast_node **new_stmts = malloc(sizeof(ast_node*) * (block->block.count + 1));
-        new_stmts[0] = def_node;
-        for (int i = 0; i < block->block.count; i++) new_stmts[i + 1] = block->block.statements[i];
-        free(block->block.statements);
-        block->block.statements = new_stmts;
-        block->block.count++;
+      ast_node **new_stmts = malloc(sizeof(ast_node *) * (block->block.count + 1));
+      new_stmts[0] = def_node;
+      for (int i = 0; i < block->block.count; i++)
+        new_stmts[i + 1] = block->block.statements[i];
+      free(block->block.statements);
+      block->block.statements = new_stmts;
+      block->block.count++;
     }
 
     if (block->block.count == 1) {
       ast_node *single_decl = block->block.statements[0];
       free(block->block.statements);
-      free(block); 
+      free(block);
       return single_decl;
     }
     return block;
@@ -712,16 +1000,17 @@ static ast_node* parse_top_level_declaration(parser *p) {
 }
 
 void parser_enter_scope(parser *p) {
-  scope *new_scope = (scope*)calloc(1, sizeof(scope));
+  scope *new_scope = (scope *)calloc(1, sizeof(scope));
   new_scope->parent = p->current_scope;
   p->current_scope = new_scope;
 }
 
 void parser_leave_scope(parser *p) {
-  if (!p->current_scope) return;
+  if (!p->current_scope)
+    return;
   scope *old = p->current_scope;
   p->current_scope = old->parent;
-  
+
   symbol *curr = old->symbols;
   while (curr) {
     symbol *next = curr->next;
@@ -733,15 +1022,16 @@ void parser_leave_scope(parser *p) {
 }
 
 void parser_define_symbol(parser *p, const char *name, symbol_kind kind) {
-  if (!p->current_scope) return;
-  symbol *sym = (symbol*)calloc(1, sizeof(symbol));
+  if (!p->current_scope)
+    return;
+  symbol *sym = (symbol *)calloc(1, sizeof(symbol));
   sym->name = strdup(name);
   sym->kind = kind;
   sym->next = p->current_scope->symbols;
   p->current_scope->symbols = sym;
 }
 
-symbol* parser_lookup_symbol(parser *p, const char *name) {
+symbol *parser_lookup_symbol(parser *p, const char *name) {
   scope *curr_scope = p->current_scope;
   while (curr_scope) {
     symbol *curr_sym = curr_scope->symbols;
@@ -756,45 +1046,45 @@ symbol* parser_lookup_symbol(parser *p, const char *name) {
   return NULL;
 }
 
-void parser_destroy (parser *p)
-{
-  if (!p) return;
-  if (p->current_token.value) free (p->current_token.value);
-  if (p->next_token.value) free (p->next_token.value);
+void parser_destroy(parser *p) {
+  if (!p)
+    return;
+  if (p->current_token.value)
+    free(p->current_token.value);
+  if (p->next_token.value)
+    free(p->next_token.value);
   while (p->current_scope) {
     parser_leave_scope(p);
   }
 }
 
-void parser_advance (parser *p)
-{
-  if (!p || !p->lex) return;
-  if (p->current_token.value) free (p->current_token.value);
+void parser_advance(parser *p) {
+  if (!p || !p->lex)
+    return;
+  if (p->current_token.value)
+    free(p->current_token.value);
   p->current_token = p->next_token;
-  p->next_token = lexer_next_token (p->lex);
+  p->next_token = lexer_next_token(p->lex);
 }
-void parser_init (parser *p, lexer *lex)
-{
-  if (!p || !lex) return;
+void parser_init(parser *p, lexer *lex) {
+  if (!p || !lex)
+    return;
   p->lex = lex;
   p->current_scope = NULL;
   p->had_error = 0;
   parser_enter_scope(p);
-  p->current_token = lexer_next_token (lex);
-  p->next_token = lexer_next_token (lex);
+  p->current_token = lexer_next_token(lex);
+  p->next_token = lexer_next_token(lex);
 }
 
-ast_node *parse_shift (parser *p)
-{
-  ast_node *left = parse_additive (p);
-  while (p->current_token.type == TOKEN_LSHIFT ||
-         p->current_token.type == TOKEN_RSHIFT)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *right = parse_additive (p);
+ast_node *parse_shift(parser *p) {
+  ast_node *left = parse_additive(p);
+  while (p->current_token.type == TOKEN_LSHIFT || p->current_token.type == TOKEN_RSHIFT) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *right = parse_additive(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -803,21 +1093,17 @@ ast_node *parse_shift (parser *p)
   }
   return left;
 }
-ast_node *parse_relational (parser *p)
-{
-  ast_node *left = parse_shift (p);
-  while (p->current_token.type == TOKEN_LT ||
-         p->current_token.type == TOKEN_GT ||
-         p->current_token.type == TOKEN_LTE ||
-         p->current_token.type == TOKEN_GTE)
-  {
+ast_node *parse_relational(parser *p) {
+  ast_node *left = parse_shift(p);
+  while (p->current_token.type == TOKEN_LT || p->current_token.type == TOKEN_GT ||
+         p->current_token.type == TOKEN_LTE || p->current_token.type == TOKEN_GTE) {
 
-    token op = clone_token (p->current_token);
-    parser_advance (p);
+    token op = clone_token(p->current_token);
+    parser_advance(p);
 
-    ast_node *right = parse_shift (p);
+    ast_node *right = parse_shift(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -826,19 +1112,16 @@ ast_node *parse_relational (parser *p)
   }
   return left;
 }
-ast_node *parse_equality (parser *p)
-{
-  ast_node *left = parse_relational (p);
-  while (p->current_token.type == TOKEN_EQ ||
-         p->current_token.type == TOKEN_NEQ)
-  {
+ast_node *parse_equality(parser *p) {
+  ast_node *left = parse_relational(p);
+  while (p->current_token.type == TOKEN_EQ || p->current_token.type == TOKEN_NEQ) {
 
-    token op = clone_token (p->current_token);
-    parser_advance (p);
+    token op = clone_token(p->current_token);
+    parser_advance(p);
 
-    ast_node *right = parse_relational (p);
+    ast_node *right = parse_relational(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -847,185 +1130,160 @@ ast_node *parse_equality (parser *p)
   }
   return left;
 }
-ast_node *parse_primary (parser *p)
-{
-  if (!p) return NULL;
-  switch (p->current_token.type)
-  {
-    case TOKEN_NUMBER:
-    {
-      ast_node *node = create_ast_node (AST_NODE_TYPE_NUMBER);
-      node->tok = clone_token (p->current_token);
-      parser_advance (p);
-      return node;
+ast_node *parse_primary(parser *p) {
+  if (!p)
+    return NULL;
+  switch (p->current_token.type) {
+  case TOKEN_NUMBER: {
+    ast_node *node = create_ast_node(AST_NODE_TYPE_NUMBER);
+    node->tok = clone_token(p->current_token);
+    parser_advance(p);
+    return node;
+  }
+  case TOKEN_IDENTIFIER: {
+    ast_node *node = create_ast_node(AST_NODE_TYPE_IDENTIFIER);
+    node->tok = clone_token(p->current_token);
+    parser_advance(p);
+    return node;
+  }
+  case TOKEN_STRING:
+  case TOKEN_WIDE_STRING: {
+    ast_node *node = create_ast_node(AST_NODE_TYPE_STRING);
+    int is_wide = (p->current_token.type == TOKEN_WIDE_STRING);
+    node->tok = clone_token(p->current_token);
+    parser_advance(p);
+    while (p->current_token.type == TOKEN_STRING || p->current_token.type == TOKEN_WIDE_STRING) {
+      if (p->current_token.type == TOKEN_WIDE_STRING)
+        is_wide = 1;
+      size_t have = node->tok.value ? strlen(node->tok.value) : 0;
+      size_t add = p->current_token.value ? strlen(p->current_token.value) : 0;
+      char *joined = malloc(have + add + 1);
+      if (!joined)
+        break;
+      if (node->tok.value)
+        memcpy(joined, node->tok.value, have);
+      if (p->current_token.value)
+        memcpy(joined + have, p->current_token.value, add);
+      joined[have + add] = '\0';
+      free(node->tok.value);
+      node->tok.value = joined;
+      parser_advance(p);
     }
-    case TOKEN_IDENTIFIER:
-    {
-      ast_node *node = create_ast_node (AST_NODE_TYPE_IDENTIFIER);
-      node->tok = clone_token (p->current_token);
-      parser_advance (p);
-      return node;
-    }
-    case TOKEN_STRING:
-    {
-      ast_node *node = create_ast_node (AST_NODE_TYPE_STRING);
-      node->tok = clone_token (p->current_token);
-      parser_advance (p);
-      while (p->current_token.type == TOKEN_STRING)
-      {
-        size_t have = node->tok.value ? strlen (node->tok.value) : 0;
-        size_t add = p->current_token.value ? strlen (p->current_token.value) : 0;
-        char *joined = malloc (have + add + 1);
-        if (!joined) break;
-        if (node->tok.value) memcpy (joined, node->tok.value, have);
-        if (p->current_token.value) memcpy (joined + have, p->current_token.value, add);
-        joined[have + add] = '\0';
-        free (node->tok.value);
-        node->tok.value = joined;
-        parser_advance (p);
-      }
-      return node;
-    }
-    case TOKEN_CHAR_LITERAL:
-    {
-      ast_node *node = create_ast_node (AST_NODE_TYPE_CHAR_LITERAL);
-      node->tok = clone_token (p->current_token);
-      parser_advance (p);
-      return node;
-    }
-    case TOKEN_LPAREN:
-    {
-      parser_advance (p);
-      ast_node *node = parse_expression (p);
-      if (p->current_token.type != TOKEN_RPAREN)
-      {
-        parser_error (p, "expected ')' to close parenthesised expression");
-        free_ast (node);
-        return NULL;
-      }
-      parser_advance (p);
-      return node;
-    }
-    default:
-      parser_error (p, "expected an expression");
+    node->literal.is_wide = is_wide;
+    node->literal.bytes = decode_escapes(p, node->tok.value, is_wide, &node->literal.length);
+    return node;
+  }
+  case TOKEN_CHAR_LITERAL:
+  case TOKEN_WIDE_CHAR: {
+    ast_node *node = create_ast_node(AST_NODE_TYPE_CHAR_LITERAL);
+    int is_wide = (p->current_token.type == TOKEN_WIDE_CHAR);
+    node->tok = clone_token(p->current_token);
+    parser_advance(p);
+    node->literal.is_wide = is_wide;
+    node->literal.bytes = decode_escapes(p, node->tok.value, is_wide, &node->literal.length);
+    return node;
+  }
+  case TOKEN_LPAREN: {
+    parser_advance(p);
+    ast_node *node = parse_expression(p);
+    if (p->current_token.type != TOKEN_RPAREN) {
+      parser_error(p, "expected ')' to close parenthesised expression");
+      free_ast(node);
       return NULL;
+    }
+    parser_advance(p);
+    return node;
+  }
+  default:
+    parser_error(p, "expected an expression");
+    return NULL;
   }
 }
-ast_node *parse_postfix (parser *p)
-{
-  ast_node *left = parse_primary (p);
-  while (p && (p->current_token.type == TOKEN_LPAREN ||
-               p->current_token.type == TOKEN_LBRACKET ||
-               p->current_token.type == TOKEN_DOT ||
-               p->current_token.type == TOKEN_ARROW ||
-               p->current_token.type == TOKEN_PLUS_PLUS ||
-               p->current_token.type == TOKEN_MINUS_MINUS))
-  {
+ast_node *parse_postfix(parser *p) {
+  ast_node *left = parse_primary(p);
+  while (p &&
+         (p->current_token.type == TOKEN_LPAREN || p->current_token.type == TOKEN_LBRACKET ||
+          p->current_token.type == TOKEN_DOT || p->current_token.type == TOKEN_ARROW ||
+          p->current_token.type == TOKEN_PLUS_PLUS || p->current_token.type == TOKEN_MINUS_MINUS)) {
 
-    if (p->current_token.type == TOKEN_LPAREN)
-    {
-      parser_advance (p);
-      ast_node *node = create_ast_node (AST_NODE_TYPE_FUNCTION_CALL);
+    if (p->current_token.type == TOKEN_LPAREN) {
+      parser_advance(p);
+      ast_node *node = create_ast_node(AST_NODE_TYPE_FUNCTION_CALL);
       node->function_call.callable = left;
       node->function_call.arguments = NULL;
       node->function_call.arg_count = 0;
 
-      if (p->current_token.type != TOKEN_RPAREN)
-      {
-        do
-        {
-          ast_node *arg = parse_assignment (p);
-          if (arg)
-          {
-            node->function_call.arguments = realloc (node->function_call.arguments,
-                                                     sizeof (ast_node *)
-                                                     * (node->function_call.arg_count
-                                                        + 1));
+      if (p->current_token.type != TOKEN_RPAREN) {
+        do {
+          ast_node *arg = parse_assignment(p);
+          if (arg) {
+            node->function_call.arguments =
+                realloc(node->function_call.arguments,
+                        sizeof(ast_node *) * (node->function_call.arg_count + 1));
             node->function_call.arguments[node->function_call.arg_count++] = arg;
           }
-          if (p->current_token.type == TOKEN_COMMA)
-          {
-            parser_advance (p);
-          }
-          else
-          {
+          if (p->current_token.type == TOKEN_COMMA) {
+            parser_advance(p);
+          } else {
             break;
           }
-        }
-        while (1);
+        } while (1);
       }
-      if (p->current_token.type == TOKEN_RPAREN)
-      {
-        parser_advance (p);
+      if (p->current_token.type == TOKEN_RPAREN) {
+        parser_advance(p);
       }
       left = node;
-    }
-    else if (p->current_token.type == TOKEN_LBRACKET)
-    {
-      parser_advance (p);
-      ast_node *node = create_ast_node (AST_NODE_TYPE_ARRAY_SUBSCRIPT);
+    } else if (p->current_token.type == TOKEN_LBRACKET) {
+      parser_advance(p);
+      ast_node *node = create_ast_node(AST_NODE_TYPE_ARRAY_SUBSCRIPT);
       node->array_subscript.left = left;
-      node->array_subscript.index = parse_expression (p);
-      if (p->current_token.type == TOKEN_RBRACKET)
-      {
-        parser_advance (p);
+      node->array_subscript.index = parse_expression(p);
+      if (p->current_token.type == TOKEN_RBRACKET) {
+        parser_advance(p);
       }
       left = node;
-    }
-    else if (p->current_token.type == TOKEN_DOT
-             || p->current_token.type == TOKEN_ARROW)
-    {
+    } else if (p->current_token.type == TOKEN_DOT || p->current_token.type == TOKEN_ARROW) {
       int is_pointer = (p->current_token.type == TOKEN_ARROW) ? 1 : 0;
-      parser_advance (p);
+      parser_advance(p);
 
-      ast_node *node = create_ast_node (AST_NODE_TYPE_MEMBER_ACCESS);
+      ast_node *node = create_ast_node(AST_NODE_TYPE_MEMBER_ACCESS);
       node->member_access.left = left;
       node->member_access.is_pointer = is_pointer;
 
-      if (p->current_token.type == TOKEN_IDENTIFIER)
-      {
-        node->member_access.member_name = strdup (p->current_token.value);
-        parser_advance (p);
-      }
-      else
-      {
-        node->member_access.member_name = strdup ("unknown");
+      if (p->current_token.type == TOKEN_IDENTIFIER) {
+        node->member_access.member_name = strdup(p->current_token.value);
+        parser_advance(p);
+      } else {
+        node->member_access.member_name = strdup("unknown");
       }
       left = node;
-    }
-    else if (p->current_token.type == TOKEN_PLUS_PLUS
-             || p->current_token.type == TOKEN_MINUS_MINUS)
-    {
-      token op = clone_token (p->current_token);
-      parser_advance (p);
-      ast_node *node = create_ast_node (AST_NODE_TYPE_UNARY_OP);
+    } else if (p->current_token.type == TOKEN_PLUS_PLUS ||
+               p->current_token.type == TOKEN_MINUS_MINUS) {
+      token op = clone_token(p->current_token);
+      parser_advance(p);
+      ast_node *node = create_ast_node(AST_NODE_TYPE_UNARY_OP);
       node->unary_op.op = op;
       node->unary_op.operand = left;
       node->unary_op.is_postfix = 1;
       left = node;
-    }
-    else
-    {
+    } else {
       break; // Should not reach here based on while condition, but safe
     }
   }
   return left;
 }
-ast_node *parse_multiplicative (parser *p)
-{
-  ast_node *left = parse_unary (p);
+ast_node *parse_multiplicative(parser *p) {
+  ast_node *left = parse_unary(p);
 
-  while (p->current_token.type == TOKEN_STAR ||
-         p->current_token.type == TOKEN_SLASH ||
-         p->current_token.type == TOKEN_PERCENT)
-  {
+  while (p->current_token.type == TOKEN_STAR || p->current_token.type == TOKEN_SLASH ||
+         p->current_token.type == TOKEN_PERCENT) {
 
-    token op = clone_token (p->current_token);
-    parser_advance (p);
+    token op = clone_token(p->current_token);
+    parser_advance(p);
 
-    ast_node *right = parse_unary (p);
+    ast_node *right = parse_unary(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -1035,20 +1293,17 @@ ast_node *parse_multiplicative (parser *p)
 
   return left;
 }
-ast_node *parse_additive (parser *p)
-{
-  ast_node *left = parse_multiplicative (p);
+ast_node *parse_additive(parser *p) {
+  ast_node *left = parse_multiplicative(p);
 
-  while (p->current_token.type == TOKEN_PLUS ||
-         p->current_token.type == TOKEN_MINUS)
-  {
+  while (p->current_token.type == TOKEN_PLUS || p->current_token.type == TOKEN_MINUS) {
 
-    token op = clone_token (p->current_token);
-    parser_advance (p);
+    token op = clone_token(p->current_token);
+    parser_advance(p);
 
-    ast_node *right = parse_multiplicative (p);
+    ast_node *right = parse_multiplicative(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -1058,20 +1313,17 @@ ast_node *parse_additive (parser *p)
 
   return left;
 }
-ast_node *parse_ternary (parser *p)
-{
-  ast_node *cond = parse_logical_or (p);
-  if (p && p->current_token.type == TOKEN_QUESTION)
-  {
-    parser_advance (p);
-    ast_node *true_expr = parse_expression (p);
-    if (p->current_token.type == TOKEN_COLON)
-    {
-      parser_advance (p);
+ast_node *parse_ternary(parser *p) {
+  ast_node *cond = parse_logical_or(p);
+  if (p && p->current_token.type == TOKEN_QUESTION) {
+    parser_advance(p);
+    ast_node *true_expr = parse_expression(p);
+    if (p->current_token.type == TOKEN_COLON) {
+      parser_advance(p);
     }
-    ast_node *false_expr = parse_ternary (p);
+    ast_node *false_expr = parse_ternary(p);
 
-    ast_node *node = create_ast_node (AST_NODE_TYPE_TERNARY);
+    ast_node *node = create_ast_node(AST_NODE_TYPE_TERNARY);
     node->ternary.condition = cond;
     node->ternary.true_branch = true_expr;
     node->ternary.false_branch = false_expr;
@@ -1079,26 +1331,21 @@ ast_node *parse_ternary (parser *p)
   }
   return cond;
 }
-ast_node *parse_assignment (parser *p)
-{
-  ast_node *left = parse_ternary (p);
-  if (p->current_token.type == TOKEN_ASSIGN ||
-      p->current_token.type == TOKEN_PLUS_ASSIGN ||
-      p->current_token.type == TOKEN_MINUS_ASSIGN ||
-      p->current_token.type == TOKEN_STAR_ASSIGN ||
+ast_node *parse_assignment(parser *p) {
+  ast_node *left = parse_ternary(p);
+  if (p->current_token.type == TOKEN_ASSIGN || p->current_token.type == TOKEN_PLUS_ASSIGN ||
+      p->current_token.type == TOKEN_MINUS_ASSIGN || p->current_token.type == TOKEN_STAR_ASSIGN ||
       p->current_token.type == TOKEN_SLASH_ASSIGN ||
       p->current_token.type == TOKEN_PERCENT_ASSIGN ||
       p->current_token.type == TOKEN_LSHIFT_ASSIGN ||
       p->current_token.type == TOKEN_RSHIFT_ASSIGN ||
       p->current_token.type == TOKEN_AMPERSAND_ASSIGN ||
-      p->current_token.type == TOKEN_CARET_ASSIGN ||
-      p->current_token.type == TOKEN_PIPE_ASSIGN)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *right = parse_assignment (p); // Right-associative
+      p->current_token.type == TOKEN_CARET_ASSIGN || p->current_token.type == TOKEN_PIPE_ASSIGN) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *right = parse_assignment(p); // Right-associative
 
-    ast_node *node = create_ast_node (AST_NODE_TYPE_ASSIGNMENT);
+    ast_node *node = create_ast_node(AST_NODE_TYPE_ASSIGNMENT);
     node->assignment.op = op;
     node->assignment.left = left;
     node->assignment.right = right;
@@ -1106,16 +1353,14 @@ ast_node *parse_assignment (parser *p)
   }
   return left;
 }
-ast_node *parse_expression (parser *p)
-{
-  ast_node *left = parse_assignment (p);
-  while (p && p->current_token.type == TOKEN_COMMA)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *right = parse_assignment (p);
+ast_node *parse_expression(parser *p) {
+  ast_node *left = parse_assignment(p);
+  while (p && p->current_token.type == TOKEN_COMMA) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *right = parse_assignment(p);
 
-    ast_node *node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     node->binary_op.op = op;
     node->binary_op.left = left;
     node->binary_op.right = right;
@@ -1124,332 +1369,326 @@ ast_node *parse_expression (parser *p)
   }
   return left;
 }
-ast_node *parse_block (parser *p)
-{
-  if (p->current_token.type != TOKEN_LBRACE)
-  {
-    parser_error (p, "expected '{' to open a block");
+ast_node *parse_block(parser *p) {
+  if (p->current_token.type != TOKEN_LBRACE) {
+    parser_error(p, "expected '{' to open a block");
     return NULL;
   }
-  parser_advance (p);
+  parser_advance(p);
 
-  ast_node *node = create_ast_node (AST_NODE_TYPE_BLOCK);
+  ast_node *node = create_ast_node(AST_NODE_TYPE_BLOCK);
   node->block.statements = NULL;
   node->block.count = 0;
 
   parser_enter_scope(p);
 
-  while (p->current_token.type != TOKEN_RBRACE
-         && p->current_token.type != TOKEN_EOF)
-  {
-    ast_node *stmt = parse_statement (p);
-    if (stmt)
-    {
-      node->block.statements = realloc (node->block.statements,
-                                        sizeof (ast_node *)
-                                        * (node->block.count + 1));
+  while (p->current_token.type != TOKEN_RBRACE && p->current_token.type != TOKEN_EOF) {
+    ast_node *stmt = parse_statement(p);
+    if (stmt) {
+      node->block.statements =
+          realloc(node->block.statements, sizeof(ast_node *) * (node->block.count + 1));
       node->block.statements[node->block.count++] = stmt;
-    }
-    else
-    {
+    } else {
       parser_leave_scope(p);
-      free_ast (node);
+      free_ast(node);
       return NULL;
     }
   }
 
   parser_leave_scope(p);
 
-  if (p->current_token.type != TOKEN_RBRACE)
-  {
-    parser_error (p, "expected '}' to close a block");
-    free_ast (node);
+  if (p->current_token.type != TOKEN_RBRACE) {
+    parser_error(p, "expected '}' to close a block");
+    free_ast(node);
     return NULL;
   }
 
-  parser_advance (p);
+  parser_advance(p);
   return node;
 }
-ast_node *parse_statement (parser *p)
-{
-  if (!p) return NULL;
+ast_node *parse_statement(parser *p) {
+  if (!p)
+    return NULL;
 
   if (is_type_token(p) || p->current_token.type == TOKEN_TYPEDEF) {
     return parse_var_decl(p);
   }
 
-  switch (p->current_token.type)
-  {
-    case TOKEN_SEMICOLON:
-    {
-      parser_advance (p);
-      ast_node *node = create_ast_node (AST_NODE_TYPE_EMPTY);
-      return node;
+  switch (p->current_token.type) {
+  case TOKEN_SEMICOLON: {
+    parser_advance(p);
+    ast_node *node = create_ast_node(AST_NODE_TYPE_EMPTY);
+    return node;
+  }
+  case TOKEN_RETURN: {
+    parser_advance(p);
+    ast_node *node = create_ast_node(AST_NODE_TYPE_RETURN);
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      node->return_stmt.return_value = parse_expression(p);
     }
-    case TOKEN_RETURN:
-    {
-      parser_advance (p);
-      ast_node *node = create_ast_node (AST_NODE_TYPE_RETURN);
-      if (p->current_token.type != TOKEN_SEMICOLON)
-      {
-        node->return_stmt.return_value = parse_expression (p);
-      }
-      if (p->current_token.type != TOKEN_SEMICOLON)
-      {
-        parser_error (p, "expected ';' after return statement");
-        free_ast (node);
-        return NULL;
-      }
-      parser_advance (p);
-      return node;
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error(p, "expected ';' after return statement");
+      free_ast(node);
+      return NULL;
     }
-    case TOKEN_LBRACE:
-      return parse_block (p);
-    case TOKEN_IF:
-    {
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_LPAREN)
-      {
-        parser_error (p, "expected '(' after 'if'");
-        return NULL;
-      }
-      parser_advance (p);
-      ast_node *condition = parse_expression (p);
-      if (p->current_token.type != TOKEN_RPAREN)
-      {
-        parser_error (p, "expected ')' after condition");
-        return NULL;
-      }
-      parser_advance (p);
-      ast_node *then_branch = parse_statement (p);
-      ast_node *else_branch = NULL;
-      if (p->current_token.type == TOKEN_ELSE)
-      {
-        parser_advance (p);
-        else_branch = parse_statement (p);
-      }
-
-      ast_node *node = create_ast_node (AST_NODE_TYPE_IF);
-      node->if_stmt.condition = condition;
-      node->if_stmt.then_branch = then_branch;
-      node->if_stmt.else_branch = else_branch;
-      return node;
+    parser_advance(p);
+    return node;
+  }
+  case TOKEN_LBRACE:
+    return parse_block(p);
+  case TOKEN_IF: {
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_LPAREN) {
+      parser_error(p, "expected '(' after 'if'");
+      return NULL;
     }
-    case TOKEN_WHILE:
-    {
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_LPAREN)
-      {
-        parser_error (p, "expected '(' after 'while'");
-        return NULL;
-      }
-      parser_advance (p);
-      ast_node *condition = parse_expression (p);
-      if (p->current_token.type != TOKEN_RPAREN)
-      {
-        parser_error (p, "expected ')' after condition");
-        return NULL;
-      }
-      parser_advance (p);
-      ast_node *body = parse_statement (p);
-
-      ast_node *node = create_ast_node (AST_NODE_TYPE_WHILE);
-      node->while_stmt.condition = condition;
-      node->while_stmt.body = body;
-      return node;
+    parser_advance(p);
+    ast_node *condition = parse_expression(p);
+    if (p->current_token.type != TOKEN_RPAREN) {
+      parser_error(p, "expected ')' after condition");
+      return NULL;
+    }
+    parser_advance(p);
+    ast_node *then_branch = parse_statement(p);
+    ast_node *else_branch = NULL;
+    if (p->current_token.type == TOKEN_ELSE) {
+      parser_advance(p);
+      else_branch = parse_statement(p);
     }
 
-    case TOKEN_FOR:
-    {
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_LPAREN)
-      {
-        parser_error (p, "expected '(' after 'for'");
-        return NULL;
-      }
-      parser_advance (p);
-
-      // 1. אתחול (אופציונלי)
-      ast_node *init = NULL;
-      if (is_type_token(p)) {
-        init = parse_var_decl(p); // Consumes the semicolon
-      } else {
-        if (p->current_token.type != TOKEN_SEMICOLON)
-        {
-          init = parse_expression (p);
-        }
-        if (p->current_token.type != TOKEN_SEMICOLON)
-        {
-          parser_error (p, "expected ';' after the initialiser in 'for'");
-          return NULL;
-        }
-        parser_advance (p);
-      }
-
-      // 2. תנאי (אופציונלי)
-      ast_node *condition = NULL;
-      if (p->current_token.type != TOKEN_SEMICOLON)
-      {
-        condition = parse_expression (p);
-      }
-      if (p->current_token.type != TOKEN_SEMICOLON)
-      {
-        parser_error (p, "expected ';' after the condition in 'for'");
-        return NULL;
-      }
-      parser_advance (p);
-
-      // 3. קידום (אופציונלי)
-      ast_node *increment = NULL;
-      if (p->current_token.type != TOKEN_RPAREN)
-      {
-        increment = parse_expression (p);
-      }
-      if (p->current_token.type != TOKEN_RPAREN)
-      {
-        parser_error (p, "expected ')' after the increment in 'for'");
-        return NULL;
-      }
-      parser_advance (p);
-
-      // 4. גוף הלולאה
-      ast_node *body = parse_statement (p);
-
-      ast_node *node = create_ast_node (AST_NODE_TYPE_FOR);
-      node->for_stmt.init = init;
-      node->for_stmt.condition = condition;
-      node->for_stmt.increment = increment;
-      node->for_stmt.body = body;
-      return node;
+    ast_node *node = create_ast_node(AST_NODE_TYPE_IF);
+    node->if_stmt.condition = condition;
+    node->if_stmt.then_branch = then_branch;
+    node->if_stmt.else_branch = else_branch;
+    return node;
+  }
+  case TOKEN_WHILE: {
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_LPAREN) {
+      parser_error(p, "expected '(' after 'while'");
+      return NULL;
     }
-
-    case TOKEN_DO:
-    {
-      parser_advance (p);
-      ast_node *body = parse_statement (p);
-      if (p->current_token.type != TOKEN_WHILE) { parser_error (p, "expected 'while' after the body of 'do'"); return NULL; }
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_LPAREN) { parser_error (p, "expected '(' after 'while'"); return NULL; }
-      parser_advance (p);
-      ast_node *condition = parse_expression (p);
-      if (p->current_token.type != TOKEN_RPAREN) { parser_error (p, "expected ')' after condition"); return NULL; }
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_SEMICOLON) { parser_error (p, "expected ';' after 'do ... while (...)'"); return NULL; }
-      parser_advance (p);
-      
-      ast_node *node = create_ast_node (AST_NODE_TYPE_DO_WHILE);
-      node->do_while_stmt.body = body;
-      node->do_while_stmt.condition = condition;
-      return node;
+    parser_advance(p);
+    ast_node *condition = parse_expression(p);
+    if (p->current_token.type != TOKEN_RPAREN) {
+      parser_error(p, "expected ')' after condition");
+      return NULL;
     }
+    parser_advance(p);
+    ast_node *body = parse_statement(p);
 
-    case TOKEN_SWITCH:
-    {
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_LPAREN) { parser_error (p, "expected '(' after 'switch'"); return NULL; }
-      parser_advance (p);
-      ast_node *condition = parse_expression (p);
-      if (p->current_token.type != TOKEN_RPAREN) { parser_error (p, "expected ')' after the switch expression"); return NULL; }
-      parser_advance (p);
-      ast_node *body = parse_statement (p);
-      
-      ast_node *node = create_ast_node (AST_NODE_TYPE_SWITCH);
-      node->switch_stmt.condition = condition;
-      node->switch_stmt.body = body;
-      return node;
+    ast_node *node = create_ast_node(AST_NODE_TYPE_WHILE);
+    node->while_stmt.condition = condition;
+    node->while_stmt.body = body;
+    return node;
+  }
+
+  case TOKEN_FOR: {
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_LPAREN) {
+      parser_error(p, "expected '(' after 'for'");
+      return NULL;
     }
+    parser_advance(p);
 
-    case TOKEN_CASE:
-    {
-      parser_advance (p);
-      ast_node *value = parse_expression (p);
-      if (p->current_token.type != TOKEN_COLON) { parser_error (p, "expected ':' after the case label"); free_ast (value); return NULL; }
-      parser_advance (p);
-      ast_node *body = parse_statement (p);
-      
-      ast_node *node = create_ast_node (AST_NODE_TYPE_CASE);
-      node->case_stmt.value = value;
-      node->case_stmt.body = body;
-      return node;
-    }
-
-    case TOKEN_DEFAULT:
-    {
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_COLON) { parser_error (p, "expected ':' after 'default'"); return NULL; }
-      parser_advance (p);
-      ast_node *body = parse_statement (p);
-
-      ast_node *node = create_ast_node (AST_NODE_TYPE_DEFAULT);
-      node->default_stmt.body = body;
-      return node;
-    }
-
-    case TOKEN_GOTO:
-    {
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_IDENTIFIER) { parser_error (p, "expected a label name after 'goto'"); return NULL; }
-      ast_node *node = create_ast_node(AST_NODE_TYPE_GOTO);
-      node->goto_stmt.label_name = strdup(p->current_token.value);
-      parser_advance (p);
+    // 1. אתחול (אופציונלי)
+    ast_node *init = NULL;
+    if (is_type_token(p)) {
+      init = parse_var_decl(p); // Consumes the semicolon
+    } else {
       if (p->current_token.type != TOKEN_SEMICOLON) {
-          parser_error (p, "expected ';' after 'goto'");
-          free_ast(node);
-          return NULL;
+        init = parse_expression(p);
       }
-      parser_advance (p);
-      return node;
-    }
-
-    case TOKEN_BREAK:
-    {
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_SEMICOLON) { parser_error (p, "expected ';' after 'break'"); return NULL; }
-      parser_advance (p);
-      return create_ast_node (AST_NODE_TYPE_BREAK);
-    }
-
-    case TOKEN_CONTINUE:
-    {
-      parser_advance (p);
-      if (p->current_token.type != TOKEN_SEMICOLON) { parser_error (p, "expected ';' after 'continue'"); return NULL; }
-      parser_advance (p);
-      return create_ast_node (AST_NODE_TYPE_CONTINUE);
-    }
-
-    default:
-    {
-      if (p->current_token.type == TOKEN_IDENTIFIER && p->next_token.type == TOKEN_COLON) {
-          ast_node *node = create_ast_node(AST_NODE_TYPE_LABEL);
-          node->label_stmt.label_name = strdup(p->current_token.value);
-          parser_advance(p); // Consume identifier
-          parser_advance(p); // Consume colon
-          node->label_stmt.statement = parse_statement(p);
-          return node;
-      }
-
-      ast_node *node = parse_expression (p);
-      if (p->current_token.type != TOKEN_SEMICOLON)
-      {
-        parser_error (p, "expected ';' after expression statement");
-        free_ast (node);
+      if (p->current_token.type != TOKEN_SEMICOLON) {
+        parser_error(p, "expected ';' after the initialiser in 'for'");
         return NULL;
       }
-      parser_advance (p);
+      parser_advance(p);
+    }
+
+    // 2. תנאי (אופציונלי)
+    ast_node *condition = NULL;
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      condition = parse_expression(p);
+    }
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error(p, "expected ';' after the condition in 'for'");
+      return NULL;
+    }
+    parser_advance(p);
+
+    // 3. קידום (אופציונלי)
+    ast_node *increment = NULL;
+    if (p->current_token.type != TOKEN_RPAREN) {
+      increment = parse_expression(p);
+    }
+    if (p->current_token.type != TOKEN_RPAREN) {
+      parser_error(p, "expected ')' after the increment in 'for'");
+      return NULL;
+    }
+    parser_advance(p);
+
+    // 4. גוף הלולאה
+    ast_node *body = parse_statement(p);
+
+    ast_node *node = create_ast_node(AST_NODE_TYPE_FOR);
+    node->for_stmt.init = init;
+    node->for_stmt.condition = condition;
+    node->for_stmt.increment = increment;
+    node->for_stmt.body = body;
+    return node;
+  }
+
+  case TOKEN_DO: {
+    parser_advance(p);
+    ast_node *body = parse_statement(p);
+    if (p->current_token.type != TOKEN_WHILE) {
+      parser_error(p, "expected 'while' after the body of 'do'");
+      return NULL;
+    }
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_LPAREN) {
+      parser_error(p, "expected '(' after 'while'");
+      return NULL;
+    }
+    parser_advance(p);
+    ast_node *condition = parse_expression(p);
+    if (p->current_token.type != TOKEN_RPAREN) {
+      parser_error(p, "expected ')' after condition");
+      return NULL;
+    }
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error(p, "expected ';' after 'do ... while (...)'");
+      return NULL;
+    }
+    parser_advance(p);
+
+    ast_node *node = create_ast_node(AST_NODE_TYPE_DO_WHILE);
+    node->do_while_stmt.body = body;
+    node->do_while_stmt.condition = condition;
+    return node;
+  }
+
+  case TOKEN_SWITCH: {
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_LPAREN) {
+      parser_error(p, "expected '(' after 'switch'");
+      return NULL;
+    }
+    parser_advance(p);
+    ast_node *condition = parse_expression(p);
+    if (p->current_token.type != TOKEN_RPAREN) {
+      parser_error(p, "expected ')' after the switch expression");
+      return NULL;
+    }
+    parser_advance(p);
+    ast_node *body = parse_statement(p);
+
+    ast_node *node = create_ast_node(AST_NODE_TYPE_SWITCH);
+    node->switch_stmt.condition = condition;
+    node->switch_stmt.body = body;
+    return node;
+  }
+
+  case TOKEN_CASE: {
+    parser_advance(p);
+    ast_node *value = parse_expression(p);
+    if (p->current_token.type != TOKEN_COLON) {
+      parser_error(p, "expected ':' after the case label");
+      free_ast(value);
+      return NULL;
+    }
+    parser_advance(p);
+    ast_node *body = parse_statement(p);
+
+    ast_node *node = create_ast_node(AST_NODE_TYPE_CASE);
+    node->case_stmt.value = value;
+    node->case_stmt.body = body;
+    return node;
+  }
+
+  case TOKEN_DEFAULT: {
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_COLON) {
+      parser_error(p, "expected ':' after 'default'");
+      return NULL;
+    }
+    parser_advance(p);
+    ast_node *body = parse_statement(p);
+
+    ast_node *node = create_ast_node(AST_NODE_TYPE_DEFAULT);
+    node->default_stmt.body = body;
+    return node;
+  }
+
+  case TOKEN_GOTO: {
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_IDENTIFIER) {
+      parser_error(p, "expected a label name after 'goto'");
+      return NULL;
+    }
+    ast_node *node = create_ast_node(AST_NODE_TYPE_GOTO);
+    node->goto_stmt.label_name = strdup(p->current_token.value);
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error(p, "expected ';' after 'goto'");
+      free_ast(node);
+      return NULL;
+    }
+    parser_advance(p);
+    return node;
+  }
+
+  case TOKEN_BREAK: {
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error(p, "expected ';' after 'break'");
+      return NULL;
+    }
+    parser_advance(p);
+    return create_ast_node(AST_NODE_TYPE_BREAK);
+  }
+
+  case TOKEN_CONTINUE: {
+    parser_advance(p);
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error(p, "expected ';' after 'continue'");
+      return NULL;
+    }
+    parser_advance(p);
+    return create_ast_node(AST_NODE_TYPE_CONTINUE);
+  }
+
+  default: {
+    if (p->current_token.type == TOKEN_IDENTIFIER && p->next_token.type == TOKEN_COLON) {
+      ast_node *node = create_ast_node(AST_NODE_TYPE_LABEL);
+      node->label_stmt.label_name = strdup(p->current_token.value);
+      parser_advance(p); // Consume identifier
+      parser_advance(p); // Consume colon
+      node->label_stmt.statement = parse_statement(p);
       return node;
     }
+
+    ast_node *node = parse_expression(p);
+    if (p->current_token.type != TOKEN_SEMICOLON) {
+      parser_error(p, "expected ';' after expression statement");
+      free_ast(node);
+      return NULL;
+    }
+    parser_advance(p);
+    return node;
+  }
   }
 }
-ast_node *parse_bitwise_and (parser *p)
-{
-  ast_node *left = parse_equality (p);
-  while (p->current_token.type == TOKEN_AMPERSAND)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *right = parse_equality (p);
+ast_node *parse_bitwise_and(parser *p) {
+  ast_node *left = parse_equality(p);
+  while (p->current_token.type == TOKEN_AMPERSAND) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *right = parse_equality(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -1458,16 +1697,14 @@ ast_node *parse_bitwise_and (parser *p)
   }
   return left;
 }
-ast_node *parse_bitwise_xor (parser *p)
-{
-  ast_node *left = parse_bitwise_and (p);
-  while (p->current_token.type == TOKEN_CARET)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *right = parse_bitwise_and (p);
+ast_node *parse_bitwise_xor(parser *p) {
+  ast_node *left = parse_bitwise_and(p);
+  while (p->current_token.type == TOKEN_CARET) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *right = parse_bitwise_and(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -1476,16 +1713,14 @@ ast_node *parse_bitwise_xor (parser *p)
   }
   return left;
 }
-ast_node *parse_bitwise_or (parser *p)
-{
-  ast_node *left = parse_bitwise_xor (p);
-  while (p->current_token.type == TOKEN_PIPE)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *right = parse_bitwise_xor (p);
+ast_node *parse_bitwise_or(parser *p) {
+  ast_node *left = parse_bitwise_xor(p);
+  while (p->current_token.type == TOKEN_PIPE) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *right = parse_bitwise_xor(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -1494,16 +1729,14 @@ ast_node *parse_bitwise_or (parser *p)
   }
   return left;
 }
-ast_node *parse_logical_and (parser *p)
-{
-  ast_node *left = parse_bitwise_or (p);
-  while (p->current_token.type == TOKEN_AND)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *right = parse_bitwise_or (p);
+ast_node *parse_logical_and(parser *p) {
+  ast_node *left = parse_bitwise_or(p);
+  while (p->current_token.type == TOKEN_AND) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *right = parse_bitwise_or(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -1512,16 +1745,14 @@ ast_node *parse_logical_and (parser *p)
   }
   return left;
 }
-ast_node *parse_logical_or (parser *p)
-{
-  ast_node *left = parse_logical_and (p);
-  while (p->current_token.type == TOKEN_OR)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *right = parse_logical_and (p);
+ast_node *parse_logical_or(parser *p) {
+  ast_node *left = parse_logical_and(p);
+  while (p->current_token.type == TOKEN_OR) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *right = parse_logical_and(p);
 
-    ast_node *new_node = create_ast_node (AST_NODE_TYPE_BINARY_OP);
+    ast_node *new_node = create_ast_node(AST_NODE_TYPE_BINARY_OP);
     new_node->binary_op.op = op;
     new_node->binary_op.left = left;
     new_node->binary_op.right = right;
@@ -1530,41 +1761,42 @@ ast_node *parse_logical_or (parser *p)
   }
   return left;
 }
-static type_info* parse_type_name(parser *p) {
-    type_info *base = parse_type_specifier(p, NULL);
-    if (!base) return NULL;
-    type_info *decl = parse_declarator(p, clone_type_info(base), NULL);
-    free_type_info(base);
-    return decl;
+static type_info *parse_type_name(parser *p) {
+  type_info *base = parse_type_specifier(p, NULL);
+  if (!base)
+    return NULL;
+  type_info *decl = parse_declarator(p, clone_type_info(base), NULL);
+  free_type_info(base);
+  return decl;
 }
 
-ast_node *parse_unary (parser *p)
-{
+ast_node *parse_unary(parser *p) {
   if (p->current_token.type == TOKEN_LPAREN) {
     int next_is_type = token_starts_type(p, p->next_token);
 
     if (next_is_type) {
-        parser_advance(p); // Consume '('
-        type_info *cast_type = parse_type_name(p);
-        if (p->current_token.type == TOKEN_RPAREN) {
-            parser_advance(p); // Consume ')'
-            
-            if (p->current_token.type == TOKEN_LBRACE) {
-                ast_node *init_list = parse_initializer(p);
-                ast_node *node = create_ast_node(AST_NODE_TYPE_COMPOUND_LITERAL);
-                node->compound_literal.type = cast_type;
-                node->compound_literal.init_list = init_list;
-                return node;
-            }
+      parser_advance(p); // Consume '('
+      type_info *cast_type = parse_type_name(p);
+      if (p->current_token.type == TOKEN_RPAREN) {
+        parser_advance(p); // Consume ')'
 
-            ast_node *operand = parse_unary(p);
-            ast_node *node = create_ast_node(AST_NODE_TYPE_CAST);
-            node->cast_expr.type = cast_type;
-            node->cast_expr.operand = operand;
-            return node;
-        } else {
-            if (cast_type) free_type_info(cast_type);
+        if (p->current_token.type == TOKEN_LBRACE) {
+          ast_node *init_list = parse_initializer(p);
+          ast_node *node = create_ast_node(AST_NODE_TYPE_COMPOUND_LITERAL);
+          node->compound_literal.type = cast_type;
+          node->compound_literal.init_list = init_list;
+          return node;
         }
+
+        ast_node *operand = parse_unary(p);
+        ast_node *node = create_ast_node(AST_NODE_TYPE_CAST);
+        node->cast_expr.type = cast_type;
+        node->cast_expr.operand = operand;
+        return node;
+      } else {
+        if (cast_type)
+          free_type_info(cast_type);
+      }
     }
   }
 
@@ -1573,23 +1805,23 @@ ast_node *parse_unary (parser *p)
     parser_advance(p);
 
     if (p->current_token.type == TOKEN_LPAREN) {
-        int next_is_type = token_starts_type(p, p->next_token);
+      int next_is_type = token_starts_type(p, p->next_token);
 
-        if (next_is_type) {
-            parser_advance(p); // '('
-            type_info *sizeof_type = parse_type_name(p);
-            if (p->current_token.type == TOKEN_RPAREN) {
-                parser_advance(p); // ')'
-                ast_node *node = create_ast_node(AST_NODE_TYPE_UNARY_OP);
-                node->unary_op.op = op;
-                ast_node *dummy_cast = create_ast_node(AST_NODE_TYPE_CAST);
-                dummy_cast->cast_expr.type = sizeof_type;
-                dummy_cast->cast_expr.operand = NULL;
-                node->unary_op.operand = dummy_cast;
-                node->unary_op.is_postfix = 0;
-                return node;
-            }
+      if (next_is_type) {
+        parser_advance(p); // '('
+        type_info *sizeof_type = parse_type_name(p);
+        if (p->current_token.type == TOKEN_RPAREN) {
+          parser_advance(p); // ')'
+          ast_node *node = create_ast_node(AST_NODE_TYPE_UNARY_OP);
+          node->unary_op.op = op;
+          ast_node *dummy_cast = create_ast_node(AST_NODE_TYPE_CAST);
+          dummy_cast->cast_expr.type = sizeof_type;
+          dummy_cast->cast_expr.operand = NULL;
+          node->unary_op.operand = dummy_cast;
+          node->unary_op.is_postfix = 0;
+          return node;
         }
+      }
     }
 
     ast_node *operand = parse_unary(p);
@@ -1600,29 +1832,22 @@ ast_node *parse_unary (parser *p)
     return node;
   }
 
-  if (p->current_token.type == TOKEN_NOT ||
-      p->current_token.type == TOKEN_MINUS ||
-      p->current_token.type == TOKEN_TILDE ||
-      p->current_token.type == TOKEN_AMPERSAND ||
-      p->current_token.type == TOKEN_STAR ||
-      p->current_token.type == TOKEN_PLUS_PLUS ||
-      p->current_token.type == TOKEN_MINUS_MINUS ||
-      p->current_token.type == TOKEN_PLUS)
-  {
-    token op = clone_token (p->current_token);
-    parser_advance (p);
-    ast_node *operand = parse_unary (p);
+  if (p->current_token.type == TOKEN_NOT || p->current_token.type == TOKEN_MINUS ||
+      p->current_token.type == TOKEN_TILDE || p->current_token.type == TOKEN_AMPERSAND ||
+      p->current_token.type == TOKEN_STAR || p->current_token.type == TOKEN_PLUS_PLUS ||
+      p->current_token.type == TOKEN_MINUS_MINUS || p->current_token.type == TOKEN_PLUS) {
+    token op = clone_token(p->current_token);
+    parser_advance(p);
+    ast_node *operand = parse_unary(p);
 
-    ast_node *node = create_ast_node (AST_NODE_TYPE_UNARY_OP);
+    ast_node *node = create_ast_node(AST_NODE_TYPE_UNARY_OP);
     node->unary_op.op = op;
     node->unary_op.operand = operand;
     node->unary_op.is_postfix = 0;
 
     return node;
-  }
-  else
-  {
-    return parse_postfix (p);
+  } else {
+    return parse_postfix(p);
   }
 }
 static void parser_recover_top_level(parser *p) {
@@ -1631,8 +1856,12 @@ static void parser_recover_top_level(parser *p) {
     if (p->current_token.type == TOKEN_LBRACE) {
       depth++;
     } else if (p->current_token.type == TOKEN_RBRACE) {
-      if (depth > 0) depth--;
-      if (depth == 0) { parser_advance(p); return; }
+      if (depth > 0)
+        depth--;
+      if (depth == 0) {
+        parser_advance(p);
+        return;
+      }
     } else if (p->current_token.type == TOKEN_SEMICOLON && depth == 0) {
       parser_advance(p);
       return;
@@ -1642,7 +1871,8 @@ static void parser_recover_top_level(parser *p) {
 }
 
 ast_node *parse_program(parser *p) {
-  if(!p) return NULL;
+  if (!p)
+    return NULL;
 
   ast_node *prog_node = create_ast_node(AST_NODE_TYPE_PROGRAM);
   prog_node->program.declarations = NULL;
@@ -1656,7 +1886,7 @@ ast_node *parse_program(parser *p) {
       ast_node *decl = parse_top_level_declaration(p);
       if (decl) {
         ast_node **temp = realloc(prog_node->program.declarations,
-                                  sizeof(ast_node*) * (prog_node->program.count + 1));
+                                  sizeof(ast_node *) * (prog_node->program.count + 1));
         if (temp) {
           prog_node->program.declarations = temp;
           prog_node->program.declarations[prog_node->program.count++] = decl;
