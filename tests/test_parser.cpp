@@ -1,10 +1,23 @@
+#include <cstring>
+#include <direct.h>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <iostream>
+#include <string>
+#include <vector>
 
 extern "C" {
 #include "ast.h"
 #include "parser.h"
+#include "preprocessor.h"
 #include <stdlib.h>
+}
+
+static const char *size_text(const type_info *type) {
+  if (type == nullptr || type->array_size_expr == nullptr ||
+      type->array_size_expr->type != AST_NODE_TYPE_NUMBER)
+    return "";
+  return type->array_size_expr->tok.value;
 }
 
 class ParserTest : public ::testing::Test {
@@ -364,7 +377,7 @@ TEST_F(ParserTest, ParseVarDeclPointersAndArrays) {
   ASSERT_EQ(node->program.count, 1);
 
   ast_node *block = node->program.declarations[0];
-  EXPECT_EQ(block->type, AST_NODE_TYPE_BLOCK);
+  EXPECT_EQ(block->type, AST_NODE_TYPE_DECL_GROUP);
   EXPECT_EQ(block->block.count, 2);
 
   ast_node *decl1 = block->block.statements[0];
@@ -377,7 +390,7 @@ TEST_F(ParserTest, ParseVarDeclPointersAndArrays) {
   EXPECT_EQ(decl2->type, AST_NODE_TYPE_VAR_DECL);
   EXPECT_STREQ(decl2->var_decl.var_name, "arr");
   EXPECT_EQ(decl2->var_decl.type->kind, TYPE_ARRAY);
-  EXPECT_EQ(decl2->var_decl.type->array_size, 10);
+  EXPECT_STREQ(size_text(decl2->var_decl.type), "10");
   EXPECT_EQ(decl2->var_decl.type->ptr_to->kind, TYPE_PRIMITIVE);
 
   free_ast(node);
@@ -395,14 +408,14 @@ TEST_F(ParserTest, ParseFunctionDefWithPointers) {
   EXPECT_EQ(func->type, AST_NODE_TYPE_FUNCTION_DEF);
   EXPECT_STREQ(func->function_def.name, "alloc");
 
-  ASSERT_NE(func->function_def.return_type, nullptr);
-  EXPECT_EQ(func->function_def.return_type->kind, TYPE_POINTER);
-  EXPECT_EQ(func->function_def.return_type->ptr_to->kind, TYPE_PRIMITIVE);
-  EXPECT_EQ(func->function_def.return_type->ptr_to->base_type.type, TOKEN_VOID);
+  ASSERT_NE(func->function_def.type->ptr_to, nullptr);
+  EXPECT_EQ(func->function_def.type->ptr_to->kind, TYPE_POINTER);
+  EXPECT_EQ(func->function_def.type->ptr_to->ptr_to->kind, TYPE_PRIMITIVE);
+  EXPECT_EQ(func->function_def.type->ptr_to->ptr_to->prim, PRIM_VOID);
 
-  EXPECT_EQ(func->function_def.param_count, 1);
-  EXPECT_STREQ(func->function_def.parameters[0], "size");
-  EXPECT_EQ(func->function_def.param_types[0]->kind, TYPE_PRIMITIVE);
+  EXPECT_EQ(func->function_def.type->param_count, 1);
+  EXPECT_STREQ(func->function_def.type->param_names[0], "size");
+  EXPECT_EQ(func->function_def.type->param_types[0]->kind, TYPE_PRIMITIVE);
 
   free_ast(node);
 }
@@ -419,13 +432,13 @@ TEST_F(ParserTest, ParseTypedef) {
   ast_node *decl1 = node->program.declarations[0];
   EXPECT_EQ(decl1->type, AST_NODE_TYPE_VAR_DECL);
   EXPECT_STREQ(decl1->var_decl.var_name, "MyInt");
-  EXPECT_EQ(decl1->var_decl.is_typedef, 1);
+  EXPECT_EQ(decl1->var_decl.specs.storage_class, TOKEN_TYPEDEF);
 
   // Second decl: MyInt x;
   ast_node *decl2 = node->program.declarations[1];
   EXPECT_EQ(decl2->type, AST_NODE_TYPE_VAR_DECL);
   EXPECT_STREQ(decl2->var_decl.var_name, "x");
-  EXPECT_EQ(decl2->var_decl.is_typedef, 0);
+  EXPECT_EQ(decl2->var_decl.specs.storage_class, 0);
   EXPECT_EQ(decl2->var_decl.type->kind, TYPE_TYPEDEF);
   EXPECT_STREQ(decl2->var_decl.type->tag_name, "MyInt");
 
@@ -458,8 +471,8 @@ TEST_F(ParserTest, ParseInlineStruct) {
   ASSERT_EQ(node->program.count, 1);
 
   ast_node *block = node->program.declarations[0];
-  EXPECT_EQ(block->type, AST_NODE_TYPE_BLOCK);
-  if (block->type != AST_NODE_TYPE_BLOCK) {
+  EXPECT_EQ(block->type, AST_NODE_TYPE_DECL_GROUP);
+  if (block->type != AST_NODE_TYPE_DECL_GROUP) {
     free_ast(node);
     return;
   }
@@ -490,8 +503,8 @@ TEST_F(ParserTest, ParseEnum) {
   ASSERT_EQ(node->program.count, 1);
 
   ast_node *block = node->program.declarations[0];
-  EXPECT_EQ(block->type, AST_NODE_TYPE_BLOCK);
-  if (block->type != AST_NODE_TYPE_BLOCK) {
+  EXPECT_EQ(block->type, AST_NODE_TYPE_DECL_GROUP);
+  if (block->type != AST_NODE_TYPE_DECL_GROUP) {
     free_ast(node);
     return;
   }
@@ -522,7 +535,7 @@ TEST_F(ParserTest, ParseTypeCast) {
 
   EXPECT_EQ(init->type, AST_NODE_TYPE_CAST);
   EXPECT_EQ(init->cast_expr.type->kind, TYPE_PRIMITIVE);
-  EXPECT_EQ(init->cast_expr.type->base_type.type, TOKEN_INT);
+  EXPECT_EQ(init->cast_expr.type->prim, PRIM_INT);
   EXPECT_EQ(init->cast_expr.operand->type, AST_NODE_TYPE_NUMBER);
 
   free_ast(node);
@@ -603,10 +616,10 @@ TEST_F(ParserTest, ParseMultidimensionalArray) {
   EXPECT_EQ(decl->type, AST_NODE_TYPE_VAR_DECL);
 
   EXPECT_EQ(decl->var_decl.type->kind, TYPE_ARRAY);
-  EXPECT_EQ(decl->var_decl.type->array_size, 10);
+  EXPECT_STREQ(size_text(decl->var_decl.type), "10");
 
   EXPECT_EQ(decl->var_decl.type->ptr_to->kind, TYPE_ARRAY);
-  EXPECT_EQ(decl->var_decl.type->ptr_to->array_size, 20);
+  EXPECT_STREQ(size_text(decl->var_decl.type->ptr_to), "20");
 
   EXPECT_EQ(decl->var_decl.type->ptr_to->ptr_to->kind, TYPE_PRIMITIVE);
 
@@ -649,7 +662,7 @@ TEST_F(ParserTest, ParseQualifiersAndStorage) {
 
   EXPECT_EQ(decl->var_decl.type->is_const, 1);
   EXPECT_EQ(decl->var_decl.type->is_volatile, 1);
-  EXPECT_EQ(decl->var_decl.type->storage_class, TOKEN_STATIC);
+  EXPECT_EQ(decl->var_decl.specs.storage_class, TOKEN_STATIC);
   EXPECT_EQ(decl->var_decl.type->kind, TYPE_PRIMITIVE);
 
   free_ast(node);
@@ -669,8 +682,8 @@ TEST_F(ParserTest, ParseForLoopDeclaration) {
   free_ast(node);
 }
 
-TEST_F(ParserTest, ParseLongLongAndComplex) {
-  setup_parser("long long _Complex x;");
+TEST_F(ParserTest, ParseLongDoubleComplex) {
+  setup_parser("long double _Complex x;");
   ast_node *node = parse_program(&p);
 
   ASSERT_NE(node, nullptr);
@@ -678,7 +691,8 @@ TEST_F(ParserTest, ParseLongLongAndComplex) {
   ast_node *decl = node->program.declarations[0];
   EXPECT_EQ(decl->type, AST_NODE_TYPE_VAR_DECL);
 
-  EXPECT_EQ(decl->var_decl.type->is_long_long, 1);
+  EXPECT_EQ(p.had_error, 0);
+  EXPECT_EQ(decl->var_decl.type->prim, PRIM_LDOUBLE);
   EXPECT_EQ(decl->var_decl.type->is_complex, 1);
 
   free_ast(node);
@@ -763,7 +777,7 @@ TEST_F(ParserTest, ParseBool) {
   ast_node *decl = node->program.declarations[0];
   EXPECT_EQ(decl->type, AST_NODE_TYPE_VAR_DECL);
   EXPECT_EQ(decl->var_decl.type->kind, TYPE_PRIMITIVE);
-  EXPECT_EQ(decl->var_decl.type->base_type.type, TOKEN_BOOL);
+  EXPECT_EQ(decl->var_decl.type->prim, PRIM_BOOL);
 
   free_ast(node);
 }
@@ -775,8 +789,8 @@ TEST_F(ParserTest, ParseVariadic) {
   ASSERT_NE(node, nullptr);
   ASSERT_GE(node->program.count, 1);
   ast_node *func = node->program.declarations[0];
-  EXPECT_EQ(func->type, AST_NODE_TYPE_FUNCTION_DEF);
-  EXPECT_EQ(func->function_def.return_type->is_variadic, 1);
+  EXPECT_EQ(func->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(func->var_decl.type->is_variadic, 1);
 
   free_ast(node);
 }
@@ -842,9 +856,10 @@ TEST_F(ParserTest, ParseRestrictAndInline) {
   ASSERT_NE(node, nullptr);
   ASSERT_GE(node->program.count, 1);
   ast_node *func_decl = node->program.declarations[0];
-  EXPECT_EQ(func_decl->type, AST_NODE_TYPE_FUNCTION_DEF);
-  EXPECT_EQ(func_decl->function_def.return_type->storage_class, TOKEN_STATIC);
-  EXPECT_EQ(func_decl->function_def.param_types[0]->is_restrict, 1);
+  EXPECT_EQ(func_decl->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(func_decl->var_decl.specs.storage_class, TOKEN_STATIC);
+  EXPECT_EQ(func_decl->var_decl.specs.is_inline, 1);
+  EXPECT_EQ(func_decl->var_decl.type->param_types[0]->is_restrict, 1);
   free_ast(node);
 }
 
@@ -880,8 +895,8 @@ TEST_F(ParserTest, ParseMultipleVariadicArgs) {
   ASSERT_NE(node, nullptr);
   ASSERT_GE(node->program.count, 1);
   ast_node *func = node->program.declarations[0];
-  EXPECT_EQ(func->function_def.param_count, 2);
-  EXPECT_EQ(func->function_def.return_type->is_variadic, 1);
+  EXPECT_EQ(func->var_decl.type->param_count, 2);
+  EXPECT_EQ(func->var_decl.type->is_variadic, 1);
   free_ast(node);
 }
 
@@ -901,10 +916,10 @@ TEST_F(ParserTest, ParseFunctionPointerDeclaration) {
   ASSERT_EQ(t->kind, TYPE_POINTER);
   ASSERT_EQ(t->ptr_to->kind, TYPE_FUNCTION);
   EXPECT_EQ(t->ptr_to->param_count, 2);
-  EXPECT_EQ(t->ptr_to->param_types[0]->base_type.type, TOKEN_INT);
-  EXPECT_EQ(t->ptr_to->param_types[1]->base_type.type, TOKEN_INT);
+  EXPECT_EQ(t->ptr_to->param_types[0]->prim, PRIM_INT);
+  EXPECT_EQ(t->ptr_to->param_types[1]->prim, PRIM_INT);
   ASSERT_EQ(t->ptr_to->ptr_to->kind, TYPE_PRIMITIVE);
-  EXPECT_EQ(t->ptr_to->ptr_to->base_type.type, TOKEN_INT);
+  EXPECT_EQ(t->ptr_to->ptr_to->prim, PRIM_INT);
 
   free_ast(node);
 }
@@ -919,7 +934,7 @@ TEST_F(ParserTest, ParsePointerToArray) {
   type_info *t = node->program.declarations[0]->var_decl.type;
   ASSERT_EQ(t->kind, TYPE_POINTER);
   ASSERT_EQ(t->ptr_to->kind, TYPE_ARRAY);
-  EXPECT_EQ(t->ptr_to->array_size, 10);
+  EXPECT_STREQ(size_text(t->ptr_to), "10");
   EXPECT_EQ(t->ptr_to->ptr_to->kind, TYPE_PRIMITIVE);
 
   free_ast(node);
@@ -934,7 +949,7 @@ TEST_F(ParserTest, ParseArrayOfPointers) {
   ASSERT_GE(node->program.count, 1);
   type_info *t = node->program.declarations[0]->var_decl.type;
   ASSERT_EQ(t->kind, TYPE_ARRAY);
-  EXPECT_EQ(t->array_size, 10);
+  EXPECT_STREQ(size_text(t), "10");
   ASSERT_EQ(t->ptr_to->kind, TYPE_POINTER);
   EXPECT_EQ(t->ptr_to->ptr_to->kind, TYPE_PRIMITIVE);
 
@@ -950,9 +965,9 @@ TEST_F(ParserTest, ParseMultiDimensionalArrayOrder) {
   ASSERT_GE(node->program.count, 1);
   type_info *t = node->program.declarations[0]->var_decl.type;
   ASSERT_EQ(t->kind, TYPE_ARRAY);
-  EXPECT_EQ(t->array_size, 3);
+  EXPECT_STREQ(size_text(t), "3");
   ASSERT_EQ(t->ptr_to->kind, TYPE_ARRAY);
-  EXPECT_EQ(t->ptr_to->array_size, 4);
+  EXPECT_STREQ(size_text(t->ptr_to), "4");
   EXPECT_EQ(t->ptr_to->ptr_to->kind, TYPE_PRIMITIVE);
 
   free_ast(node);
@@ -967,9 +982,9 @@ TEST_F(ParserTest, ParseArrayOfArraysOfPointers) {
   ASSERT_GE(node->program.count, 1);
   type_info *t = node->program.declarations[0]->var_decl.type;
   ASSERT_EQ(t->kind, TYPE_ARRAY);
-  EXPECT_EQ(t->array_size, 2);
+  EXPECT_STREQ(size_text(t), "2");
   ASSERT_EQ(t->ptr_to->kind, TYPE_ARRAY);
-  EXPECT_EQ(t->ptr_to->array_size, 3);
+  EXPECT_STREQ(size_text(t->ptr_to), "3");
   EXPECT_EQ(t->ptr_to->ptr_to->kind, TYPE_POINTER);
 
   free_ast(node);
@@ -984,11 +999,11 @@ TEST_F(ParserTest, ParseArrayOfFunctionPointers) {
   ASSERT_GE(node->program.count, 1);
   type_info *t = node->program.declarations[0]->var_decl.type;
   ASSERT_EQ(t->kind, TYPE_ARRAY);
-  EXPECT_EQ(t->array_size, 3);
+  EXPECT_STREQ(size_text(t), "3");
   ASSERT_EQ(t->ptr_to->kind, TYPE_POINTER);
   ASSERT_EQ(t->ptr_to->ptr_to->kind, TYPE_FUNCTION);
   EXPECT_EQ(t->ptr_to->ptr_to->param_count, 0);
-  EXPECT_EQ(t->ptr_to->ptr_to->ptr_to->base_type.type, TOKEN_INT);
+  EXPECT_EQ(t->ptr_to->ptr_to->ptr_to->prim, PRIM_INT);
 
   free_ast(node);
 }
@@ -1004,7 +1019,7 @@ TEST_F(ParserTest, ParseTriplePointer) {
   ASSERT_EQ(t->kind, TYPE_POINTER);
   ASSERT_EQ(t->ptr_to->kind, TYPE_POINTER);
   ASSERT_EQ(t->ptr_to->ptr_to->kind, TYPE_POINTER);
-  EXPECT_EQ(t->ptr_to->ptr_to->ptr_to->base_type.type, TOKEN_CHAR);
+  EXPECT_EQ(t->ptr_to->ptr_to->ptr_to->prim, PRIM_CHAR);
 
   free_ast(node);
 }
@@ -1021,7 +1036,7 @@ TEST_F(ParserTest, ParseQualifiedPointer) {
   EXPECT_EQ(t->is_const, 1);
   EXPECT_EQ(t->is_restrict, 1);
   EXPECT_EQ(t->is_volatile, 0);
-  EXPECT_EQ(t->ptr_to->base_type.type, TOKEN_CHAR);
+  EXPECT_EQ(t->ptr_to->prim, PRIM_CHAR);
 
   free_ast(node);
 }
@@ -1036,7 +1051,7 @@ TEST_F(ParserTest, ParseFunctionPointerTypedefAndUse) {
   ast_node *td = node->program.declarations[0];
   ASSERT_EQ(td->type, AST_NODE_TYPE_VAR_DECL);
   EXPECT_STREQ(td->var_decl.var_name, "cb");
-  EXPECT_EQ(td->var_decl.is_typedef, 1);
+  EXPECT_EQ(td->var_decl.specs.storage_class, TOKEN_TYPEDEF);
   ASSERT_EQ(td->var_decl.type->kind, TYPE_POINTER);
   EXPECT_EQ(td->var_decl.type->ptr_to->kind, TYPE_FUNCTION);
 
@@ -1057,17 +1072,17 @@ TEST_F(ParserTest, ParseFunctionPointerParameter) {
   ASSERT_EQ(node->program.count, 1);
 
   ast_node *func = node->program.declarations[0];
-  ASSERT_EQ(func->type, AST_NODE_TYPE_FUNCTION_DEF);
-  EXPECT_STREQ(func->function_def.name, "q");
-  ASSERT_EQ(func->function_def.param_count, 1);
-  EXPECT_STREQ(func->function_def.parameters[0], "cmp");
+  ASSERT_EQ(func->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(func->var_decl.var_name, "q");
+  ASSERT_EQ(func->var_decl.type->param_count, 1);
+  EXPECT_STREQ(func->var_decl.type->param_names[0], "cmp");
 
-  type_info *cmp = func->function_def.param_types[0];
+  type_info *cmp = func->var_decl.type->param_types[0];
   ASSERT_EQ(cmp->kind, TYPE_POINTER);
   ASSERT_EQ(cmp->ptr_to->kind, TYPE_FUNCTION);
   EXPECT_EQ(cmp->ptr_to->param_count, 2);
   EXPECT_EQ(cmp->ptr_to->param_types[0]->kind, TYPE_POINTER);
-  EXPECT_EQ(cmp->ptr_to->ptr_to->base_type.type, TOKEN_INT);
+  EXPECT_EQ(cmp->ptr_to->ptr_to->prim, PRIM_INT);
 
   free_ast(node);
 }
@@ -1085,7 +1100,7 @@ TEST_F(ParserTest, ParsePointerToFunctionReturningPointerToArray) {
   EXPECT_EQ(t->ptr_to->param_count, 0);
   ASSERT_EQ(t->ptr_to->ptr_to->kind, TYPE_POINTER);
   ASSERT_EQ(t->ptr_to->ptr_to->ptr_to->kind, TYPE_ARRAY);
-  EXPECT_EQ(t->ptr_to->ptr_to->ptr_to->array_size, 3);
+  EXPECT_STREQ(size_text(t->ptr_to->ptr_to->ptr_to), "3");
 
   free_ast(node);
 }
@@ -1098,22 +1113,22 @@ TEST_F(ParserTest, ParseFunctionReturningFunctionPointer) {
   ASSERT_EQ(node->program.count, 1);
 
   ast_node *func = node->program.declarations[0];
-  ASSERT_EQ(func->type, AST_NODE_TYPE_FUNCTION_DEF);
-  EXPECT_STREQ(func->function_def.name, "signal");
-  ASSERT_EQ(func->function_def.param_count, 2);
-  EXPECT_STREQ(func->function_def.parameters[0], "sig");
-  EXPECT_STREQ(func->function_def.parameters[1], "h");
+  ASSERT_EQ(func->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(func->var_decl.var_name, "signal");
+  ASSERT_EQ(func->var_decl.type->param_count, 2);
+  EXPECT_STREQ(func->var_decl.type->param_names[0], "sig");
+  EXPECT_STREQ(func->var_decl.type->param_names[1], "h");
 
-  type_info *h = func->function_def.param_types[1];
+  type_info *h = func->var_decl.type->param_types[1];
   ASSERT_EQ(h->kind, TYPE_POINTER);
   ASSERT_EQ(h->ptr_to->kind, TYPE_FUNCTION);
   EXPECT_EQ(h->ptr_to->param_count, 1);
 
-  type_info *ret = func->function_def.return_type;
+  type_info *ret = func->var_decl.type->ptr_to;
   ASSERT_EQ(ret->kind, TYPE_POINTER);
   ASSERT_EQ(ret->ptr_to->kind, TYPE_FUNCTION);
   EXPECT_EQ(ret->ptr_to->param_count, 1);
-  EXPECT_EQ(ret->ptr_to->ptr_to->base_type.type, TOKEN_VOID);
+  EXPECT_EQ(ret->ptr_to->ptr_to->prim, PRIM_VOID);
 
   free_ast(node);
 }
@@ -1146,8 +1161,8 @@ TEST_F(ParserTest, ParseVoidParameterListIsEmpty) {
 
   ASSERT_GE(node->program.count, 1);
   ast_node *func = node->program.declarations[0];
-  ASSERT_EQ(func->type, AST_NODE_TYPE_FUNCTION_DEF);
-  EXPECT_EQ(func->function_def.param_count, 0);
+  ASSERT_EQ(func->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(func->var_decl.type->param_count, 0);
 
   free_ast(node);
 }
@@ -1160,8 +1175,8 @@ TEST_F(ParserTest, ParseEmptyParameterList) {
 
   ASSERT_GE(node->program.count, 1);
   ast_node *func = node->program.declarations[0];
-  ASSERT_EQ(func->type, AST_NODE_TYPE_FUNCTION_DEF);
-  EXPECT_EQ(func->function_def.param_count, 0);
+  ASSERT_EQ(func->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(func->var_decl.type->param_count, 0);
 
   free_ast(node);
 }
@@ -1174,11 +1189,11 @@ TEST_F(ParserTest, ParseUnnamedParameters) {
 
   ASSERT_GE(node->program.count, 1);
   ast_node *func = node->program.declarations[0];
-  ASSERT_EQ(func->function_def.param_count, 2);
-  EXPECT_EQ(func->function_def.parameters[0], nullptr);
-  EXPECT_EQ(func->function_def.parameters[1], nullptr);
-  EXPECT_EQ(func->function_def.param_types[0]->base_type.type, TOKEN_INT);
-  EXPECT_EQ(func->function_def.param_types[1]->kind, TYPE_POINTER);
+  ASSERT_EQ(func->var_decl.type->param_count, 2);
+  EXPECT_EQ(func->var_decl.type->param_names[0], nullptr);
+  EXPECT_EQ(func->var_decl.type->param_names[1], nullptr);
+  EXPECT_EQ(func->var_decl.type->param_types[0]->prim, PRIM_INT);
+  EXPECT_EQ(func->var_decl.type->param_types[1]->kind, TYPE_POINTER);
 
   free_ast(node);
 }
@@ -1191,10 +1206,10 @@ TEST_F(ParserTest, ParseStaticArrayParameter) {
 
   ASSERT_GE(node->program.count, 1);
   ast_node *func = node->program.declarations[0];
-  ASSERT_EQ(func->function_def.param_count, 1);
-  EXPECT_STREQ(func->function_def.parameters[0], "a");
-  ASSERT_EQ(func->function_def.param_types[0]->kind, TYPE_ARRAY);
-  EXPECT_EQ(func->function_def.param_types[0]->array_size, 4);
+  ASSERT_EQ(func->var_decl.type->param_count, 1);
+  EXPECT_STREQ(func->var_decl.type->param_names[0], "a");
+  ASSERT_EQ(func->var_decl.type->param_types[0]->kind, TYPE_ARRAY);
+  EXPECT_STREQ(size_text(func->var_decl.type->param_types[0]), "4");
 
   free_ast(node);
 }
@@ -1401,7 +1416,7 @@ TEST_F(ParserTest, ParseCastToQualifiedPointer) {
   type_info *t = ret->return_stmt.return_value->cast_expr.type;
   ASSERT_EQ(t->kind, TYPE_POINTER);
   EXPECT_EQ(t->ptr_to->is_const, 1);
-  EXPECT_EQ(t->ptr_to->base_type.type, TOKEN_CHAR);
+  EXPECT_EQ(t->ptr_to->prim, PRIM_CHAR);
 
   free_ast(node);
 }
@@ -1424,7 +1439,7 @@ TEST_F(ParserTest, ParseCastToBool) {
   ast_node *body = node->program.declarations[0]->function_def.body;
   ast_node *val = body->block.statements[0]->return_stmt.return_value;
   ASSERT_EQ(val->type, AST_NODE_TYPE_CAST);
-  EXPECT_EQ(val->cast_expr.type->base_type.type, TOKEN_BOOL);
+  EXPECT_EQ(val->cast_expr.type->prim, PRIM_BOOL);
 
   free_ast(node);
 }
@@ -1610,7 +1625,7 @@ TEST_F(ParserTest, EllipsisStillLexesAfterDotFloatChange) {
   ASSERT_NE(node, nullptr);
   EXPECT_EQ(p.had_error, 0);
   ASSERT_GE(node->program.count, 1);
-  EXPECT_EQ(node->program.declarations[0]->function_def.return_type->is_variadic, 1);
+  EXPECT_EQ(node->program.declarations[0]->var_decl.type->is_variadic, 1);
   free_ast(node);
 }
 
@@ -1788,12 +1803,87 @@ TEST_F(ParserTest, AllSimpleEscapesDecode) {
   free_ast(node);
 }
 
-TEST_F(ParserTest, ConcatenationDecodesTheJoinedText) {
+TEST_F(ParserTest, ConcatenationJoinsTheDecodedPieces) {
   setup_parser("char *s = \"a\\n\" \"b\";");
   ast_node *node = parse_program(&p);
   ast_node *init = node->program.declarations[0]->var_decl.init_value;
   ASSERT_EQ(init->literal.length, 3);
   EXPECT_EQ(init->literal.bytes[1], '\n');
+  free_ast(node);
+}
+
+TEST_F(ParserTest, EachConcatenatedPieceIsDecodedOnItsOwn) {
+  setup_parser("char *s = \"\\x1\" \"2\";");
+  ast_node *node = parse_program(&p);
+  EXPECT_EQ(p.had_error, 0);
+  ast_node *init = node->program.declarations[0]->var_decl.init_value;
+  ASSERT_EQ(init->literal.length, 2) << "\\x1 then 2, not the single escape \\x12";
+  EXPECT_EQ(init->literal.bytes[0], 1);
+  EXPECT_EQ(init->literal.bytes[1], '2');
+  EXPECT_EQ(init->literal.bytes[2], 0);
+  free_ast(node);
+}
+
+TEST_F(ParserTest, EveryPieceOfAWideConcatenationIsDecodedWide) {
+  setup_parser("int *s = \"\\xffff\" L\"a\" \"\\u20ac\";");
+  ast_node *node = parse_program(&p);
+  EXPECT_EQ(p.had_error, 0) << "\\xffff is out of range only for a narrow literal";
+  ast_node *init = node->program.declarations[0]->var_decl.init_value;
+  EXPECT_EQ(init->literal.is_wide, 1);
+  ASSERT_EQ(init->literal.length, 3);
+  EXPECT_EQ(std::vector<char>(init->literal.bytes, init->literal.bytes + 8),
+            std::vector<char>({'\xff', '\xff', 'a', 0, '\xac', 0x20, 0, 0}));
+  free_ast(node);
+}
+
+TEST_F(ParserTest, WideLiteralsHoldSixteenBitUnits) {
+  setup_parser("int *s = L\"\\U0001F600\"; int c = L'\\u20ac';");
+  ast_node *node = parse_program(&p);
+  EXPECT_EQ(p.had_error, 0);
+  ast_node *s = node->program.declarations[0]->var_decl.init_value;
+  ASSERT_EQ(s->literal.length, 2);
+  EXPECT_EQ(std::vector<char>(s->literal.bytes, s->literal.bytes + 6),
+            std::vector<char>({0x3d, '\xd8', 0x00, '\xde', 0, 0}));
+  ast_node *c = node->program.declarations[1]->var_decl.init_value;
+  ASSERT_EQ(c->literal.length, 1);
+  EXPECT_EQ(std::vector<char>(c->literal.bytes, c->literal.bytes + 4),
+            std::vector<char>({'\xac', 0x20, 0, 0}));
+  free_ast(node);
+}
+
+TEST_F(ParserTest, AMultiCharacterConstantKeepsEveryCharacter) {
+  setup_parser("int c = 'ab';");
+  ast_node *node = parse_program(&p);
+  EXPECT_EQ(p.had_error, 0);
+  ast_node *init = node->program.declarations[0]->var_decl.init_value;
+  ASSERT_EQ(init->type, AST_NODE_TYPE_CHAR_LITERAL);
+  ASSERT_EQ(init->literal.length, 2);
+  EXPECT_EQ(init->literal.bytes[0], 'a');
+  EXPECT_EQ(init->literal.bytes[1], 'b');
+  free_ast(node);
+}
+
+TEST_F(ParserTest, ALiteralErrorPointsAtTheLiteralThatHasIt) {
+  setup_parser("char *s = \"ok\"\n  \"\\q\" \"\\x\";\nint c = '\\777', d;");
+  testing::internal::CaptureStderr();
+  ast_node *node = parse_program(&p);
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(p.had_error, 3);
+  EXPECT_EQ(diagnostics, "2:3: error: unknown escape sequence in literal (at '\\q')\n"
+                         "2:8: error: \\x used with no following hex digits (at '\\x')\n"
+                         "3:9: error: octal escape sequence out of range (at '\\777')\n");
+  free_ast(node);
+}
+
+TEST_F(ParserTest, EveryNumberIsCheckedWhenItBecomesAToken) {
+  setup_parser("void f(void) {\n  int a = 08;\n  double b = 1e + 1.5f;\n  a = 0x1p-3 + 0x;\n}\n");
+  testing::internal::CaptureStderr();
+  ast_node *node = parse_program(&p);
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(p.had_error, 3);
+  EXPECT_EQ(diagnostics, "2:11: error: invalid digit in an octal constant (at '08')\n"
+                         "3:14: error: exponent has no digits (at '1e')\n"
+                         "4:16: error: hexadecimal constant has no digits (at '0x')\n");
   free_ast(node);
 }
 
@@ -1863,4 +1953,2412 @@ TEST_F(ParserTest, OctalEscapeOutOfRangeIsAnError) {
   ast_node *node = parse_program(&p);
   EXPECT_GT(p.had_error, 0);
   free_ast(node);
+}
+
+static bool differ(std::string &why, const std::string &at, const char *what) {
+  why = at + ": " + what;
+  return false;
+}
+
+static bool same_str(const char *a, const char *b) {
+  if (a == nullptr || b == nullptr)
+    return a == b;
+  return strcmp(a, b) == 0;
+}
+
+static bool same_type(const type_info *a, const type_info *b, const std::string &at,
+                      std::string &why) {
+  if (a == nullptr || b == nullptr)
+    return a == b || differ(why, at, "one type is null");
+  if (a->kind != b->kind || a->is_const != b->is_const || a->is_volatile != b->is_volatile ||
+      a->is_restrict != b->is_restrict || a->array_size != b->array_size ||
+      a->param_count != b->param_count || a->is_variadic != b->is_variadic)
+    return differ(why, at, "type fields differ");
+  if (a->prim != b->prim || a->is_complex != b->is_complex || a->is_imaginary != b->is_imaginary)
+    return differ(why, at, "arithmetic types differ");
+  if (!same_str(a->tag_name, b->tag_name))
+    return differ(why, at, "tag names differ");
+  if (!same_type(a->ptr_to, b->ptr_to, at + "/ptr_to", why))
+    return false;
+  for (int i = 0; i < a->param_count; i++) {
+    if (!same_type(a->param_types[i], b->param_types[i], at + "/param" + std::to_string(i), why))
+      return false;
+  }
+  return true;
+}
+
+static bool same_ast(const ast_node *a, const ast_node *b, const std::string &at, std::string &why);
+
+static bool same_list(ast_node **a, ast_node **b, int n, const std::string &at, std::string &why) {
+  for (int i = 0; i < n; i++) {
+    if (!same_ast(a[i], b[i], at + "[" + std::to_string(i) + "]", why))
+      return false;
+  }
+  return true;
+}
+
+static bool same_ast(const ast_node *a, const ast_node *b, const std::string &at,
+                     std::string &why) {
+  if (a == nullptr || b == nullptr)
+    return a == b || differ(why, at, "one node is null");
+  if (a->type != b->type)
+    return differ(why, at, "node types differ");
+  if (a->tok.type != b->tok.type || !same_str(a->tok.value, b->tok.value))
+    return differ(why, at, "node tokens differ");
+  if (a->loc.line != b->loc.line || a->loc.column != b->loc.column)
+    return differ(why, at, "node locations differ");
+
+  switch (a->type) {
+  case AST_NODE_TYPE_PROGRAM:
+    if (a->program.count != b->program.count)
+      return differ(why, at, "declaration counts differ");
+    return same_list(a->program.declarations, b->program.declarations, a->program.count, at, why);
+  case AST_NODE_TYPE_BLOCK:
+  case AST_NODE_TYPE_DECL_GROUP:
+    if (a->block.count != b->block.count)
+      return differ(why, at, "statement counts differ");
+    return same_list(a->block.statements, b->block.statements, a->block.count, at, why);
+  case AST_NODE_TYPE_FUNCTION_DEF:
+    if (!same_str(a->function_def.name, b->function_def.name) ||
+        a->function_def.type->param_count != b->function_def.type->param_count ||
+        a->function_def.specs.storage_class != b->function_def.specs.storage_class ||
+        a->function_def.specs.is_inline != b->function_def.specs.is_inline)
+      return differ(why, at, "function signatures differ");
+    for (int i = 0; i < a->function_def.type->param_count; i++) {
+      if (!same_str(a->function_def.type->param_names[i], b->function_def.type->param_names[i]))
+        return differ(why, at, "parameter names differ");
+      if (!same_type(a->function_def.type->param_types[i], b->function_def.type->param_types[i],
+                     at + "/param" + std::to_string(i), why))
+        return false;
+    }
+    return same_type(a->function_def.type->ptr_to, b->function_def.type->ptr_to, at + "/return",
+                     why) &&
+           same_ast(a->function_def.body, b->function_def.body, at + "/body", why);
+  case AST_NODE_TYPE_VAR_DECL:
+    if (!same_str(a->var_decl.var_name, b->var_decl.var_name) ||
+        a->var_decl.specs.storage_class != b->var_decl.specs.storage_class ||
+        a->var_decl.specs.is_inline != b->var_decl.specs.is_inline)
+      return differ(why, at, "declarations differ");
+    return same_type(a->var_decl.type, b->var_decl.type, at + "/type", why) &&
+           same_ast(a->var_decl.init_value, b->var_decl.init_value, at + "/init", why) &&
+           same_ast(a->var_decl.bitfield_width, b->var_decl.bitfield_width, at + "/width", why);
+  case AST_NODE_TYPE_IF:
+    return same_ast(a->if_stmt.condition, b->if_stmt.condition, at + "/cond", why) &&
+           same_ast(a->if_stmt.then_branch, b->if_stmt.then_branch, at + "/then", why) &&
+           same_ast(a->if_stmt.else_branch, b->if_stmt.else_branch, at + "/else", why);
+  case AST_NODE_TYPE_WHILE:
+    return same_ast(a->while_stmt.condition, b->while_stmt.condition, at + "/cond", why) &&
+           same_ast(a->while_stmt.body, b->while_stmt.body, at + "/body", why);
+  case AST_NODE_TYPE_FOR:
+    return same_ast(a->for_stmt.init, b->for_stmt.init, at + "/init", why) &&
+           same_ast(a->for_stmt.condition, b->for_stmt.condition, at + "/cond", why) &&
+           same_ast(a->for_stmt.increment, b->for_stmt.increment, at + "/incr", why) &&
+           same_ast(a->for_stmt.body, b->for_stmt.body, at + "/body", why);
+  case AST_NODE_TYPE_RETURN:
+    return same_ast(a->return_stmt.return_value, b->return_stmt.return_value, at + "/value", why);
+  case AST_NODE_TYPE_BINARY_OP:
+    if (a->binary_op.op.type != b->binary_op.op.type)
+      return differ(why, at, "binary operators differ");
+    return same_ast(a->binary_op.left, b->binary_op.left, at + "/left", why) &&
+           same_ast(a->binary_op.right, b->binary_op.right, at + "/right", why);
+  case AST_NODE_TYPE_UNARY_OP:
+    if (a->unary_op.op.type != b->unary_op.op.type ||
+        a->unary_op.is_postfix != b->unary_op.is_postfix)
+      return differ(why, at, "unary operators differ");
+    return same_ast(a->unary_op.operand, b->unary_op.operand, at + "/operand", why);
+  case AST_NODE_TYPE_ASSIGNMENT:
+    if (a->assignment.op.type != b->assignment.op.type)
+      return differ(why, at, "assignment operators differ");
+    return same_ast(a->assignment.left, b->assignment.left, at + "/left", why) &&
+           same_ast(a->assignment.right, b->assignment.right, at + "/right", why);
+  case AST_NODE_TYPE_FUNCTION_CALL:
+    if (a->function_call.arg_count != b->function_call.arg_count)
+      return differ(why, at, "argument counts differ");
+    return same_ast(a->function_call.callable, b->function_call.callable, at + "/callee", why) &&
+           same_list(a->function_call.arguments, b->function_call.arguments,
+                     a->function_call.arg_count, at + "/args", why);
+  case AST_NODE_TYPE_STRING:
+    if (a->literal.length != b->literal.length || a->literal.is_wide != b->literal.is_wide ||
+        memcmp(a->literal.bytes, b->literal.bytes, a->literal.length) != 0)
+      return differ(why, at, "string literals differ");
+    return true;
+  case AST_NODE_TYPE_NUMBER:
+  case AST_NODE_TYPE_IDENTIFIER:
+    return true;
+  default:
+    return differ(why, at,
+                  ("comparator does not handle node type " + std::to_string(a->type)).c_str());
+  }
+}
+
+class BridgeTest : public ::testing::Test {
+protected:
+  token_buf tb;
+  parser p;
+  bool have_parser = false;
+
+  void SetUp() override {
+    token_buf_init(&tb);
+  }
+
+  ast_node *parse_preprocessed(const char *source) {
+    EXPECT_EQ(pp_run(&tb, source), 0);
+    parser_init_from_buf(&p, &tb);
+    have_parser = true;
+    return parse_program(&p);
+  }
+
+  void TearDown() override {
+    if (have_parser) {
+      parser_destroy(&p);
+    }
+    token_buf_free(&tb);
+  }
+};
+
+TEST_F(BridgeTest, PreprocessedTokensParseToTheSameTreeAsLexedTokens) {
+  const char *source = "int counter = 0;\n"
+                       "static const char *name = \"abc\";\n"
+                       "int add(int a, int b) { return a + b; }\n"
+                       "int main(void) {\n"
+                       "  int i;\n"
+                       "  for (i = 0; i < 10; i++) {\n"
+                       "    if (i % 2 == 0)\n"
+                       "      counter = add(counter, i);\n"
+                       "    else\n"
+                       "      counter--;\n"
+                       "  }\n"
+                       "  while (counter > 100)\n"
+                       "    counter = counter - 1;\n"
+                       "  return counter;\n"
+                       "}\n";
+
+  lexer lex;
+  lexer_init(&lex, source);
+  parser direct;
+  parser_init(&direct, &lex);
+  ast_node *expected = parse_program(&direct);
+
+  ast_node *actual = parse_preprocessed(source);
+
+  ASSERT_NE(expected, nullptr);
+  ASSERT_NE(actual, nullptr);
+  EXPECT_EQ(direct.had_error, 0);
+  EXPECT_EQ(p.had_error, 0);
+  EXPECT_EQ(expected->program.count, 4);
+  std::string why;
+  EXPECT_TRUE(same_ast(expected, actual, "program", why)) << why;
+
+  free_ast(expected);
+  free_ast(actual);
+  parser_destroy(&direct);
+}
+
+TEST_F(BridgeTest, AnObjectLikeMacroCanExpandToAWholeDeclaration) {
+  ast_node *program = parse_preprocessed("#define DECL int answer = 42;\nDECL\n");
+  ASSERT_NE(program, nullptr);
+  EXPECT_EQ(p.had_error, 0);
+  ASSERT_EQ(program->program.count, 1);
+  ast_node *decl = program->program.declarations[0];
+  ASSERT_EQ(decl->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(decl->var_decl.var_name, "answer");
+  ASSERT_NE(decl->var_decl.init_value, nullptr);
+  EXPECT_EQ(decl->var_decl.init_value->type, AST_NODE_TYPE_NUMBER);
+  EXPECT_STREQ(decl->var_decl.init_value->tok.value, "42");
+  free_ast(program);
+}
+
+TEST_F(BridgeTest, AFunctionLikeMacroCanSupplyAnInitialiser) {
+  ast_node *program = parse_preprocessed("#define SQ(a) ((a) * (a))\nint x = SQ(3);\n");
+  ASSERT_NE(program, nullptr);
+  EXPECT_EQ(p.had_error, 0);
+  ASSERT_EQ(program->program.count, 1);
+  ast_node *init = program->program.declarations[0]->var_decl.init_value;
+  ASSERT_NE(init, nullptr);
+  ASSERT_EQ(init->type, AST_NODE_TYPE_BINARY_OP);
+  EXPECT_EQ(init->binary_op.op.type, TOKEN_STAR);
+  ASSERT_NE(init->binary_op.left, nullptr);
+  ASSERT_NE(init->binary_op.right, nullptr);
+  EXPECT_STREQ(init->binary_op.left->tok.value, "3");
+  EXPECT_STREQ(init->binary_op.right->tok.value, "3");
+  free_ast(program);
+}
+
+TEST_F(BridgeTest, AnIncludedHeaderParsesAsPartOfTheSameTranslationUnit) {
+  _mkdir("bridge_test_inc");
+  {
+    std::ofstream f("bridge_test_inc/decls.h", std::ios::binary);
+    f << "int from_header;\n";
+  }
+  static const char *dirs[] = {"bridge_test_inc"};
+  int rc = pp_run_ex(&tb, "#include \"decls.h\"\nint from_source;\n", "bridge_main.c", dirs, 1);
+  remove("bridge_test_inc/decls.h");
+  _rmdir("bridge_test_inc");
+  EXPECT_EQ(rc, 0);
+
+  parser_init_from_buf(&p, &tb);
+  have_parser = true;
+  ast_node *program = parse_program(&p);
+  ASSERT_NE(program, nullptr);
+  EXPECT_EQ(p.had_error, 0);
+  ASSERT_EQ(program->program.count, 2);
+  EXPECT_STREQ(program->program.declarations[0]->var_decl.var_name, "from_header");
+  EXPECT_STREQ(program->program.declarations[1]->var_decl.var_name, "from_source");
+  free_ast(program);
+}
+
+TEST_F(BridgeTest, AnInactiveConditionalGroupNeverReachesTheParser) {
+  ast_node *program = parse_preprocessed("#if 0\nint int ) ( ;;; {\n#endif\nint kept;\n");
+  ASSERT_NE(program, nullptr);
+  EXPECT_EQ(p.had_error, 0);
+  ASSERT_EQ(program->program.count, 1);
+  EXPECT_STREQ(program->program.declarations[0]->var_decl.var_name, "kept");
+  free_ast(program);
+}
+
+TEST_F(BridgeTest, HandingOverABufferEmptiesTheCallersCopy) {
+  ASSERT_EQ(pp_run(&tb, "int moved;\n"), 0);
+  ASSERT_GT(tb.count, 0);
+
+  parser_init_from_buf(&p, &tb);
+  have_parser = true;
+
+  bool emptied = tb.tokens == nullptr && tb.count == 0 && tb.capacity == 0 && tb.pos == 0;
+  EXPECT_TRUE(emptied) << "the caller's buffer still refers to the handed-over tokens";
+  if (!emptied) {
+    token_buf_init(&tb);
+  }
+
+  token_buf_free(&tb);
+  ast_node *program = parse_program(&p);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 1);
+  EXPECT_STREQ(program->program.declarations[0]->var_decl.var_name, "moved");
+  free_ast(program);
+
+  parser_destroy(&p);
+  have_parser = false;
+  token_buf_free(&tb);
+}
+
+TEST_F(BridgeTest, AnAlreadyReadBufferStillParsesFromTheFirstToken) {
+  ASSERT_EQ(pp_run(&tb, "int first; int second;\n"), 0);
+  while (token_buf_next(&tb).type != TOKEN_EOF) {
+  }
+  ASSERT_EQ(tb.pos, tb.count);
+
+  parser_init_from_buf(&p, &tb);
+  have_parser = true;
+  ast_node *program = parse_program(&p);
+  ASSERT_NE(program, nullptr);
+  EXPECT_EQ(p.had_error, 0);
+  ASSERT_EQ(program->program.count, 2);
+  EXPECT_STREQ(program->program.declarations[0]->var_decl.var_name, "first");
+  EXPECT_STREQ(program->program.declarations[1]->var_decl.var_name, "second");
+  free_ast(program);
+}
+
+TEST_F(BridgeTest, EmptySourceIsAnEmptyProgramWithOneErrorThroughBothEntryPoints) {
+  lexer lex;
+  lexer_init(&lex, "");
+  parser direct;
+  parser_init(&direct, &lex);
+  testing::internal::CaptureStderr();
+  ast_node *from_lexer = parse_program(&direct);
+  ASSERT_NE(from_lexer, nullptr);
+  EXPECT_EQ(from_lexer->program.count, 0);
+  EXPECT_EQ(direct.had_error, 1) << "C99 6.9: a translation unit declares at least one thing";
+  free_ast(from_lexer);
+  parser_destroy(&direct);
+
+  ast_node *from_pp = parse_preprocessed("");
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  ASSERT_NE(from_pp, nullptr);
+  EXPECT_EQ(from_pp->program.count, 0);
+  EXPECT_EQ(p.had_error, 1);
+  EXPECT_EQ(diagnostics,
+            "1:1: error: a translation unit needs at least one declaration (at '<eof>')\n"
+            "1:1: error: a translation unit needs at least one declaration (at '<eof>')\n");
+  free_ast(from_pp);
+}
+
+static ast_node *parse_source(const char *source, int *errors) {
+  lexer lex;
+  lexer_init(&lex, source);
+  parser p;
+  parser_init(&p, &lex);
+  ast_node *program = parse_program(&p);
+  *errors = p.had_error;
+  parser_destroy(&p);
+  return program;
+}
+
+static ast_node *top_decl(ast_node *program, int index) {
+  if (program == nullptr || index >= program->program.count)
+    return nullptr;
+  return program->program.declarations[index];
+}
+
+static type_info *top_var_type(ast_node *program, int index) {
+  ast_node *decl = top_decl(program, index);
+  if (decl == nullptr || decl->type != AST_NODE_TYPE_VAR_DECL)
+    return nullptr;
+  return decl->var_decl.type;
+}
+
+struct ArithmeticSpelling {
+  const char *source;
+  prim_kind prim;
+  int is_complex;
+  int is_imaginary;
+};
+
+static const ArithmeticSpelling every_c99_spelling[] = {
+    {"void x;", PRIM_VOID, 0, 0},
+    {"_Bool x;", PRIM_BOOL, 0, 0},
+    {"char x;", PRIM_CHAR, 0, 0},
+    {"signed char x;", PRIM_SCHAR, 0, 0},
+    {"unsigned char x;", PRIM_UCHAR, 0, 0},
+    {"short x;", PRIM_SHORT, 0, 0},
+    {"signed short x;", PRIM_SHORT, 0, 0},
+    {"short int x;", PRIM_SHORT, 0, 0},
+    {"signed short int x;", PRIM_SHORT, 0, 0},
+    {"unsigned short x;", PRIM_USHORT, 0, 0},
+    {"unsigned short int x;", PRIM_USHORT, 0, 0},
+    {"int x;", PRIM_INT, 0, 0},
+    {"signed x;", PRIM_INT, 0, 0},
+    {"signed int x;", PRIM_INT, 0, 0},
+    {"unsigned x;", PRIM_UINT, 0, 0},
+    {"unsigned int x;", PRIM_UINT, 0, 0},
+    {"long x;", PRIM_LONG, 0, 0},
+    {"signed long x;", PRIM_LONG, 0, 0},
+    {"long int x;", PRIM_LONG, 0, 0},
+    {"signed long int x;", PRIM_LONG, 0, 0},
+    {"unsigned long x;", PRIM_ULONG, 0, 0},
+    {"unsigned long int x;", PRIM_ULONG, 0, 0},
+    {"long long x;", PRIM_LLONG, 0, 0},
+    {"signed long long x;", PRIM_LLONG, 0, 0},
+    {"long long int x;", PRIM_LLONG, 0, 0},
+    {"signed long long int x;", PRIM_LLONG, 0, 0},
+    {"unsigned long long x;", PRIM_ULLONG, 0, 0},
+    {"unsigned long long int x;", PRIM_ULLONG, 0, 0},
+    {"float x;", PRIM_FLOAT, 0, 0},
+    {"double x;", PRIM_DOUBLE, 0, 0},
+    {"long double x;", PRIM_LDOUBLE, 0, 0},
+    {"float _Complex x;", PRIM_FLOAT, 1, 0},
+    {"double _Complex x;", PRIM_DOUBLE, 1, 0},
+    {"long double _Complex x;", PRIM_LDOUBLE, 1, 0},
+    {"float _Imaginary x;", PRIM_FLOAT, 0, 1},
+    {"double _Imaginary x;", PRIM_DOUBLE, 0, 1},
+    {"long double _Imaginary x;", PRIM_LDOUBLE, 0, 1},
+};
+
+static const ArithmeticSpelling reordered_spellings[] = {
+    {"char unsigned x;", PRIM_UCHAR, 0, 0},
+    {"char signed x;", PRIM_SCHAR, 0, 0},
+    {"int short x;", PRIM_SHORT, 0, 0},
+    {"int unsigned short x;", PRIM_USHORT, 0, 0},
+    {"int long x;", PRIM_LONG, 0, 0},
+    {"long unsigned x;", PRIM_ULONG, 0, 0},
+    {"long int long x;", PRIM_LLONG, 0, 0},
+    {"long unsigned long int x;", PRIM_ULLONG, 0, 0},
+    {"int signed long long x;", PRIM_LLONG, 0, 0},
+    {"double long x;", PRIM_LDOUBLE, 0, 0},
+    {"_Complex float x;", PRIM_FLOAT, 1, 0},
+    {"_Complex long double x;", PRIM_LDOUBLE, 1, 0},
+};
+
+static void expect_spellings(const ArithmeticSpelling *rows, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    SCOPED_TRACE(rows[i].source);
+    int errors = -1;
+    ast_node *program = parse_source(rows[i].source, &errors);
+    type_info *t = top_var_type(program, 0);
+    EXPECT_EQ(errors, 0);
+    EXPECT_NE(t, nullptr);
+    if (t != nullptr) {
+      EXPECT_EQ(t->kind, TYPE_PRIMITIVE);
+      EXPECT_EQ(t->prim, rows[i].prim);
+      EXPECT_EQ(t->is_complex, rows[i].is_complex);
+      EXPECT_EQ(t->is_imaginary, rows[i].is_imaginary);
+    }
+    free_ast(program);
+  }
+}
+
+TEST(TypeSpecifierTest, EveryC99SpellingResolvesToItsType) {
+  expect_spellings(every_c99_spelling, sizeof(every_c99_spelling) / sizeof(every_c99_spelling[0]));
+}
+
+TEST(TypeSpecifierTest, WordOrderDoesNotChangeTheType) {
+  expect_spellings(reordered_spellings,
+                   sizeof(reordered_spellings) / sizeof(reordered_spellings[0]));
+}
+
+TEST(TypeSpecifierTest, PlainSignedAndUnsignedCharAreThreeDistinctTypes) {
+  int errors = -1;
+  ast_node *program = parse_source("char a; signed char b; unsigned char c;", &errors);
+  EXPECT_EQ(errors, 0);
+  type_info *a = top_var_type(program, 0);
+  type_info *b = top_var_type(program, 1);
+  type_info *c = top_var_type(program, 2);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  ASSERT_NE(c, nullptr);
+  EXPECT_EQ(a->prim, PRIM_CHAR);
+  EXPECT_EQ(b->prim, PRIM_SCHAR);
+  EXPECT_EQ(c->prim, PRIM_UCHAR);
+  free_ast(program);
+}
+
+static const char *const invalid_arithmetic_spellings[] = {
+    "int int x;",
+    "short short x;",
+    "long long long x;",
+    "void void x;",
+    "float float x;",
+    "double double x;",
+    "_Bool _Bool x;",
+    "char char x;",
+    "signed signed x;",
+    "unsigned unsigned x;",
+    "signed unsigned x;",
+    "unsigned signed int x;",
+    "short char x;",
+    "long char x;",
+    "char int x;",
+    "short long x;",
+    "long short int x;",
+    "long float x;",
+    "long long double x;",
+    "short double x;",
+    "unsigned double x;",
+    "int double x;",
+    "float double x;",
+    "signed float x;",
+    "void int x;",
+    "unsigned void x;",
+    "_Bool int x;",
+    "unsigned _Bool x;",
+    "int _Complex x;",
+    "char _Imaginary x;",
+    "_Complex x;",
+    "_Imaginary x;",
+    "_Complex _Imaginary double x;",
+    "double _Complex _Complex x;",
+    "long long _Complex x;",
+    "_Bool _Complex x;",
+};
+
+TEST(TypeSpecifierTest, AnInvalidCombinationIsDiagnosedOnceAndParsingContinues) {
+  for (const char *spelling : invalid_arithmetic_spellings) {
+    std::string source = std::string(spelling) + " int after;";
+    SCOPED_TRACE(source);
+    int errors = -1;
+    ast_node *program = parse_source(source.c_str(), &errors);
+    EXPECT_EQ(errors, 1);
+    type_info *bad = top_var_type(program, 0);
+    EXPECT_NE(bad, nullptr);
+    if (bad != nullptr)
+      EXPECT_EQ(bad->prim, PRIM_INT);
+    ast_node *after = top_decl(program, 1);
+    EXPECT_NE(after, nullptr);
+    if (after != nullptr) {
+      EXPECT_EQ(after->type, AST_NODE_TYPE_VAR_DECL);
+      if (after->type == AST_NODE_TYPE_VAR_DECL)
+        EXPECT_STREQ(after->var_decl.var_name, "after");
+    }
+    free_ast(program);
+  }
+}
+
+struct NamedConflict {
+  const char *source;
+  type_kind kind;
+  const char *tag;
+};
+
+static const NamedConflict named_type_conflicts[] = {
+    {"struct S int x; int after;", TYPE_STRUCT, "S"},
+    {"int struct S x; int after;", TYPE_STRUCT, "S"},
+    {"struct S _Complex x; int after;", TYPE_STRUCT, "S"},
+    {"union U double x; int after;", TYPE_UNION, "U"},
+    {"enum E unsigned x; int after;", TYPE_ENUM, "E"},
+    {"struct A struct B x; int after;", TYPE_STRUCT, "B"},
+    {"struct A enum B x; int after;", TYPE_ENUM, "B"},
+};
+
+TEST(TypeSpecifierTest, ANamedTypeCombinedWithAnotherTypeIsDiagnosedOnce) {
+  for (const NamedConflict &row : named_type_conflicts) {
+    SCOPED_TRACE(row.source);
+    int errors = -1;
+    ast_node *program = parse_source(row.source, &errors);
+    EXPECT_EQ(errors, 1);
+    type_info *t = top_var_type(program, 0);
+    EXPECT_NE(t, nullptr);
+    if (t != nullptr) {
+      EXPECT_EQ(t->kind, row.kind);
+      EXPECT_STREQ(t->tag_name, row.tag);
+      EXPECT_EQ(t->prim, PRIM_NONE);
+    }
+    type_info *after = top_var_type(program, 1);
+    EXPECT_NE(after, nullptr);
+    if (after != nullptr)
+      EXPECT_EQ(after->prim, PRIM_INT);
+    free_ast(program);
+  }
+}
+
+TEST(TypeSpecifierTest, ATypedefNameCombinedWithAnArithmeticWordIsDiagnosedOnce) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int T; T unsigned x; int after;", &errors);
+  EXPECT_EQ(errors, 1);
+  type_info *t = top_var_type(program, 1);
+  ASSERT_NE(t, nullptr);
+  EXPECT_EQ(t->kind, TYPE_TYPEDEF);
+  EXPECT_STREQ(t->tag_name, "T");
+  type_info *after = top_var_type(program, 2);
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(after->prim, PRIM_INT);
+  free_ast(program);
+}
+
+static const char *const missing_type_specifier[] = {
+    "static x; int after;",
+    "const x; int after;",
+    "extern volatile x; int after;",
+};
+
+TEST(TypeSpecifierTest, AMissingTypeSpecifierIsDiagnosedAndBecomesInt) {
+  for (const char *source : missing_type_specifier) {
+    SCOPED_TRACE(source);
+    int errors = -1;
+    ast_node *program = parse_source(source, &errors);
+    EXPECT_EQ(errors, 1);
+    type_info *t = top_var_type(program, 0);
+    type_info *after = top_var_type(program, 1);
+    EXPECT_NE(t, nullptr);
+    EXPECT_NE(after, nullptr);
+    if (t != nullptr)
+      EXPECT_EQ(t->prim, PRIM_INT);
+    if (after != nullptr)
+      EXPECT_EQ(after->prim, PRIM_INT);
+    free_ast(program);
+  }
+}
+
+TEST(TypeSpecifierTest, AParameterWithoutATypeSpecifierIsDiagnosedAndBecomesInt) {
+  int errors = -1;
+  ast_node *program = parse_source("int f(register a);", &errors);
+  EXPECT_EQ(errors, 1);
+  ast_node *f = top_decl(program, 0);
+  ASSERT_NE(f, nullptr);
+  ASSERT_EQ(f->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(f->var_decl.type->param_count, 1);
+  EXPECT_EQ(f->var_decl.type->param_types[0]->prim, PRIM_INT);
+  EXPECT_STREQ(f->var_decl.type->param_names[0], "a");
+  free_ast(program);
+}
+
+TEST(TypeSpecifierTest, AUnionTypeIsDistinctFromAStructType) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("union U { int a; float b; } u; struct S { int a; } s; union U *ptr;", &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 3);
+
+  ast_node *u_block = program->program.declarations[0];
+  ASSERT_EQ(u_block->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(u_block->block.count, 2);
+  type_info *u = u_block->block.statements[1]->var_decl.type;
+  EXPECT_EQ(u->kind, TYPE_UNION);
+  EXPECT_STREQ(u->tag_name, "U");
+
+  ast_node *s_block = program->program.declarations[1];
+  ASSERT_EQ(s_block->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(s_block->block.count, 2);
+  EXPECT_EQ(s_block->block.statements[1]->var_decl.type->kind, TYPE_STRUCT);
+
+  type_info *ptr = top_var_type(program, 2);
+  ASSERT_NE(ptr, nullptr);
+  ASSERT_EQ(ptr->kind, TYPE_POINTER);
+  ASSERT_NE(ptr->ptr_to, nullptr);
+  EXPECT_EQ(ptr->ptr_to->kind, TYPE_UNION);
+  free_ast(program);
+}
+
+TEST(TypeSpecifierTest, AUnionForwardDeclarationIsStillAccepted) {
+  int errors = -1;
+  ast_node *program = parse_source("union U; int after;", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *fwd = top_decl(program, 0);
+  ASSERT_NE(fwd, nullptr);
+  ASSERT_EQ(fwd->type, AST_NODE_TYPE_STRUCT_DEF);
+  EXPECT_EQ(fwd->struct_def.is_forward, 1);
+  EXPECT_STREQ(fwd->struct_def.tag_name, "U");
+  type_info *after = top_var_type(program, 1);
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(after->prim, PRIM_INT);
+  free_ast(program);
+}
+
+TEST(TypeSpecifierTest, AnIdentifierAfterAnArithmeticWordIsTheDeclaredName) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int T; unsigned T;", &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 2);
+  ast_node *decl = program->program.declarations[1];
+  ASSERT_EQ(decl->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(decl->var_decl.var_name, "T");
+  EXPECT_EQ(decl->var_decl.specs.storage_class, 0);
+  EXPECT_EQ(decl->var_decl.type->prim, PRIM_UINT);
+  free_ast(program);
+}
+
+TEST(TypeSpecifierTest, MemberSpecifiersDoNotLeakIntoTheEnclosingDeclaration) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("struct S { unsigned char c; long long n; } s; short after;", &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 2);
+  ast_node *block = program->program.declarations[0];
+  ASSERT_EQ(block->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(block->block.count, 2);
+  ast_node *def = block->block.statements[0];
+  ASSERT_EQ(def->type, AST_NODE_TYPE_STRUCT_DEF);
+  ASSERT_EQ(def->struct_def.member_count, 2);
+  EXPECT_EQ(def->struct_def.members[0]->var_decl.type->prim, PRIM_UCHAR);
+  EXPECT_EQ(def->struct_def.members[1]->var_decl.type->prim, PRIM_LLONG);
+  type_info *s = block->block.statements[1]->var_decl.type;
+  EXPECT_EQ(s->kind, TYPE_STRUCT);
+  EXPECT_EQ(s->prim, PRIM_NONE);
+  type_info *after = top_var_type(program, 1);
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(after->prim, PRIM_SHORT);
+  free_ast(program);
+}
+
+TEST(TypeSpecifierTest, EveryDeclaratorInAListKeepsTheResolvedType) {
+  int errors = -1;
+  ast_node *program = parse_source("unsigned char a, *b, c[2];", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *block = top_decl(program, 0);
+  ASSERT_NE(block, nullptr);
+  ASSERT_EQ(block->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(block->block.count, 3);
+  type_info *a = block->block.statements[0]->var_decl.type;
+  type_info *b = block->block.statements[1]->var_decl.type;
+  type_info *c = block->block.statements[2]->var_decl.type;
+  EXPECT_EQ(a->prim, PRIM_UCHAR);
+  ASSERT_EQ(b->kind, TYPE_POINTER);
+  EXPECT_EQ(b->ptr_to->prim, PRIM_UCHAR);
+  ASSERT_EQ(c->kind, TYPE_ARRAY);
+  EXPECT_EQ(c->ptr_to->prim, PRIM_UCHAR);
+  free_ast(program);
+}
+
+TEST(TypeSpecifierTest, AVoidParameterListMeansNoParameters) {
+  int errors = -1;
+  ast_node *program = parse_source("int f(void); int g(void *q);", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *f = top_decl(program, 0);
+  ast_node *g = top_decl(program, 1);
+  ASSERT_NE(f, nullptr);
+  ASSERT_NE(g, nullptr);
+  ASSERT_EQ(f->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(g->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(f->var_decl.type->param_count, 0);
+  ASSERT_EQ(g->var_decl.type->param_count, 1);
+  ASSERT_EQ(g->var_decl.type->param_types[0]->kind, TYPE_POINTER);
+  EXPECT_EQ(g->var_decl.type->param_types[0]->ptr_to->prim, PRIM_VOID);
+  free_ast(program);
+}
+
+TEST(TypeSpecifierTest, AnIdentifierListOutsideADefinitionIsDiagnosed) {
+  int errors = -1;
+  ast_node *program = parse_source("int f(x); int after;", &errors);
+  EXPECT_EQ(errors, 1);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 2);
+  type_info *f = top_var_type(program, 0);
+  ASSERT_NE(f, nullptr);
+  ASSERT_EQ(f->kind, TYPE_FUNCTION);
+  EXPECT_EQ(f->has_prototype, 0);
+  ASSERT_EQ(f->param_count, 1);
+  EXPECT_STREQ(f->param_names[0], "x");
+  EXPECT_EQ(f->param_types[0], nullptr);
+  type_info *after = top_var_type(program, 1);
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(after->prim, PRIM_INT);
+  free_ast(program);
+}
+
+static ast_node *function_body_statement(ast_node *program, int decl_index, int stmt_index) {
+  ast_node *fn = top_decl(program, decl_index);
+  if (fn == nullptr || fn->type != AST_NODE_TYPE_FUNCTION_DEF || fn->function_def.body == nullptr)
+    return nullptr;
+  ast_node *body = fn->function_def.body;
+  if (stmt_index >= body->block.count)
+    return nullptr;
+  return body->block.statements[stmt_index];
+}
+
+TEST(DeclSpecifierTest, StorageClassIsRecordedOnTheDeclarationWhateverTheTypeShape) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("static int *p; static int a[3]; extern int (*fp)(void);", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *p = top_decl(program, 0);
+  ast_node *a = top_decl(program, 1);
+  ast_node *fp = top_decl(program, 2);
+  ASSERT_NE(p, nullptr);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(p->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(a->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(fp->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(p->var_decl.type->kind, TYPE_POINTER);
+  EXPECT_EQ(p->var_decl.specs.storage_class, TOKEN_STATIC);
+  EXPECT_EQ(a->var_decl.type->kind, TYPE_ARRAY);
+  EXPECT_EQ(a->var_decl.specs.storage_class, TOKEN_STATIC);
+  EXPECT_EQ(fp->var_decl.type->kind, TYPE_POINTER);
+  EXPECT_EQ(fp->var_decl.specs.storage_class, TOKEN_EXTERN);
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, FunctionSpecifiersAreRecordedOnTheFunction) {
+  int errors = -1;
+  ast_node *program = parse_source(
+      "static inline void f(void); extern int g(void) { return 0; } int h(void);", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *f = top_decl(program, 0);
+  ast_node *g = top_decl(program, 1);
+  ast_node *h = top_decl(program, 2);
+  ASSERT_NE(f, nullptr);
+  ASSERT_NE(g, nullptr);
+  ASSERT_NE(h, nullptr);
+  ASSERT_EQ(f->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(g->type, AST_NODE_TYPE_FUNCTION_DEF);
+  ASSERT_EQ(h->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(f->var_decl.specs.storage_class, TOKEN_STATIC);
+  EXPECT_EQ(f->var_decl.specs.is_inline, 1);
+  EXPECT_EQ(g->function_def.specs.storage_class, TOKEN_EXTERN);
+  EXPECT_EQ(g->function_def.specs.is_inline, 0);
+  EXPECT_EQ(h->var_decl.specs.storage_class, 0);
+  EXPECT_EQ(h->var_decl.specs.is_inline, 0);
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, EveryDeclaratorInAListCarriesTheStorageClass) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("static int a, *b, c[2]; void f(void) { register int x, *y, z[2]; }", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *file_list = top_decl(program, 0);
+  ASSERT_NE(file_list, nullptr);
+  ASSERT_EQ(file_list->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(file_list->block.count, 3);
+  for (int i = 0; i < 3; i++)
+    EXPECT_EQ(file_list->block.statements[i]->var_decl.specs.storage_class, TOKEN_STATIC) << i;
+  ast_node *block_list = function_body_statement(program, 1, 0);
+  ASSERT_NE(block_list, nullptr);
+  ASSERT_EQ(block_list->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(block_list->block.count, 3);
+  for (int i = 0; i < 3; i++)
+    EXPECT_EQ(block_list->block.statements[i]->var_decl.specs.storage_class, TOKEN_REGISTER) << i;
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, SpecifiersDoNotLeakIntoTheNextDeclaration) {
+  int errors = -1;
+  ast_node *program = parse_source("static inline int a(void); int b(void); static int c; int d; "
+                                   "void f(void) { register int x; int y; }",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *b = top_decl(program, 1);
+  ASSERT_NE(b, nullptr);
+  ASSERT_EQ(b->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(b->var_decl.specs.storage_class, 0);
+  EXPECT_EQ(b->var_decl.specs.is_inline, 0);
+  ast_node *d = top_decl(program, 3);
+  ASSERT_NE(d, nullptr);
+  ASSERT_EQ(d->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(d->var_decl.specs.storage_class, 0);
+  ast_node *x = function_body_statement(program, 4, 0);
+  ast_node *y = function_body_statement(program, 4, 1);
+  ASSERT_NE(x, nullptr);
+  ASSERT_NE(y, nullptr);
+  EXPECT_EQ(x->var_decl.specs.storage_class, TOKEN_REGISTER);
+  EXPECT_EQ(y->var_decl.specs.storage_class, 0);
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, TypedefMayAppearAnywhereInTheSpecifiers) {
+  int errors = -1;
+  ast_node *program = parse_source(
+      "int typedef T; T x; unsigned typedef long U; U y; void f(void) { char typedef C; C c; }",
+      &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *t = top_decl(program, 0);
+  ASSERT_NE(t, nullptr);
+  ASSERT_EQ(t->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(t->var_decl.var_name, "T");
+  EXPECT_EQ(t->var_decl.specs.storage_class, TOKEN_TYPEDEF);
+  EXPECT_EQ(t->var_decl.type->prim, PRIM_INT);
+  type_info *x = top_var_type(program, 1);
+  ASSERT_NE(x, nullptr);
+  EXPECT_EQ(x->kind, TYPE_TYPEDEF);
+  EXPECT_STREQ(x->tag_name, "T");
+  ast_node *u = top_decl(program, 2);
+  ASSERT_NE(u, nullptr);
+  ASSERT_EQ(u->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(u->var_decl.specs.storage_class, TOKEN_TYPEDEF);
+  EXPECT_EQ(u->var_decl.type->prim, PRIM_ULONG);
+  type_info *y = top_var_type(program, 3);
+  ASSERT_NE(y, nullptr);
+  EXPECT_EQ(y->kind, TYPE_TYPEDEF);
+  EXPECT_STREQ(y->tag_name, "U");
+  ast_node *c_type = function_body_statement(program, 4, 0);
+  ast_node *c = function_body_statement(program, 4, 1);
+  ASSERT_NE(c_type, nullptr);
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(c_type->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(c->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(c_type->var_decl.specs.storage_class, TOKEN_TYPEDEF);
+  EXPECT_EQ(c_type->var_decl.type->prim, PRIM_CHAR);
+  EXPECT_EQ(c->var_decl.type->kind, TYPE_TYPEDEF);
+  EXPECT_STREQ(c->var_decl.type->tag_name, "C");
+  free_ast(program);
+}
+
+struct StorageConflict {
+  const char *source;
+  token_type kept;
+};
+
+static const StorageConflict storage_conflicts[] = {
+    {"static extern int x; int after;", TOKEN_STATIC},
+    {"typedef static int T; int after;", TOKEN_TYPEDEF},
+    {"extern extern int y; int after;", TOKEN_EXTERN},
+    {"int static register z; int after;", TOKEN_STATIC},
+    {"auto register int w; int after;", TOKEN_AUTO},
+};
+
+TEST(DeclSpecifierTest, MoreThanOneStorageClassIsDiagnosedOnceAndTheFirstIsKept) {
+  for (const StorageConflict &row : storage_conflicts) {
+    SCOPED_TRACE(row.source);
+    int errors = -1;
+    ast_node *program = parse_source(row.source, &errors);
+    EXPECT_EQ(errors, 1);
+    ast_node *bad = top_decl(program, 0);
+    ast_node *after = top_decl(program, 1);
+    EXPECT_NE(bad, nullptr);
+    EXPECT_NE(after, nullptr);
+    if (bad != nullptr && bad->type == AST_NODE_TYPE_VAR_DECL)
+      EXPECT_EQ(bad->var_decl.specs.storage_class, row.kept);
+    else
+      ADD_FAILURE() << "first declaration is not a VAR_DECL";
+    if (after != nullptr && after->type == AST_NODE_TYPE_VAR_DECL) {
+      EXPECT_STREQ(after->var_decl.var_name, "after");
+      EXPECT_EQ(after->var_decl.specs.storage_class, 0);
+    } else {
+      ADD_FAILURE() << "second declaration is not a VAR_DECL";
+    }
+    free_ast(program);
+  }
+}
+
+TEST(DeclSpecifierTest, AutoIsAStorageClassButNotForParameters) {
+  int errors = -1;
+  ast_node *program = parse_source("void f(void) { auto int x; int auto y, *z; }", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *x = function_body_statement(program, 0, 0);
+  ast_node *group = function_body_statement(program, 0, 1);
+  ASSERT_NE(x, nullptr);
+  ASSERT_NE(group, nullptr);
+  ASSERT_EQ(x->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(x->var_decl.var_name, "x");
+  EXPECT_EQ(x->var_decl.specs.storage_class, TOKEN_AUTO);
+  ASSERT_EQ(group->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(group->block.count, 2);
+  for (int i = 0; i < 2; i++)
+    EXPECT_EQ(group->block.statements[i]->var_decl.specs.storage_class, TOKEN_AUTO) << i;
+  free_ast(program);
+
+  errors = -1;
+  program = parse_source("void g(auto int a); int after;", &errors);
+  EXPECT_EQ(errors, 1);
+  ast_node *after = top_decl(program, 1);
+  ASSERT_NE(after, nullptr);
+  ASSERT_EQ(after->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(after->var_decl.var_name, "after");
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, AFunctionTypedefIsATypeNotAFunction) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int handler(int); handler *h;", &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 2);
+  ast_node *td = program->program.declarations[0];
+  ASSERT_EQ(td->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(td->var_decl.var_name, "handler");
+  EXPECT_EQ(td->var_decl.specs.storage_class, TOKEN_TYPEDEF);
+  type_info *fn = td->var_decl.type;
+  ASSERT_EQ(fn->kind, TYPE_FUNCTION);
+  ASSERT_NE(fn->ptr_to, nullptr);
+  EXPECT_EQ(fn->ptr_to->prim, PRIM_INT);
+  ASSERT_EQ(fn->param_count, 1);
+  EXPECT_EQ(fn->param_types[0]->prim, PRIM_INT);
+  type_info *h = top_var_type(program, 1);
+  ASSERT_NE(h, nullptr);
+  ASSERT_EQ(h->kind, TYPE_POINTER);
+  ASSERT_NE(h->ptr_to, nullptr);
+  EXPECT_EQ(h->ptr_to->kind, TYPE_TYPEDEF);
+  EXPECT_STREQ(h->ptr_to->tag_name, "handler");
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, AFunctionTypedefAtBlockScopeIsATypeNotAFunction) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("void f(void) { typedef int handler(int); handler *h; }", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *td = function_body_statement(program, 0, 0);
+  ast_node *h = function_body_statement(program, 0, 1);
+  ASSERT_NE(td, nullptr);
+  ASSERT_NE(h, nullptr);
+  ASSERT_EQ(td->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(td->var_decl.specs.storage_class, TOKEN_TYPEDEF);
+  EXPECT_EQ(td->var_decl.type->kind, TYPE_FUNCTION);
+  ASSERT_EQ(h->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(h->var_decl.type->kind, TYPE_POINTER);
+  EXPECT_EQ(h->var_decl.type->ptr_to->kind, TYPE_TYPEDEF);
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, AFunctionTypedefWithABodyIsDiagnosed) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int g(void) { return 0; } int after;", &errors);
+  EXPECT_EQ(errors, 1);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 1);
+  ast_node *after = top_decl(program, 0);
+  ASSERT_EQ(after->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(after->var_decl.var_name, "after");
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, EveryTypedefNameInAListIsRegisteredAtFileScope) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int A, *B; A a; B b;", &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 3);
+  type_info *a = top_var_type(program, 1);
+  type_info *b = top_var_type(program, 2);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  EXPECT_EQ(a->kind, TYPE_TYPEDEF);
+  EXPECT_STREQ(a->tag_name, "A");
+  EXPECT_EQ(b->kind, TYPE_TYPEDEF);
+  EXPECT_STREQ(b->tag_name, "B");
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, EveryTypedefNameInAListIsRegisteredAtBlockScope) {
+  int errors = -1;
+  ast_node *program = parse_source("void f(void) { typedef int A, *B; A a; B b; }", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *b = function_body_statement(program, 0, 2);
+  ASSERT_NE(b, nullptr);
+  ASSERT_EQ(b->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(b->var_decl.type->kind, TYPE_TYPEDEF);
+  EXPECT_STREQ(b->var_decl.type->tag_name, "B");
+  free_ast(program);
+}
+
+static ast_node *leading_struct_def(ast_node *decl) {
+  if (decl == nullptr)
+    return nullptr;
+  if (decl->type == AST_NODE_TYPE_STRUCT_DEF)
+    return decl;
+  if (decl->type == AST_NODE_TYPE_DECL_GROUP && decl->block.count > 0 &&
+      decl->block.statements[0]->type == AST_NODE_TYPE_STRUCT_DEF)
+    return decl->block.statements[0];
+  return nullptr;
+}
+
+struct UnionMarking {
+  const char *source;
+  int is_union;
+  int is_forward;
+};
+
+static const UnionMarking union_markings[] = {
+    {"union U { int a; };", 1, 0},
+    {"struct S { int a; };", 0, 0},
+    {"union U;", 1, 1},
+    {"struct S;", 0, 1},
+    {"union U { int a; } u;", 1, 0},
+    {"struct S { int a; } s;", 0, 0},
+};
+
+TEST(DeclSpecifierTest, AUnionDefinitionIsMarkedAsAUnion) {
+  for (const UnionMarking &row : union_markings) {
+    SCOPED_TRACE(row.source);
+    int errors = -1;
+    ast_node *program = parse_source(row.source, &errors);
+    EXPECT_EQ(errors, 0);
+    ast_node *def = leading_struct_def(top_decl(program, 0));
+    EXPECT_NE(def, nullptr);
+    if (def != nullptr) {
+      EXPECT_EQ(def->struct_def.is_union, row.is_union);
+      EXPECT_EQ(def->struct_def.is_forward, row.is_forward);
+    }
+    free_ast(program);
+  }
+}
+
+TEST(DeclSpecifierTest, AUnionDefinitionAtBlockScopeIsMarkedAsAUnion) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("void f(void) { union U { int a; } u; struct S { int a; } s; }", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *u = leading_struct_def(function_body_statement(program, 0, 0));
+  ast_node *s = leading_struct_def(function_body_statement(program, 0, 1));
+  ASSERT_NE(u, nullptr);
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(u->struct_def.is_union, 1);
+  EXPECT_EQ(s->struct_def.is_union, 0);
+  free_ast(program);
+}
+
+TEST(DeclSpecifierTest, RegisterIsAllowedInAParameter) {
+  int errors = -1;
+  ast_node *program = parse_source("int f(register int a);", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *f = top_decl(program, 0);
+  ASSERT_NE(f, nullptr);
+  ASSERT_EQ(f->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(f->var_decl.type->param_count, 1);
+  EXPECT_EQ(f->var_decl.type->param_types[0]->prim, PRIM_INT);
+  free_ast(program);
+}
+
+static const char *const disallowed_parameter_specifiers[] = {
+    "int f(static int a); int after;",
+    "int f(extern int a); int after;",
+    "int f(typedef int a); int after;",
+    "int f(inline int a); int after;",
+    "int f(register register int a); int after;",
+};
+
+TEST(DeclSpecifierTest, OnlyRegisterMayAppearInAParameterDeclaration) {
+  for (const char *source : disallowed_parameter_specifiers) {
+    SCOPED_TRACE(source);
+    int errors = -1;
+    ast_node *program = parse_source(source, &errors);
+    EXPECT_EQ(errors, 1);
+    ast_node *f = top_decl(program, 0);
+    EXPECT_NE(f, nullptr);
+    if (f != nullptr && f->type == AST_NODE_TYPE_VAR_DECL) {
+      EXPECT_EQ(f->var_decl.type->param_count, 1);
+      if (f->var_decl.type->param_count == 1)
+        EXPECT_STREQ(f->var_decl.type->param_names[0], "a");
+    } else {
+      ADD_FAILURE() << "the function declaration did not survive";
+    }
+    type_info *after = top_var_type(program, 1);
+    EXPECT_NE(after, nullptr);
+    free_ast(program);
+  }
+}
+
+static const char *const type_names_with_declaration_specifiers[] = {
+    "int f(void) { return sizeof(int static); } int after;",
+    "int f(void) { return sizeof(int typedef); } int after;",
+    "int f(void) { return (int extern)1; } int after;",
+    "int f(void) { return sizeof(int inline); } int after;",
+};
+
+TEST(DeclSpecifierTest, AStorageClassOrInlineInATypeNameIsDiagnosed) {
+  for (const char *source : type_names_with_declaration_specifiers) {
+    SCOPED_TRACE(source);
+    int errors = -1;
+    ast_node *program = parse_source(source, &errors);
+    EXPECT_EQ(errors, 1);
+    ast_node *f = top_decl(program, 0);
+    EXPECT_NE(f, nullptr);
+    if (f != nullptr)
+      EXPECT_EQ(f->type, AST_NODE_TYPE_FUNCTION_DEF);
+    type_info *after = top_var_type(program, 1);
+    EXPECT_NE(after, nullptr);
+    free_ast(program);
+  }
+}
+
+struct SourcePos {
+  int line;
+  int column;
+};
+
+static SourcePos pos_of(const char *source, const char *needle, int occurrence) {
+  const char *hit = nullptr;
+  const char *from = source;
+  for (int i = 0; i < occurrence; i++) {
+    hit = strstr(from, needle);
+    if (hit == nullptr)
+      return SourcePos{0, 0};
+    from = hit + 1;
+  }
+  int line = 1;
+  int column = 1;
+  for (const char *c = source; c < hit; c++) {
+    if (*c == '\n') {
+      line++;
+      column = 1;
+    } else {
+      column++;
+    }
+  }
+  return SourcePos{line, column};
+}
+
+static ::testing::AssertionResult located_at(const ast_node *node, const char *source,
+                                             const char *needle, int occurrence = 1) {
+  if (node == nullptr)
+    return ::testing::AssertionFailure() << "node is null (looking for '" << needle << "')";
+  SourcePos want = pos_of(source, needle, occurrence);
+  if (want.line == 0)
+    return ::testing::AssertionFailure()
+           << "'" << needle << "' occurrence " << occurrence << " is not in the source";
+  if (node->loc.line != want.line || node->loc.column != want.column)
+    return ::testing::AssertionFailure()
+           << "node type " << node->type << " is at " << node->loc.line << ":" << node->loc.column
+           << " but '" << needle << "' is at " << want.line << ":" << want.column;
+  return ::testing::AssertionSuccess();
+}
+
+static void gather_nodes(const ast_node *node, std::vector<const ast_node *> &out);
+
+static void gather_type_nodes(const type_info *type, std::vector<const ast_node *> &out) {
+  for (const type_info *t = type; t != nullptr; t = t->ptr_to) {
+    gather_nodes(t->array_size_expr, out);
+    if (t->param_types != nullptr) {
+      for (int i = 0; i < t->param_count; i++) {
+        if (t->param_definitions != nullptr)
+          gather_nodes(t->param_definitions[i], out);
+        gather_type_nodes(t->param_types[i], out);
+      }
+    }
+  }
+}
+
+static void gather_nodes(const ast_node *node, std::vector<const ast_node *> &out) {
+  if (node == nullptr)
+    return;
+  out.push_back(node);
+  switch (node->type) {
+  case AST_NODE_TYPE_PROGRAM:
+    for (int i = 0; i < node->program.count; i++)
+      gather_nodes(node->program.declarations[i], out);
+    break;
+  case AST_NODE_TYPE_BLOCK:
+  case AST_NODE_TYPE_DECL_GROUP:
+    for (int i = 0; i < node->block.count; i++)
+      gather_nodes(node->block.statements[i], out);
+    break;
+  case AST_NODE_TYPE_BINARY_OP:
+    gather_nodes(node->binary_op.left, out);
+    gather_nodes(node->binary_op.right, out);
+    break;
+  case AST_NODE_TYPE_UNARY_OP:
+    gather_nodes(node->unary_op.operand, out);
+    break;
+  case AST_NODE_TYPE_ASSIGNMENT:
+    gather_nodes(node->assignment.left, out);
+    gather_nodes(node->assignment.right, out);
+    break;
+  case AST_NODE_TYPE_TERNARY:
+    gather_nodes(node->ternary.condition, out);
+    gather_nodes(node->ternary.true_branch, out);
+    gather_nodes(node->ternary.false_branch, out);
+    break;
+  case AST_NODE_TYPE_IF:
+    gather_nodes(node->if_stmt.condition, out);
+    gather_nodes(node->if_stmt.then_branch, out);
+    gather_nodes(node->if_stmt.else_branch, out);
+    break;
+  case AST_NODE_TYPE_WHILE:
+    gather_nodes(node->while_stmt.condition, out);
+    gather_nodes(node->while_stmt.body, out);
+    break;
+  case AST_NODE_TYPE_FOR:
+    gather_nodes(node->for_stmt.init, out);
+    gather_nodes(node->for_stmt.condition, out);
+    gather_nodes(node->for_stmt.increment, out);
+    gather_nodes(node->for_stmt.body, out);
+    break;
+  case AST_NODE_TYPE_FUNCTION_CALL:
+    gather_nodes(node->function_call.callable, out);
+    for (int i = 0; i < node->function_call.arg_count; i++)
+      gather_nodes(node->function_call.arguments[i], out);
+    break;
+  case AST_NODE_TYPE_FUNCTION_DEF:
+    gather_type_nodes(node->function_def.type->ptr_to, out);
+    for (int i = 0; i < node->function_def.type->param_count; i++)
+      gather_type_nodes(node->function_def.type->param_types[i], out);
+    gather_nodes(node->function_def.body, out);
+    break;
+  case AST_NODE_TYPE_RETURN:
+    gather_nodes(node->return_stmt.return_value, out);
+    break;
+  case AST_NODE_TYPE_ARRAY_SUBSCRIPT:
+    gather_nodes(node->array_subscript.left, out);
+    gather_nodes(node->array_subscript.index, out);
+    break;
+  case AST_NODE_TYPE_MEMBER_ACCESS:
+    gather_nodes(node->member_access.left, out);
+    break;
+  case AST_NODE_TYPE_VAR_DECL:
+    gather_type_nodes(node->var_decl.type, out);
+    gather_nodes(node->var_decl.init_value, out);
+    gather_nodes(node->var_decl.bitfield_width, out);
+    break;
+  case AST_NODE_TYPE_DO_WHILE:
+    gather_nodes(node->do_while_stmt.body, out);
+    gather_nodes(node->do_while_stmt.condition, out);
+    break;
+  case AST_NODE_TYPE_SWITCH:
+    gather_nodes(node->switch_stmt.condition, out);
+    gather_nodes(node->switch_stmt.body, out);
+    break;
+  case AST_NODE_TYPE_CASE:
+    gather_nodes(node->case_stmt.value, out);
+    gather_nodes(node->case_stmt.body, out);
+    break;
+  case AST_NODE_TYPE_DEFAULT:
+    gather_nodes(node->default_stmt.body, out);
+    break;
+  case AST_NODE_TYPE_STRUCT_DEF:
+    for (int i = 0; i < node->struct_def.member_count; i++)
+      gather_nodes(node->struct_def.members[i], out);
+    break;
+  case AST_NODE_TYPE_ENUM_DEF:
+    if (node->enum_def.values != nullptr) {
+      for (int i = 0; i < node->enum_def.enumerator_count; i++)
+        gather_nodes(node->enum_def.values[i], out);
+    }
+    break;
+  case AST_NODE_TYPE_CAST:
+    gather_nodes(node->cast_expr.definition, out);
+    gather_type_nodes(node->cast_expr.type, out);
+    gather_nodes(node->cast_expr.operand, out);
+    break;
+  case AST_NODE_TYPE_INIT_LIST:
+    for (int i = 0; i < node->init_list.count; i++) {
+      gather_nodes(node->init_list.items[i].index, out);
+      gather_nodes(node->init_list.items[i].value, out);
+    }
+    break;
+  case AST_NODE_TYPE_COMPOUND_LITERAL:
+    gather_nodes(node->compound_literal.definition, out);
+    gather_type_nodes(node->compound_literal.type, out);
+    gather_nodes(node->compound_literal.init_list, out);
+    break;
+  case AST_NODE_TYPE_LABEL:
+    gather_nodes(node->label_stmt.statement, out);
+    break;
+  default:
+    break;
+  }
+}
+
+static const char *every_node_kind_source =
+    "struct fwd;\n"
+    "struct point { int x; int y; };\n"
+    "union number { int i; float f; };\n"
+    "enum color { RED, GREEN = 2 };\n"
+    "typedef int handler(int);\n"
+    "static int table[3] = { 1, 2, 3 };\n"
+    "struct point origin = { .x = 0, .y = 0 };\n"
+    "struct wrap { struct point p; } w = { .p.x = 1 };\n"
+    "struct pair { int a; int b; } make_pair(void);\n"
+    "int sum(int a, int b) { return a + b; }\n"
+    "int main(void) {\n"
+    "  int i, *ptr = &i;\n"
+    "  struct point pt;\n"
+    "  i = sizeof(int) + sizeof i;\n"
+    "  ptr = (int *)ptr;\n"
+    "  pt = (struct point){ 1, 2 };\n"
+    "  pt.x = ptr[0];\n"
+    "  (&pt)->y = i > 0 ? i : -i;\n"
+    "  for (i = 0; i < 3; i++) { if (i == 1) continue; else break; }\n"
+    "  while (i) i--;\n"
+    "  do { i++; } while (i < 2);\n"
+    "  switch (i) { case 1: i = 2; break; default: ; }\n"
+    "  goto done;\n"
+    "done:\n"
+    "  i = sum(i, 1), i++;\n"
+    "  return \"s\" \"t\"[0] + 'c';\n"
+    "}\n";
+
+TEST(SourceLocationTest, EveryNodeTheParserBuildsHasALocation) {
+  int errors = -1;
+  ast_node *program = parse_source(every_node_kind_source, &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+
+  std::vector<const ast_node *> nodes;
+  gather_nodes(program, nodes);
+
+  std::vector<int> seen(AST_NODE_TYPE_COMPOUND_LITERAL + 1, 0);
+  for (const ast_node *n : nodes) {
+    seen[n->type] = 1;
+    EXPECT_GE(n->loc.line, 1) << "node type " << n->type << " has no line";
+    EXPECT_GE(n->loc.column, 1) << "node type " << n->type << " has no column";
+  }
+
+  const ast_node_type expected_kinds[] = {
+      AST_NODE_TYPE_EMPTY,         AST_NODE_TYPE_PROGRAM,      AST_NODE_TYPE_NUMBER,
+      AST_NODE_TYPE_IDENTIFIER,    AST_NODE_TYPE_BINARY_OP,    AST_NODE_TYPE_UNARY_OP,
+      AST_NODE_TYPE_ASSIGNMENT,    AST_NODE_TYPE_TERNARY,      AST_NODE_TYPE_IF,
+      AST_NODE_TYPE_WHILE,         AST_NODE_TYPE_BLOCK,        AST_NODE_TYPE_FOR,
+      AST_NODE_TYPE_FUNCTION_CALL, AST_NODE_TYPE_FUNCTION_DEF, AST_NODE_TYPE_RETURN,
+      AST_NODE_TYPE_STRING,        AST_NODE_TYPE_CHAR_LITERAL, AST_NODE_TYPE_ARRAY_SUBSCRIPT,
+      AST_NODE_TYPE_MEMBER_ACCESS, AST_NODE_TYPE_VAR_DECL,     AST_NODE_TYPE_DO_WHILE,
+      AST_NODE_TYPE_SWITCH,        AST_NODE_TYPE_CASE,         AST_NODE_TYPE_DEFAULT,
+      AST_NODE_TYPE_BREAK,         AST_NODE_TYPE_CONTINUE,     AST_NODE_TYPE_STRUCT_DEF,
+      AST_NODE_TYPE_ENUM_DEF,      AST_NODE_TYPE_CAST,         AST_NODE_TYPE_INIT_LIST,
+      AST_NODE_TYPE_GOTO,          AST_NODE_TYPE_LABEL,        AST_NODE_TYPE_COMPOUND_LITERAL,
+      AST_NODE_TYPE_DECL_GROUP,
+  };
+  for (ast_node_type kind : expected_kinds)
+    EXPECT_EQ(seen[kind], 1) << "the source did not exercise node type " << kind;
+
+  free_ast(program);
+}
+
+TEST(DeclarationGroupTest, OnlyACompoundStatementIsABlock) {
+  int errors = -1;
+  ast_node *program = parse_source("int a, b;\n"
+                                   "struct pair { int first, second; } make(void);\n"
+                                   "void f(void) {\n"
+                                   "  int c, d;\n"
+                                   "  { }\n"
+                                   "}\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 3);
+
+  ast_node *file_list = top_decl(program, 0);
+  EXPECT_EQ(file_list->type, AST_NODE_TYPE_DECL_GROUP) << "a file-scope declarator list";
+  EXPECT_EQ(file_list->block.count, 2);
+
+  ast_node *with_function = top_decl(program, 1);
+  ASSERT_EQ(with_function->type, AST_NODE_TYPE_DECL_GROUP) << "a definition and a function";
+  ASSERT_EQ(with_function->block.count, 2);
+  ast_node *pair = with_function->block.statements[0];
+  ASSERT_EQ(pair->type, AST_NODE_TYPE_STRUCT_DEF);
+  ASSERT_EQ(pair->struct_def.member_count, 1);
+  EXPECT_EQ(pair->struct_def.members[0]->type, AST_NODE_TYPE_DECL_GROUP) << "a member list";
+  EXPECT_EQ(with_function->block.statements[1]->type, AST_NODE_TYPE_VAR_DECL);
+
+  ast_node *fn = top_decl(program, 2);
+  ASSERT_EQ(fn->type, AST_NODE_TYPE_FUNCTION_DEF);
+  EXPECT_EQ(fn->function_def.body->type, AST_NODE_TYPE_BLOCK);
+  ast_node *local_list = function_body_statement(program, 2, 0);
+  ast_node *inner = function_body_statement(program, 2, 1);
+  ASSERT_NE(local_list, nullptr);
+  ASSERT_NE(inner, nullptr);
+  EXPECT_EQ(local_list->type, AST_NODE_TYPE_DECL_GROUP) << "a block-scope declarator list";
+  EXPECT_EQ(inner->type, AST_NODE_TYPE_BLOCK);
+  free_ast(program);
+}
+
+TEST(TagDeclarationTest, ATagDeclaredAloneInABlockIsAForwardDeclaration) {
+  int errors = -1;
+  ast_node *program = parse_source("void f(void) {\n"
+                                   "  struct S;\n"
+                                   "  union U;\n"
+                                   "}\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+
+  ast_node *s = function_body_statement(program, 0, 0);
+  ast_node *u = function_body_statement(program, 0, 1);
+  ASSERT_NE(s, nullptr);
+  ASSERT_NE(u, nullptr);
+
+  ASSERT_EQ(s->type, AST_NODE_TYPE_STRUCT_DEF);
+  EXPECT_STREQ(s->struct_def.tag_name, "S");
+  EXPECT_EQ(s->struct_def.is_forward, 1);
+  EXPECT_EQ(s->struct_def.is_union, 0);
+  EXPECT_EQ(s->loc.line, 2);
+  EXPECT_EQ(s->loc.column, 3);
+
+  ASSERT_EQ(u->type, AST_NODE_TYPE_STRUCT_DEF);
+  EXPECT_STREQ(u->struct_def.tag_name, "U");
+  EXPECT_EQ(u->struct_def.is_forward, 1);
+  EXPECT_EQ(u->struct_def.is_union, 1);
+  free_ast(program);
+}
+
+TEST(TagDeclarationTest, OnlyAStructOrUnionTagDeclaredAloneIsADeclaration) {
+  const struct {
+    const char *source;
+    const char *diagnostics;
+  } cases[] = {
+      {"void f(void) {\n  enum E;\n}\n",
+       "2:9: error: declaration does not declare anything (at ';')\n"},
+      {"enum E;\n", "1:7: error: declaration does not declare anything (at ';')\n"},
+      {"int;\nconst;\n", "1:4: error: declaration does not declare anything (at ';')\n"
+                         "2:6: error: a declaration needs a type specifier (at ';')\n"
+                         "2:6: error: declaration does not declare anything (at ';')\n"},
+      {"struct S a, ;\n", "1:13: error: expected a name in this declaration (at ';')\n"},
+      {"struct S *;\n", "1:11: error: expected a name in this declaration (at ';')\n"},
+      {"struct *p;\n", "1:8: error: expected a tag name or '{' (at '*')\n"},
+      {"enum *e;\n", "1:6: error: expected a tag name or '{' (at '*')\n"},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    int errors = -1;
+    testing::internal::CaptureStderr();
+    ast_node *program = parse_source(test.source, &errors);
+    std::string diagnostics = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(diagnostics, test.diagnostics);
+    free_ast(program);
+  }
+}
+
+TEST(TagDeclarationTest, ADefiningSpecifierLinksEveryDeclaratorToTheDefinition) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef struct { int x; } point, *point_ptr;\n"
+                                   "enum { RED } shade;\n"
+                                   "struct named { int y; } one;\n"
+                                   "struct named two;\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 4);
+
+  ast_node *group = top_decl(program, 0);
+  ASSERT_EQ(group->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(group->block.count, 3);
+  ast_node *def = group->block.statements[0];
+  ASSERT_EQ(def->type, AST_NODE_TYPE_STRUCT_DEF);
+  type_info *point = group->block.statements[1]->var_decl.type;
+  type_info *point_ptr = group->block.statements[2]->var_decl.type;
+  EXPECT_EQ(point->definition, def);
+  ASSERT_NE(point_ptr->ptr_to, nullptr);
+  EXPECT_EQ(point_ptr->definition, nullptr) << "the pointer is not the specifier";
+  EXPECT_EQ(point_ptr->ptr_to->definition, def) << "every declarator's copy keeps the link";
+  EXPECT_NE(point_ptr->ptr_to, point);
+
+  ast_node *enum_group = top_decl(program, 1);
+  ASSERT_EQ(enum_group->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(enum_group->block.count, 2);
+  EXPECT_EQ(enum_group->block.statements[1]->var_decl.type->definition,
+            enum_group->block.statements[0]);
+
+  ast_node *named = top_decl(program, 2);
+  ASSERT_EQ(named->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(named->block.count, 2);
+  EXPECT_EQ(named->block.statements[1]->var_decl.type->definition, named->block.statements[0]);
+
+  ast_node *two = top_decl(program, 3);
+  ASSERT_EQ(two->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(two->var_decl.type->definition, nullptr) << "a plain reference defines nothing";
+  EXPECT_EQ(two->var_decl.type->symbol, nullptr) << "the parser never resolves";
+  free_ast(program);
+}
+
+TEST(ArrayDeclaratorTest, TheParserKeepsTheSizeExpressionAndLeavesTheSizeToSema) {
+  int errors = -1;
+  ast_node *program = parse_source("int a[10];\nint b[0x10];\n", &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 2);
+  type_info *a = top_var_type(program, 0);
+  type_info *b = top_var_type(program, 1);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  EXPECT_STREQ(size_text(a), "10");
+  EXPECT_STREQ(size_text(b), "0x10");
+  EXPECT_EQ(a->array_size, -1);
+  EXPECT_EQ(b->array_size, -1);
+  EXPECT_EQ(a->is_vla, 0);
+  free_ast(program);
+}
+
+TEST(FunctionDeclarationTest, ADefinitionKeepsItsWholeFunctionType) {
+  int errors = -1;
+  ast_node *program = parse_source("int sum(int a, char *b, ...) { return a; }\n", &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ast_node *fn = top_decl(program, 0);
+  ASSERT_NE(fn, nullptr);
+  ASSERT_EQ(fn->type, AST_NODE_TYPE_FUNCTION_DEF);
+  EXPECT_STREQ(fn->function_def.name, "sum");
+  type_info *type = fn->function_def.type;
+  ASSERT_NE(type, nullptr);
+  EXPECT_EQ(type->kind, TYPE_FUNCTION);
+  EXPECT_EQ(type->is_variadic, 1);
+  ASSERT_EQ(type->param_count, 2);
+  EXPECT_STREQ(type->param_names[0], "a");
+  EXPECT_STREQ(type->param_names[1], "b");
+  EXPECT_EQ(type->param_types[1]->kind, TYPE_POINTER);
+  ASSERT_NE(type->ptr_to, nullptr);
+  EXPECT_EQ(type->ptr_to->prim, PRIM_INT);
+  EXPECT_EQ(type->ptr_to->is_variadic, 0) << "the return type is not variadic";
+  EXPECT_NE(fn->function_def.body, nullptr);
+  free_ast(program);
+}
+
+TEST(FunctionDeclarationTest, APrototypeIsADeclaration) {
+  int errors = -1;
+  ast_node *program = parse_source("int f(void), x;\n"
+                                   "int g(int a);\n"
+                                   "int h(void) = 1;\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 3);
+
+  ast_node *list = top_decl(program, 0);
+  ASSERT_EQ(list->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(list->block.count, 2);
+  ast_node *f = list->block.statements[0];
+  ast_node *x = list->block.statements[1];
+  ASSERT_EQ(f->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(f->var_decl.var_name, "f");
+  EXPECT_EQ(f->var_decl.type->kind, TYPE_FUNCTION);
+  ASSERT_EQ(x->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(x->var_decl.var_name, "x");
+  EXPECT_EQ(x->var_decl.type->kind, TYPE_PRIMITIVE);
+
+  ast_node *g = top_decl(program, 1);
+  ASSERT_EQ(g->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(g->var_decl.type->kind, TYPE_FUNCTION);
+
+  ast_node *h = top_decl(program, 2);
+  ASSERT_EQ(h->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_NE(h->var_decl.init_value, nullptr) << "sema rejects it; the parser only builds it";
+  free_ast(program);
+}
+
+TEST(FunctionDeclarationTest, ADefinitionAfterAStructDefinitionStaysGrouped) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("struct pair { int a; } make(void) { struct pair p; return p; }\n", &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ast_node *group = top_decl(program, 0);
+  ASSERT_EQ(group->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(group->block.count, 2);
+  EXPECT_EQ(group->block.statements[0]->type, AST_NODE_TYPE_STRUCT_DEF);
+  ASSERT_EQ(group->block.statements[1]->type, AST_NODE_TYPE_FUNCTION_DEF);
+  EXPECT_EQ(group->block.statements[1]->function_def.type->kind, TYPE_FUNCTION);
+  free_ast(program);
+}
+
+TEST(FunctionDeclarationTest, AFunctionDeclaratorFollowedByNeitherSemicolonNorBodyIsReported) {
+  int errors = -1;
+  testing::internal::CaptureStderr();
+  ast_node *program = parse_source("int f(void) int x;\n", &errors);
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  EXPECT_GT(errors, 0);
+  EXPECT_NE(diagnostics.find("expected ';' after declaration"), std::string::npos) << diagnostics;
+  free_ast(program);
+}
+
+TEST(SourceLocationTest, LiteralsAndIdentifiersAreLocatedAtTheirToken) {
+  const char *src = "int f(int count) {\n"
+                    "  return count\n"
+                    "    + 42\n"
+                    "    + \"ab\" \"cd\"[0]\n"
+                    "    + 'z';\n"
+                    "}\n";
+  int errors = -1;
+  ast_node *program = parse_source(src, &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *ret = function_body_statement(program, 0, 0);
+  ASSERT_NE(ret, nullptr);
+  ASSERT_EQ(ret->type, AST_NODE_TYPE_RETURN);
+  EXPECT_TRUE(located_at(ret, src, "return"));
+
+  ast_node *outer = ret->return_stmt.return_value;
+  ASSERT_EQ(outer->type, AST_NODE_TYPE_BINARY_OP);
+  ast_node *middle = outer->binary_op.left;
+  ASSERT_EQ(middle->type, AST_NODE_TYPE_BINARY_OP);
+  ast_node *inner = middle->binary_op.left;
+  ASSERT_EQ(inner->type, AST_NODE_TYPE_BINARY_OP);
+
+  EXPECT_TRUE(located_at(inner->binary_op.left, src, "count", 2));
+  EXPECT_TRUE(located_at(inner->binary_op.right, src, "42"));
+  ast_node *sub = middle->binary_op.right;
+  ASSERT_EQ(sub->type, AST_NODE_TYPE_ARRAY_SUBSCRIPT);
+  EXPECT_TRUE(located_at(sub->array_subscript.left, src, "\"ab\""));
+  EXPECT_TRUE(located_at(sub->array_subscript.index, src, "0]"));
+  EXPECT_TRUE(located_at(outer->binary_op.right, src, "'z'"));
+  free_ast(program);
+}
+
+TEST(SourceLocationTest, OperatorNodesAreLocatedAtTheirOperator) {
+  const char *src = "void g(int a, int b, int *p) {\n"
+                    "  a = b << 1;\n"
+                    "  a += -b;\n"
+                    "  a = !b, b = ~a;\n"
+                    "  p++;\n"
+                    "  --a;\n"
+                    "  a = b ? a : b;\n"
+                    "  a = sizeof(int) + sizeof a;\n"
+                    "  a = b * a + b;\n"
+                    "}\n";
+  int errors = -1;
+  ast_node *program = parse_source(src, &errors);
+  EXPECT_EQ(errors, 0);
+
+  ast_node *s0 = function_body_statement(program, 0, 0);
+  ASSERT_NE(s0, nullptr);
+  EXPECT_TRUE(located_at(s0, src, "= b <<"));
+  EXPECT_TRUE(located_at(s0->assignment.right, src, "<<"));
+
+  ast_node *s1 = function_body_statement(program, 0, 1);
+  ASSERT_NE(s1, nullptr);
+  EXPECT_TRUE(located_at(s1, src, "+="));
+  EXPECT_TRUE(located_at(s1->assignment.right, src, "-b"));
+
+  ast_node *s2 = function_body_statement(program, 0, 2);
+  ASSERT_NE(s2, nullptr);
+  ASSERT_EQ(s2->type, AST_NODE_TYPE_BINARY_OP);
+  EXPECT_TRUE(located_at(s2, src, ", b = ~"));
+  EXPECT_TRUE(located_at(s2->binary_op.left, src, "= !b"));
+  EXPECT_TRUE(located_at(s2->binary_op.left->assignment.right, src, "!b"));
+  EXPECT_TRUE(located_at(s2->binary_op.right, src, "= ~a"));
+  EXPECT_TRUE(located_at(s2->binary_op.right->assignment.right, src, "~a"));
+
+  EXPECT_TRUE(located_at(function_body_statement(program, 0, 3), src, "++"));
+  EXPECT_TRUE(located_at(function_body_statement(program, 0, 4), src, "--a"));
+
+  ast_node *s5 = function_body_statement(program, 0, 5);
+  ASSERT_NE(s5, nullptr);
+  EXPECT_TRUE(located_at(s5, src, "= b ?"));
+  EXPECT_TRUE(located_at(s5->assignment.right, src, "?"));
+
+  ast_node *s6 = function_body_statement(program, 0, 6);
+  ASSERT_NE(s6, nullptr);
+  EXPECT_TRUE(located_at(s6, src, "= sizeof"));
+  ast_node *plus = s6->assignment.right;
+  ASSERT_EQ(plus->type, AST_NODE_TYPE_BINARY_OP);
+  EXPECT_TRUE(located_at(plus, src, "+ sizeof a"));
+  EXPECT_TRUE(located_at(plus->binary_op.left, src, "sizeof(int)"));
+  EXPECT_TRUE(located_at(plus->binary_op.left->unary_op.operand, src, "(int)"));
+  EXPECT_TRUE(located_at(plus->binary_op.right, src, "sizeof a"));
+
+  ast_node *s7 = function_body_statement(program, 0, 7);
+  ASSERT_NE(s7, nullptr);
+  ast_node *add = s7->assignment.right;
+  ASSERT_EQ(add->type, AST_NODE_TYPE_BINARY_OP);
+  EXPECT_TRUE(located_at(add, src, "+ b;"));
+  EXPECT_TRUE(located_at(add->binary_op.left, src, "* a +"));
+  free_ast(program);
+}
+
+TEST(SourceLocationTest, PostfixNodesAreLocatedAtTheirPunctuator) {
+  const char *src = "struct s { int v; int *w; };\n"
+                    "void h(struct s x, struct s *y, int (*fn)(int)) {\n"
+                    "  fn(x.v);\n"
+                    "  y->w[2] = 1;\n"
+                    "}\n";
+  int errors = -1;
+  ast_node *program = parse_source(src, &errors);
+  EXPECT_EQ(errors, 0);
+
+  ast_node *call = function_body_statement(program, 1, 0);
+  ASSERT_NE(call, nullptr);
+  ASSERT_EQ(call->type, AST_NODE_TYPE_FUNCTION_CALL);
+  EXPECT_TRUE(located_at(call, src, "(x.v)"));
+  EXPECT_TRUE(located_at(call->function_call.callable, src, "fn(x"));
+  ASSERT_EQ(call->function_call.arg_count, 1);
+  EXPECT_TRUE(located_at(call->function_call.arguments[0], src, ".v"));
+
+  ast_node *assign = function_body_statement(program, 1, 1);
+  ASSERT_NE(assign, nullptr);
+  EXPECT_TRUE(located_at(assign, src, "= 1"));
+  ast_node *sub = assign->assignment.left;
+  ASSERT_EQ(sub->type, AST_NODE_TYPE_ARRAY_SUBSCRIPT);
+  EXPECT_TRUE(located_at(sub, src, "[2]"));
+  EXPECT_TRUE(located_at(sub->array_subscript.left, src, "->w"));
+  free_ast(program);
+}
+
+TEST(SourceLocationTest, CastsCompoundLiteralsAndInitListsAreLocatedAtTheirOpeningToken) {
+  const char *src = "struct pt { int x; int y; };\n"
+                    "struct box { struct pt a; };\n"
+                    "void k(long n) {\n"
+                    "  struct pt q = (struct pt){ 1, 2 };\n"
+                    "  struct box b = { .a.x = 3 };\n"
+                    "  n = (long)q.x;\n"
+                    "}\n";
+  int errors = -1;
+  ast_node *program = parse_source(src, &errors);
+  EXPECT_EQ(errors, 0);
+
+  ast_node *q = function_body_statement(program, 2, 0);
+  ASSERT_NE(q, nullptr);
+  ASSERT_EQ(q->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_TRUE(located_at(q, src, "q = ("));
+  ast_node *literal = q->var_decl.init_value;
+  ASSERT_EQ(literal->type, AST_NODE_TYPE_COMPOUND_LITERAL);
+  EXPECT_TRUE(located_at(literal, src, "(struct pt){"));
+  EXPECT_TRUE(located_at(literal->compound_literal.init_list, src, "{ 1, 2"));
+
+  ast_node *b = function_body_statement(program, 2, 1);
+  ASSERT_NE(b, nullptr);
+  ASSERT_EQ(b->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_TRUE(located_at(b, src, "b = {"));
+  ast_node *outer = b->var_decl.init_value;
+  ASSERT_EQ(outer->type, AST_NODE_TYPE_INIT_LIST);
+  EXPECT_TRUE(located_at(outer, src, "{ .a.x"));
+  ASSERT_EQ(outer->init_list.count, 1);
+  ast_node *wrap = outer->init_list.items[0].value;
+  ASSERT_EQ(wrap->type, AST_NODE_TYPE_INIT_LIST);
+  EXPECT_TRUE(located_at(wrap, src, "{ .a.x"));
+
+  ast_node *assign = function_body_statement(program, 2, 2);
+  ASSERT_NE(assign, nullptr);
+  ast_node *cast = assign->assignment.right;
+  ASSERT_EQ(cast->type, AST_NODE_TYPE_CAST);
+  EXPECT_TRUE(located_at(cast, src, "(long)"));
+  EXPECT_TRUE(located_at(cast->cast_expr.operand, src, ".x;"));
+  free_ast(program);
+}
+
+TEST(SourceLocationTest, StatementsAreLocatedAtTheirKeyword) {
+  const char *src = "int m(int i) {\n"
+                    "  if (i) i = 1; else i = 2;\n"
+                    "  while (i) i--;\n"
+                    "  do { i++; } while (i < 3);\n"
+                    "  for (;;) break;\n"
+                    "  switch (i) {\n"
+                    "  case 1:\n"
+                    "    goto out;\n"
+                    "  default:\n"
+                    "    ;\n"
+                    "  }\n"
+                    "  for (;;) continue;\n"
+                    "out:\n"
+                    "  return i;\n"
+                    "}\n";
+  int errors = -1;
+  ast_node *program = parse_source(src, &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  EXPECT_TRUE(located_at(program, src, "int m"));
+
+  ast_node *fn = top_decl(program, 0);
+  ASSERT_NE(fn, nullptr);
+  ASSERT_EQ(fn->type, AST_NODE_TYPE_FUNCTION_DEF);
+  EXPECT_TRUE(located_at(fn->function_def.body, src, "{\n  if"));
+
+  EXPECT_TRUE(located_at(function_body_statement(program, 0, 0), src, "if"));
+  EXPECT_TRUE(located_at(function_body_statement(program, 0, 1), src, "while (i) i--"));
+
+  ast_node *dowhile = function_body_statement(program, 0, 2);
+  ASSERT_NE(dowhile, nullptr);
+  EXPECT_TRUE(located_at(dowhile, src, "do"));
+  EXPECT_TRUE(located_at(dowhile->do_while_stmt.body, src, "{ i++; }"));
+
+  ast_node *for_break = function_body_statement(program, 0, 3);
+  ASSERT_NE(for_break, nullptr);
+  EXPECT_TRUE(located_at(for_break, src, "for (;;) break"));
+  EXPECT_TRUE(located_at(for_break->for_stmt.body, src, "break"));
+
+  ast_node *sw = function_body_statement(program, 0, 4);
+  ASSERT_NE(sw, nullptr);
+  EXPECT_TRUE(located_at(sw, src, "switch"));
+  ast_node *sw_body = sw->switch_stmt.body;
+  ASSERT_EQ(sw_body->type, AST_NODE_TYPE_BLOCK);
+  EXPECT_TRUE(located_at(sw_body, src, "{\n  case"));
+  ASSERT_EQ(sw_body->block.count, 2);
+  ast_node *case_stmt = sw_body->block.statements[0];
+  EXPECT_TRUE(located_at(case_stmt, src, "case"));
+  EXPECT_TRUE(located_at(case_stmt->case_stmt.body, src, "goto"));
+  ast_node *default_stmt = sw_body->block.statements[1];
+  EXPECT_TRUE(located_at(default_stmt, src, "default"));
+  EXPECT_TRUE(located_at(default_stmt->default_stmt.body, src, ";\n  }"));
+
+  ast_node *for_continue = function_body_statement(program, 0, 5);
+  ASSERT_NE(for_continue, nullptr);
+  EXPECT_TRUE(located_at(for_continue, src, "for (;;) continue"));
+  EXPECT_TRUE(located_at(for_continue->for_stmt.body, src, "continue"));
+
+  ast_node *label = function_body_statement(program, 0, 6);
+  ASSERT_NE(label, nullptr);
+  EXPECT_TRUE(located_at(label, src, "out:"));
+  EXPECT_TRUE(located_at(label->label_stmt.statement, src, "return"));
+  free_ast(program);
+
+  ast_node *empty = parse_source("", &errors);
+  ASSERT_NE(empty, nullptr);
+  EXPECT_EQ(empty->loc.line, 1);
+  EXPECT_EQ(empty->loc.column, 1);
+  free_ast(empty);
+}
+
+TEST(SourceLocationTest, DeclarationsAreLocatedAtTheirName) {
+  const char *src = "static unsigned long *counter;\n"
+                    "int (*fp)(void), plain, *ptr;\n"
+                    "struct flags { unsigned : 3; int bit : 1; } f;\n"
+                    "union u;\n"
+                    "enum e { A, B } ev;\n"
+                    "int sum(int a) { int local, *lp; return a; }\n";
+  int errors = -1;
+  ast_node *program = parse_source(src, &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 6);
+
+  EXPECT_TRUE(located_at(top_decl(program, 0), src, "counter"));
+
+  ast_node *list = top_decl(program, 1);
+  ASSERT_EQ(list->type, AST_NODE_TYPE_DECL_GROUP);
+  EXPECT_TRUE(located_at(list, src, "int (*fp)"));
+  ASSERT_EQ(list->block.count, 3);
+  EXPECT_TRUE(located_at(list->block.statements[0], src, "fp)"));
+  EXPECT_TRUE(located_at(list->block.statements[1], src, "plain"));
+  EXPECT_TRUE(located_at(list->block.statements[2], src, "ptr;"));
+
+  ast_node *flags = top_decl(program, 2);
+  ASSERT_EQ(flags->type, AST_NODE_TYPE_DECL_GROUP);
+  EXPECT_TRUE(located_at(flags, src, "struct flags"));
+  ASSERT_EQ(flags->block.count, 2);
+  ast_node *def = flags->block.statements[0];
+  ASSERT_EQ(def->type, AST_NODE_TYPE_STRUCT_DEF);
+  EXPECT_TRUE(located_at(def, src, "struct flags"));
+  ASSERT_EQ(def->struct_def.member_count, 2);
+  EXPECT_TRUE(located_at(def->struct_def.members[0], src, ": 3"));
+  EXPECT_TRUE(located_at(def->struct_def.members[1], src, "bit"));
+  EXPECT_TRUE(located_at(flags->block.statements[1], src, "f;"));
+
+  ast_node *forward = top_decl(program, 3);
+  ASSERT_EQ(forward->type, AST_NODE_TYPE_STRUCT_DEF);
+  EXPECT_TRUE(located_at(forward, src, "union u;"));
+
+  ast_node *enum_block = top_decl(program, 4);
+  ASSERT_EQ(enum_block->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(enum_block->block.count, 2);
+  EXPECT_TRUE(located_at(enum_block->block.statements[0], src, "enum"));
+  EXPECT_TRUE(located_at(enum_block->block.statements[1], src, "ev;"));
+
+  ast_node *sum = top_decl(program, 5);
+  ASSERT_EQ(sum->type, AST_NODE_TYPE_FUNCTION_DEF);
+  EXPECT_TRUE(located_at(sum, src, "sum"));
+  ast_node *locals = function_body_statement(program, 5, 0);
+  ASSERT_NE(locals, nullptr);
+  ASSERT_EQ(locals->type, AST_NODE_TYPE_DECL_GROUP);
+  EXPECT_TRUE(located_at(locals, src, "int local"));
+  ASSERT_EQ(locals->block.count, 2);
+  EXPECT_TRUE(located_at(locals->block.statements[0], src, "local"));
+  EXPECT_TRUE(located_at(locals->block.statements[1], src, "lp;"));
+  free_ast(program);
+}
+
+TEST(SourceLocationTest, BlockScopeDefinitionsAreLocatedAtTheirKeyword) {
+  const char *src = "void z(void) {\n"
+                    "  struct inner { int q; } iv;\n"
+                    "  union { int a; } anon;\n"
+                    "}\n";
+  int errors = -1;
+  ast_node *program = parse_source(src, &errors);
+  EXPECT_EQ(errors, 0);
+
+  ast_node *first = function_body_statement(program, 0, 0);
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->type, AST_NODE_TYPE_DECL_GROUP);
+  EXPECT_TRUE(located_at(first, src, "struct inner"));
+  ASSERT_EQ(first->block.count, 2);
+  EXPECT_TRUE(located_at(first->block.statements[0], src, "struct inner"));
+  EXPECT_TRUE(located_at(first->block.statements[1], src, "iv"));
+
+  ast_node *second = function_body_statement(program, 0, 1);
+  ASSERT_NE(second, nullptr);
+  ASSERT_EQ(second->type, AST_NODE_TYPE_DECL_GROUP);
+  ASSERT_EQ(second->block.count, 2);
+  EXPECT_TRUE(located_at(second->block.statements[0], src, "union"));
+  EXPECT_TRUE(located_at(second->block.statements[1], src, "anon"));
+  free_ast(program);
+}
+
+TEST(SourceLocationTest, AMacroBodyTokenKeepsItsDefinitionPositionAndAnArgumentItsUsePosition) {
+  const char *src = "#define TWICE(x) ((x) + (x))\n"
+                    "int v = TWICE(3);\n";
+  token_buf tb;
+  token_buf_init(&tb);
+  ASSERT_EQ(pp_run(&tb, src), 0);
+  parser p;
+  parser_init_from_buf(&p, &tb);
+  ast_node *program = parse_program(&p);
+  EXPECT_EQ(p.had_error, 0);
+
+  ast_node *v = top_decl(program, 0);
+  ASSERT_NE(v, nullptr);
+  ASSERT_EQ(v->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_TRUE(located_at(v, src, "v ="));
+  ast_node *sum = v->var_decl.init_value;
+  ASSERT_NE(sum, nullptr);
+  ASSERT_EQ(sum->type, AST_NODE_TYPE_BINARY_OP);
+  EXPECT_TRUE(located_at(sum, src, "+"));
+  EXPECT_TRUE(located_at(sum->binary_op.left, src, "3)"));
+
+  free_ast(program);
+  parser_destroy(&p);
+  token_buf_free(&tb);
+}
+
+TEST(SourceLocationTest, ADefinitionFollowedByAFunctionDeclaratorIsLocated) {
+  const char *src = "struct pair { int a; int b; } make_pair(void);";
+  int errors = -1;
+  ast_node *program = parse_source(src, &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *block = top_decl(program, 0);
+  ASSERT_NE(block, nullptr);
+  ASSERT_EQ(block->type, AST_NODE_TYPE_DECL_GROUP);
+  EXPECT_TRUE(located_at(block, src, "struct pair"));
+  ASSERT_EQ(block->block.count, 2);
+  EXPECT_TRUE(located_at(block->block.statements[0], src, "struct pair"));
+  ASSERT_EQ(block->block.statements[1]->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_TRUE(located_at(block->block.statements[1], src, "make_pair"));
+  free_ast(program);
+}
+
+static std::string parse_diagnostics(const char *source, int *errors) {
+  testing::internal::CaptureStderr();
+  ast_node *program = parse_source(source, errors);
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  free_ast(program);
+  return diagnostics;
+}
+
+struct DiagnosticCase {
+  const char *source;
+  const char *message;
+};
+
+static void expect_diagnosed(const std::vector<DiagnosticCase> &cases) {
+  for (const DiagnosticCase &test : cases) {
+    SCOPED_TRACE(test.source);
+    int errors = -1;
+    std::string diagnostics = parse_diagnostics(test.source, &errors);
+    EXPECT_GT(errors, 0);
+    EXPECT_NE(diagnostics.find(test.message), std::string::npos) << diagnostics;
+  }
+}
+
+static void expect_clean(const std::vector<const char *> &sources) {
+  for (const char *source : sources) {
+    SCOPED_TRACE(source);
+    int errors = -1;
+    std::string diagnostics = parse_diagnostics(source, &errors);
+    EXPECT_EQ(errors, 0) << diagnostics;
+  }
+}
+
+TEST(TypedefScopeTest, OrdinaryNamesHideATypedefNameUntilTheirScopeEnds) {
+  expect_clean({
+      "typedef int T; void f(void) { int T; T = 1; }",
+      "typedef int T; void f(int T) { T = 1; }",
+      "typedef int T; void f(T T) { T = 1; }",
+      "typedef int T; void f(int T); T x;",
+      "typedef int T; void f(void) { { int T; } T x; }",
+      "typedef int T; void f(void) { enum { T }; int y = T; }",
+      "typedef int T; void f(void) { enum { T }; T + 1; }",
+      "typedef int T; void f(int c) { if (c) c = sizeof(enum { T = 1 }); else c = (T){1}; }",
+      "typedef int T; void f(int c) { do c = sizeof(enum { T = 1 }); while ((T){0}); }",
+      "typedef int T; void f(void) { for (int T = 0; T < 1; T++) ; T x; }",
+      "typedef int T; void f(int c) { if (sizeof(enum { T = 1 })) c = T; T x; }",
+      "typedef int T; void f(int c) { while (c) c = sizeof(enum { T = 1 }); T x; }",
+      "typedef int T; struct S { int T; T x; };",
+      "int T; void f(void) { typedef int T; T x; }",
+      "typedef int T; void f(void) { T: goto T; }",
+      "typedef int T; void f(void) { int T = sizeof(T); }",
+      "typedef int T; void f(void) { T T; T = 1; }",
+      "typedef int T; void f(int (T));",
+  });
+}
+
+TEST(TypedefScopeTest, AHiddenTypedefNameIsNotAType) {
+  expect_diagnosed({
+      {"typedef int T; void f(void) { int T; T x; }", "expected ';' after expression statement"},
+      {"typedef int T; void g(int T, T x);", "expected a parameter type"},
+      {"typedef int T; void f(void) { enum { T }; T x; }",
+       "expected ';' after expression statement"},
+  });
+}
+
+TEST(StatementTest, ADeclarationIsNotAStatement) {
+  expect_diagnosed({
+      {"void f(int c) { if (c) int x; }", "a declaration is not a statement"},
+      {"void f(int c) { if (c) ; else int x; }", "a declaration is not a statement"},
+      {"void f(int c) { while (c) int x; }", "a declaration is not a statement"},
+      {"void f(int c) { do int x; while (c); }", "a declaration is not a statement"},
+      {"void f(int c) { for (;;) int x; }", "a declaration is not a statement"},
+      {"void f(int c) { switch (c) int x; }", "a declaration is not a statement"},
+      {"void f(int c) { switch (c) { case 1: int x; } }", "a declaration is not a statement"},
+      {"void f(int c) { switch (c) { default: int x; } }", "a declaration is not a statement"},
+      {"void f(void) { L: int x; }", "a declaration is not a statement"},
+  });
+  expect_clean({"void f(void) { int a; a = 1; int b; { int c; } for (int i = 0; ;) break; }"});
+}
+
+TEST(DeclarationShapeTest, MembersParametersAndTypedefsFollowTheirOwnRules) {
+  expect_diagnosed({
+      {"struct S { int a = 1; };", "a member cannot have an initializer"},
+      {"struct S { static int a; };", "a member cannot have a storage class or be inline"},
+      {"struct S { inline int a; };", "a member cannot have a storage class or be inline"},
+      {"typedef int T = 1;", "a typedef cannot have an initializer"},
+      {"struct S { };", "a struct or union needs at least one member"},
+      {"enum E { };", "an enum needs at least one enumerator"},
+      {"struct S { int a;", "expected '}' to close the member list"},
+      {"enum { A B } x;", "expected '}' to close the enumerator list"},
+      {"struct S { foo; int a; };", "expected a member declaration"},
+      {"struct S { int; };", "declaration does not declare anything"},
+      {"struct S { struct T; int a; };", "declaration does not declare anything"},
+      {"struct S { enum { A } ; int a; };", "declaration does not declare anything"},
+      {"int f(...);", "a named parameter must come before '...'"},
+      {"int x, f(void) { return 0; }", "expected ';' after declaration"},
+      {"typedef int F(void) { return 0; }", "expected ';' after declaration"},
+      {"void f(void) { int b : 3; }", "expected ';' after declaration"},
+      {"int a[1, 2];", "expected ']' after array size"},
+  });
+  expect_clean({
+      "struct S { int a : 3, : 0; unsigned b : 1; };",
+      "enum E { A, B, };",
+      "struct S; union U; void f(void) { struct S; }",
+      "static struct S { int a; };",
+      "int f(int, ...);",
+  });
+}
+
+TEST(DeclarationShapeTest, AMemberInitializerIsDroppedAndATypedefKeepsNone) {
+  int errors = -1;
+  testing::internal::CaptureStderr();
+  ast_node *program = parse_source("struct S { int a = 1; }; typedef int T = 2;", &errors);
+  testing::internal::GetCapturedStderr();
+  EXPECT_EQ(errors, 2);
+  ast_node *def = top_decl(program, 0);
+  ASSERT_NE(def, nullptr);
+  ASSERT_EQ(def->type, AST_NODE_TYPE_STRUCT_DEF);
+  ASSERT_EQ(def->struct_def.member_count, 1);
+  EXPECT_EQ(def->struct_def.members[0]->var_decl.init_value, nullptr);
+  ast_node *t = top_decl(program, 1);
+  ASSERT_NE(t, nullptr);
+  ASSERT_EQ(t->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_EQ(t->var_decl.init_value, nullptr);
+  free_ast(program);
+}
+
+TEST(TypeNameTest, TypeNamesMayDefineTagsAndCompoundLiteralsTakePostfixOperators) {
+  int errors = -1;
+  ast_node *program = parse_source("void f(void) {\n"
+                                   "  long a = sizeof(struct P { int x; });\n"
+                                   "  int b = (enum { K = 3 })K;\n"
+                                   "  int c = (int[]){1, 2}[1];\n"
+                                   "  int d = sizeof (int){1};\n"
+                                   "  int e = ((struct { int y; }){4}).y;\n"
+                                   "}\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *a = function_body_statement(program, 0, 0);
+  ast_node *b = function_body_statement(program, 0, 1);
+  ast_node *c = function_body_statement(program, 0, 2);
+  ast_node *d = function_body_statement(program, 0, 3);
+  ast_node *e = function_body_statement(program, 0, 4);
+  ASSERT_TRUE(a && b && c && d && e);
+
+  ast_node *size = a->var_decl.init_value;
+  ASSERT_EQ(size->type, AST_NODE_TYPE_UNARY_OP);
+  ASSERT_EQ(size->unary_op.operand->type, AST_NODE_TYPE_CAST);
+  ast_node *struct_def = size->unary_op.operand->cast_expr.definition;
+  ASSERT_NE(struct_def, nullptr);
+  ASSERT_EQ(struct_def->type, AST_NODE_TYPE_STRUCT_DEF);
+  EXPECT_STREQ(struct_def->struct_def.tag_name, "P");
+  EXPECT_EQ(size->unary_op.operand->cast_expr.type->definition, struct_def);
+
+  ast_node *cast = b->var_decl.init_value;
+  ASSERT_EQ(cast->type, AST_NODE_TYPE_CAST);
+  ASSERT_NE(cast->cast_expr.definition, nullptr);
+  EXPECT_EQ(cast->cast_expr.definition->type, AST_NODE_TYPE_ENUM_DEF);
+  ASSERT_NE(cast->cast_expr.operand, nullptr);
+  EXPECT_EQ(cast->cast_expr.operand->type, AST_NODE_TYPE_IDENTIFIER);
+
+  ast_node *subscript = c->var_decl.init_value;
+  ASSERT_EQ(subscript->type, AST_NODE_TYPE_ARRAY_SUBSCRIPT);
+  EXPECT_EQ(subscript->array_subscript.left->type, AST_NODE_TYPE_COMPOUND_LITERAL);
+
+  ast_node *literal_size = d->var_decl.init_value;
+  ASSERT_EQ(literal_size->type, AST_NODE_TYPE_UNARY_OP);
+  EXPECT_EQ(literal_size->unary_op.operand->type, AST_NODE_TYPE_COMPOUND_LITERAL);
+
+  ast_node *member = e->var_decl.init_value;
+  ASSERT_EQ(member->type, AST_NODE_TYPE_MEMBER_ACCESS);
+  ASSERT_EQ(member->member_access.left->type, AST_NODE_TYPE_COMPOUND_LITERAL);
+  ASSERT_NE(member->member_access.left->compound_literal.definition, nullptr);
+  EXPECT_EQ(member->member_access.left->compound_literal.definition->type,
+            AST_NODE_TYPE_STRUCT_DEF);
+  free_ast(program);
+}
+
+TEST(TypeNameTest, UnfinishedTypeNamesAndPostfixOperatorsAreReported) {
+  expect_diagnosed({
+      {"int a = (int 1;", "expected ')' after a type name"},
+      {"int b = sizeof(int 1;", "expected ')' after a type name"},
+      {"void f(void) { f(1; }", "expected ')' after the arguments"},
+      {"void f(int *a) { a[1; }", "expected ']' after the subscript"},
+      {"struct S { int x; } s; void f(void) { s.; }", "expected a member name"},
+  });
+}
+
+TEST(ParameterTest, AParameterSpecifierMayDefineATag) {
+  int errors = -1;
+  ast_node *program = parse_source("void f(struct Q { int y; } q, enum { R } r);\n"
+                                   "void g(int a, struct Z { int z; } *b);\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  type_info *f = top_var_type(program, 0);
+  ASSERT_NE(f, nullptr);
+  ASSERT_EQ(f->param_count, 2);
+  ASSERT_NE(f->param_definitions, nullptr);
+  ASSERT_NE(f->param_definitions[0], nullptr);
+  EXPECT_EQ(f->param_definitions[0]->type, AST_NODE_TYPE_STRUCT_DEF);
+  EXPECT_EQ(f->param_types[0]->definition, f->param_definitions[0]);
+  ASSERT_NE(f->param_definitions[1], nullptr);
+  EXPECT_EQ(f->param_definitions[1]->type, AST_NODE_TYPE_ENUM_DEF);
+  type_info *g = top_var_type(program, 1);
+  ASSERT_NE(g, nullptr);
+  ASSERT_EQ(g->param_count, 2);
+  ASSERT_NE(g->param_definitions, nullptr);
+  EXPECT_EQ(g->param_definitions[0], nullptr);
+  ASSERT_NE(g->param_definitions[1], nullptr);
+  EXPECT_STREQ(g->param_definitions[1]->struct_def.tag_name, "Z");
+  free_ast(program);
+}
+
+TEST(ParameterTest, AbstractDeclaratorsMayBeFunctions) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int T;\n"
+                                   "void f(int (int), int (), int (char *, ...), int (*)(int), "
+                                   "int (T));\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  type_info *f = top_var_type(program, 1);
+  ASSERT_NE(f, nullptr);
+  ASSERT_EQ(f->param_count, 5);
+  EXPECT_EQ(f->param_types[0]->kind, TYPE_FUNCTION);
+  EXPECT_EQ(f->param_types[0]->has_prototype, 1);
+  EXPECT_EQ(f->param_types[1]->kind, TYPE_FUNCTION);
+  EXPECT_EQ(f->param_types[1]->has_prototype, 0);
+  EXPECT_EQ(f->param_types[2]->kind, TYPE_FUNCTION);
+  EXPECT_EQ(f->param_types[2]->is_variadic, 1);
+  ASSERT_EQ(f->param_types[3]->kind, TYPE_POINTER);
+  EXPECT_EQ(f->param_types[3]->ptr_to->kind, TYPE_FUNCTION);
+  ASSERT_EQ(f->param_types[4]->kind, TYPE_FUNCTION) << "C99 6.7.5.3p11: (T) is a parameter list";
+  ASSERT_EQ(f->param_types[4]->param_count, 1);
+  EXPECT_EQ(f->param_types[4]->param_types[0]->kind, TYPE_TYPEDEF);
+  free_ast(program);
+}
+
+TEST(ArrayDeclaratorTest, StaticQualifiersAndStarBelongToParameters) {
+  int errors = -1;
+  ast_node *program = parse_source(
+      "void f(int a[static 3], int b[const], int c[static const 4][5], int d[*], int e[*][*],\n"
+      "       int (*g)(int h[*]));\n"
+      "void k(int n, int *p, int a[*p]);\n",
+      &errors);
+  EXPECT_EQ(errors, 0);
+  type_info *f = top_var_type(program, 0);
+  ASSERT_NE(f, nullptr);
+  ASSERT_EQ(f->param_count, 6);
+  EXPECT_EQ(f->param_types[0]->array_static, 1);
+  EXPECT_NE(f->param_types[0]->array_size_expr, nullptr);
+  EXPECT_EQ(f->param_types[1]->is_const, 1);
+  EXPECT_EQ(f->param_types[1]->array_static, 0);
+  EXPECT_EQ(f->param_types[2]->array_static, 1);
+  EXPECT_EQ(f->param_types[2]->is_const, 1);
+  EXPECT_EQ(f->param_types[2]->ptr_to->array_static, 0);
+  EXPECT_EQ(f->param_types[2]->ptr_to->is_const, 0);
+  EXPECT_EQ(f->param_types[3]->array_star, 1);
+  EXPECT_EQ(f->param_types[3]->array_size_expr, nullptr);
+  EXPECT_EQ(f->param_types[4]->ptr_to->array_star, 1);
+  free_ast(program);
+
+  expect_diagnosed({
+      {"int a[static 3];",
+       "static and qualifiers in [] belong only to a parameter's outermost array"},
+      {"int a[const 3];",
+       "static and qualifiers in [] belong only to a parameter's outermost array"},
+      {"void f(int a[3][static 4]);",
+       "static and qualifiers in [] belong only to a parameter's outermost array"},
+      {"void f(int (*a)[const 3]);",
+       "static and qualifiers in [] belong only to a parameter's outermost array"},
+      {"struct S { int a[restrict 2]; };",
+       "static and qualifiers in [] belong only to a parameter's outermost array"},
+      {"int a[*];", "[*] is only allowed in a function prototype"},
+      {"void f(void) { long n = sizeof(int[*]); }", "[*] is only allowed in a function prototype"},
+      {"void f(int a[static]);", "static in an array declarator needs a size"},
+      {"void f(int a[static static 3]);", "static appears twice in an array declarator"},
+  });
+}
+
+TEST(KnrDefinitionTest, AnIdentifierListTakesItsTypesFromTheDeclarationList) {
+  int errors = -1;
+  ast_node *program = parse_source("int f(a, b, c) int a; double *b, c; { return a; }\n"
+                                   "int g(p) register int p; { return p; }\n"
+                                   "int h(s) struct S { int x; } s; { return s.x; }\n"
+                                   "typedef int T;\n"
+                                   "int k(t) T t; { T u; return t; }\n"
+                                   "int empty() { return 0; }\n"
+                                   "int none(void) { return 0; }\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *f = top_decl(program, 0);
+  ASSERT_NE(f, nullptr);
+  ASSERT_EQ(f->type, AST_NODE_TYPE_FUNCTION_DEF);
+  type_info *type = f->function_def.type;
+  EXPECT_EQ(type->has_prototype, 0);
+  ASSERT_EQ(type->param_count, 3);
+  EXPECT_STREQ(type->param_names[0], "a");
+  ASSERT_NE(type->param_types[0], nullptr);
+  EXPECT_EQ(type->param_types[0]->prim, PRIM_INT);
+  ASSERT_NE(type->param_types[1], nullptr);
+  EXPECT_EQ(type->param_types[1]->kind, TYPE_POINTER);
+  ASSERT_NE(type->param_types[2], nullptr);
+  EXPECT_EQ(type->param_types[2]->prim, PRIM_DOUBLE);
+
+  ast_node *h = top_decl(program, 2);
+  ASSERT_NE(h, nullptr);
+  ASSERT_EQ(h->type, AST_NODE_TYPE_FUNCTION_DEF);
+  ASSERT_NE(h->function_def.type->param_definitions, nullptr);
+  ASSERT_NE(h->function_def.type->param_definitions[0], nullptr);
+  EXPECT_EQ(h->function_def.type->param_definitions[0]->type, AST_NODE_TYPE_STRUCT_DEF);
+
+  ast_node *empty = top_decl(program, 5);
+  ast_node *none = top_decl(program, 6);
+  ASSERT_TRUE(empty && none);
+  EXPECT_EQ(empty->function_def.type->has_prototype, 0);
+  EXPECT_EQ(none->function_def.type->has_prototype, 1);
+  free_ast(program);
+}
+
+TEST(KnrDefinitionTest, IdentifierListsAndParameterNamesAreChecked) {
+  expect_diagnosed({
+      {"int f(a);", "an identifier list is only allowed in a function definition"},
+      {"int (*fp)(a);", "an identifier list is only allowed in a function definition"},
+      {"int g(int h(x));", "an identifier list is only allowed in a function definition"},
+      {"long n = sizeof(int (*)(x));",
+       "an identifier list is only allowed in a function definition"},
+      {"int f(a) { return 0; }", "a parameter in the identifier list is not declared"},
+      {"int f(a) int b; int a; { return 0; }",
+       "this declaration names no parameter of the function"},
+      {"int f(a) int a; int a; { return 0; }", "a parameter is declared twice"},
+      {"int f(a) static int a; { return 0; }",
+       "only register may appear in a parameter declaration"},
+      {"int f(a) int a = 1; { return 0; }", "a parameter cannot have an initializer"},
+      {"int f(a) int; int a; { return 0; }", "declaration does not declare anything"},
+      {"int f(a, 1) { return 0; }", "expected a parameter name"},
+  });
+  expect_clean({"int f(int) { return 0; }", "int f(int a, char) { return a; }"});
+}
+
+TEST(SourceLocationTest, NodesAndErrorsNameTheFileTheTokensCameFrom) {
+  token_buf tb;
+  pp_run_ex(&tb, "int a = 08;\n#line 30 \"gen.c\"\nint b = 09;\n", "main.c", nullptr, 0);
+  parser p;
+  parser_init_from_buf(&p, &tb);
+  testing::internal::CaptureStderr();
+  ast_node *program = parse_program(&p);
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  parser_destroy(&p);
+  EXPECT_EQ(diagnostics, "main.c:1:9: error: invalid digit in an octal constant (at '08')\n"
+                         "gen.c:30:9: error: invalid digit in an octal constant (at '09')\n");
+  ast_node *a = top_decl(program, 0);
+  ast_node *b = top_decl(program, 1);
+  ASSERT_TRUE(a && b);
+  EXPECT_STREQ(a->loc.file, "main.c") << "file names outlive the token buffer";
+  EXPECT_STREQ(a->var_decl.init_value->loc.file, "main.c");
+  EXPECT_STREQ(b->loc.file, "gen.c");
+  EXPECT_EQ(b->loc.line, 30);
+  free_ast(program);
+
+  int errors = -1;
+  program = parse_source("int c;", &errors);
+  ASSERT_NE(top_decl(program, 0), nullptr);
+  EXPECT_EQ(top_decl(program, 0)->loc.file, nullptr)
+      << "source handed straight to the lexer has no file";
+  free_ast(program);
+}
+
+TEST(InitializerTest, InitializerListsFollowTheGrammar) {
+  expect_diagnosed({
+      {"int a[2] = {};", "an initializer list needs at least one initializer"},
+      {"int a[2][2] = { {}, { 1 } };", "an initializer list needs at least one initializer"},
+      {"int a[2] = { [1] 5 };", "expected '=' after a designator"},
+      {"struct P { int x; } p = { .x 1 };", "expected '=' after a designator"},
+      {"int a[2] = { 1, 2;", "expected '}' to close the initializer list"},
+      {"int a[2][2] = { { 1 };", "expected '}' to close the initializer list"},
+  });
+  expect_clean({
+      "int a[2] = { [1] = 5, };",
+      "struct P { int x; } p = { .x = 1 };",
+      "int b[2][2] = { { 1 }, { 2, 3 } };",
+      "int c = { 1 };",
+  });
+  int errors = -1;
+  EXPECT_EQ(parse_diagnostics("int a[2] = { [1] };", &errors),
+            "1:18: error: expected '=' after a designator (at '}')\n"
+            "1:18: error: expected an expression (at '}')\n")
+      << "a missing value does not also lose the closing brace";
+}
+
+TEST(TranslationUnitTest, ATranslationUnitNeedsADeclaration) {
+  int errors = -1;
+  EXPECT_EQ(parse_diagnostics("", &errors),
+            "1:1: error: a translation unit needs at least one declaration (at '<eof>')\n");
+  EXPECT_EQ(errors, 1);
+  std::string dropped = parse_diagnostics("int x", &errors);
+  EXPECT_EQ(errors, 1);
+  EXPECT_NE(dropped.find("expected ';' after declaration"), std::string::npos) << dropped;
+  EXPECT_EQ(dropped.find("translation unit"), std::string::npos)
+      << "a unit whose only declaration was dropped after an error is not reported again as empty";
+}
+
+TEST(ParameterTest, VoidIsOnlyTheEmptyListWhenItIsAloneUnnamedAndUnqualified) {
+  int errors = -1;
+  ast_node *program = parse_source("int g(void);\n"
+                                   "int h(const void);\n"
+                                   "int k(void, ...);\n"
+                                   "int m(void x);\n"
+                                   "int n(void, int);\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0) << "C99 6.7.5.3p4 constrains only a definition's parameters";
+  const int counts[] = {0, 1, 1, 1, 2};
+  for (int i = 0; i < 5; i++) {
+    type_info *type = top_var_type(program, i);
+    ASSERT_NE(type, nullptr) << i;
+    EXPECT_EQ(type->param_count, counts[i]) << i;
+    EXPECT_EQ(type->has_prototype, 1) << i;
+  }
+  free_ast(program);
+
+  expect_clean({"int f(void) { return 0; }", "int f(void *p) { return p != 0; }",
+                "int f(void x) { return 0; }", "int f(void, int a) { return a; }",
+                "int f(const void) { return 0; }"});
 }

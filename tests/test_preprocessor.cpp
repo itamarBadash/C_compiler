@@ -5,6 +5,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <io.h>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1398,16 +1399,170 @@ TEST_F(PreprocessorTest, HashInObjectLikeMacroIsJustAToken) {
   EXPECT_EQ(tb.tokens[0].type, TOKEN_HASH);
 }
 
-TEST_F(PreprocessorTest, HashNotFollowedByAParameterIsEmittedLiterally) {
-  run("#define S(x) #y x\nS(1)");
-  std::vector<std::string> expected = {"#", "y", "1"};
+TEST_F(PreprocessorTest, DefineConstraintsAreDiagnosedAndTheMacroIsNotDefined) {
+  const struct {
+    const char *source;
+    const char *message;
+    std::vector<std::string> output;
+  } cases[] = {
+      {"#define\nX", "1:2: error: expected a macro name after #define", {"X"}},
+      {"#define F(x, x) x\nF(1)", "1:14: error: duplicate macro parameter", {"F", "(", "1", ")"}},
+      {"#define F(1) x\nF(1)",
+       "1:11: error: expected a macro parameter name",
+       {"F", "(", "1", ")"}},
+      {"#define F(a b) x\nF(1)",
+       "1:13: error: expected ',' or ')' in macro parameter list",
+       {"F", "(", "1", ")"}},
+      {"#define F(a,\nF(1)",
+       "1:9: error: missing ')' in macro parameter list",
+       {"F", "(", "1", ")"}},
+      {"#define S(x) #y x\nS(1)",
+       "1:9: error: '#' is not followed by a macro parameter",
+       {"S", "(", "1", ")"}},
+      {"#define S(x) x #\nS(1)",
+       "1:9: error: '#' is not followed by a macro parameter",
+       {"S", "(", "1", ")"}},
+      {"#define S(x) # 1\nS(1)",
+       "1:9: error: '#' is not followed by a macro parameter",
+       {"S", "(", "1", ")"}},
+      {"#define S(a) ##a\nS(x)",
+       "1:9: error: '##' cannot appear at either end of a macro replacement list",
+       {"S", "(", "x", ")"}},
+      {"#define S(a) a##\nS(x)",
+       "1:9: error: '##' cannot appear at either end of a macro replacement list",
+       {"S", "(", "x", ")"}},
+      {"#define O ## 1\nO",
+       "1:9: error: '##' cannot appear at either end of a macro replacement list",
+       {"O"}},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    token_buf out;
+    testing::internal::CaptureStderr();
+    int errors = pp_run(&out, test.source);
+    std::string diagnostics = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(errors, 1);
+    EXPECT_EQ(diagnostics, std::string("<source>:") + (test.message + 0) + "\n");
+    std::vector<std::string> spelled;
+    for (int i = 0; i < out.count; i++) {
+      if (out.tokens[i].type != TOKEN_EOF)
+        spelled.push_back(out.tokens[i].value);
+    }
+    EXPECT_EQ(spelled, test.output);
+    token_buf_free(&out);
+  }
+}
+
+TEST_F(PreprocessorTest, AnObjectLikeMacroNeedsWhitespaceAfterItsName) {
+  testing::internal::CaptureStderr();
+  run("#define X+1\n#define Y\"s\"\n#define Z (1)\n#define W/**/2\nX Y Z W");
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(rc, 2);
+  EXPECT_EQ(diagnostics,
+            "<source>:1:10: error: an object-like macro needs whitespace after its name\n"
+            "<source>:2:10: error: an object-like macro needs whitespace after its name\n");
+  std::vector<std::string> expected = {"+", "1", "s", "(", "1", ")", "2"};
+  EXPECT_EQ(spellings(), expected) << "the macro is still defined, as GCC does";
+}
+
+TEST_F(PreprocessorTest, ARedefinitionMustMatchTheOriginal) {
+  testing::internal::CaptureStderr();
+  run("#define A 1 + 2\n#define A 1  +  2\n"
+      "#define B 1 + 2\n#define B 1+2\n"
+      "#define C(x) x\n#define C(y) y\n"
+      "#define D(x) x\n#define D x\n"
+      "#define E 1\n#define E 2\n"
+      "#define F(...) __VA_ARGS__\n#define F(...) __VA_ARGS__\n"
+      "#define G(a, ...) a\n#define G(a) a\n"
+      "#define H() x\n#define H x\n"
+      "#define S \"1\"\n#define S 1\n"
+      "#define P(a, b) a\n#define P(b, a) a\n"
+      "#define L 1 2\n#define L 1\n"
+      "#define O # y\n"
+      "A B C(1) D E G(1) H S P(1, 2) L O");
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(rc, 9);
+  EXPECT_EQ(diagnostics, "<source>:4:9: error: macro redefined with a different definition\n"
+                         "<source>:6:9: error: macro redefined with a different definition\n"
+                         "<source>:8:9: error: macro redefined with a different definition\n"
+                         "<source>:10:9: error: macro redefined with a different definition\n"
+                         "<source>:14:9: error: macro redefined with a different definition\n"
+                         "<source>:16:9: error: macro redefined with a different definition\n"
+                         "<source>:18:9: error: macro redefined with a different definition\n"
+                         "<source>:20:9: error: macro redefined with a different definition\n"
+                         "<source>:22:9: error: macro redefined with a different definition\n");
+  std::vector<std::string> expected = {"1", "+", "2", "1", "+", "2", "1", "x",
+                                       "2", "1", "x", "1", "2", "1", "#", "y"};
+  EXPECT_EQ(spellings(), expected) << "the later definition replaces the earlier one";
+}
+
+TEST_F(PreprocessorTest, ConditionalAndUndefDirectivesTakeNoExtraTokens) {
+  testing::internal::CaptureStderr();
+  run("#define X 1\n"
+      "#ifdef X Y\n"
+      "a\n"
+      "#endif Z\n"
+      "#ifndef Q R\n"
+      "b\n"
+      "#else S\n"
+      "c\n"
+      "#endif\n"
+      "#undef X T\n"
+      "#undef\n"
+      "X\n"
+      "#if 0\n"
+      "#else junk\n"
+      "#endif\n");
+  std::string diagnostics = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(rc, 7);
+  EXPECT_EQ(diagnostics, "<source>:2:10: error: extra tokens after #ifdef\n"
+                         "<source>:4:8: error: extra tokens after #endif\n"
+                         "<source>:5:11: error: extra tokens after #ifndef\n"
+                         "<source>:7:7: error: extra tokens after #else\n"
+                         "<source>:10:10: error: extra tokens after #undef\n"
+                         "<source>:11:2: error: expected a macro name after #undef\n"
+                         "<source>:14:7: error: extra tokens after #else\n");
+  std::vector<std::string> expected = {"a", "b", "X"};
+  EXPECT_EQ(spellings(), expected);
+
+  token_buf clean;
+  EXPECT_EQ(pp_run(&clean, "#ifdef X // c\n#else /* c */\n#endif\n#undef X /* c */\nx"), 0);
+  token_buf_free(&clean);
+}
+
+TEST_F(PreprocessorTest, LexerErrorsCountAsDiagnostics) {
+  testing::internal::CaptureStderr();
+  run("int @;\n#if 0\n'\n#endif\n");
+  testing::internal::GetCapturedStderr();
+  EXPECT_EQ(rc, 2) << "one stray character, one unterminated constant in a skipped group";
+}
+
+TEST_F(PreprocessorTest, DigraphsWorkAsDirectivesPastesAndStringizedSpellings) {
+  run("%:define CAT(a, b) a %:%: b\n"
+      "%:define STR(x) %:x\n"
+      "int CAT(x, y) <: 2 :>;\n"
+      "const char *s = STR(<%);\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"int",  "xy", "<:", "2", ":>", ";", "const",
+                                       "char", "*",  "s",  "=", "<%", ";"};
   EXPECT_EQ(spellings(), expected);
 }
 
-TEST_F(PreprocessorTest, HashAtEndOfMacroBodyIsEmittedLiterally) {
-  run("#define S(x) x #\nS(1)");
-  std::vector<std::string> expected = {"1", "#"};
+TEST_F(PreprocessorTest, TrigraphsWorkThroughThePreprocessor) {
+  run("?\?=define X 1\nint a?\?(X?\?) = ?\?<X?\?>;\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"int", "a", "[", "1", "]", "=", "{", "1", "}", ";"};
   EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(SpliceTest, TrigraphsAreReplacedBeforeLinesAreSpliced) {
+  EXPECT_EQ(splice("?\?=?\?(?\?)?\?<?\?>?\?'?\?!?\?-"), "#[]{}^|~");
+  EXPECT_EQ(splice("a?\?/\nb"), "ab\n") << "a trigraph backslash splices like a backslash";
+  EXPECT_EQ(splice("a?\?/\r\nb"), "ab\n");
+  EXPECT_EQ(splice("?\?/"), "\\");
+  EXPECT_EQ(splice("?\?[?\?#?\?\\"), "?\?[?\?#?\?\\") << "only the nine trigraph keys";
+  EXPECT_EQ(splice("?\?\?="), "?#") << "only the last two question marks start the trigraph";
+  EXPECT_EQ(splice("?\?x ?? ?"), "?\?x ?? ?");
 }
 
 TEST_F(PreprocessorTest, StringizedResultIsAStringNotRescanned) {
@@ -1531,18 +1686,6 @@ TEST_F(PreprocessorTest, PasteWorksInObjectLikeMacros) {
   ASSERT_EQ(tb.count, 2);
   EXPECT_EQ(tb.tokens[0].type, TOKEN_NUMBER);
   EXPECT_STREQ(tb.tokens[0].value, "12");
-}
-
-TEST_F(PreprocessorTest, PasteAtTheStartOfABodyIsDropped) {
-  run("#define S(a) ##a\n[S(x)]");
-  std::vector<std::string> expected = {"[", "x", "]"};
-  EXPECT_EQ(spellings(), expected);
-}
-
-TEST_F(PreprocessorTest, PasteAtTheEndOfABodyIsDropped) {
-  run("#define S(a) a##\n[S(x)]");
-  std::vector<std::string> expected = {"[", "x", "]"};
-  EXPECT_EQ(spellings(), expected);
 }
 
 TEST_F(PreprocessorTest, PastedTokenKeepsTheLeftOperandPosition) {
@@ -3014,6 +3157,36 @@ TEST_F(PreprocessorTest, ANulCharacterConstantIsFalse) {
   EXPECT_EQ(rc, 0);
 }
 
+TEST_F(PreprocessorTest, MultiCharacterAndUniversalCharacterConstantsMatchGcc) {
+  run("#if 'ab' == 24930 && 'abcde' == 'bcde' && '\\377\\377' == 65535\nA\n#endif\n"
+      "#if L'ab' == 'b' && L'\\xffff' == 65535 && L'\\U0001F600' == 0xDE00\nB\n#endif\n"
+      "#if '\\u00e9' == 0xC3A9 && L'\\u00e9' == 0xE9 && L'\\x100' == 256\nC\n#endif\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"A", "B", "C"};
+  EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(PreprocessorTest, AnOutOfRangeCharacterEscapeIsAnError) {
+  run("#if '\\x100'\nA\n#endif");
+  EXPECT_EQ(rc, 1);
+}
+
+TEST_F(PreprocessorTest, ConditionalIntegersFollowTheConstantGrammar) {
+  run("#if 0x10u == 16 && 1LL && 07 == 7 && 10llu == 10 && -1 > 0u\nA\n#endif\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"A"};
+  EXPECT_EQ(spellings(), expected);
+  for (const char *source :
+       {"#if 1lL\nB\n#endif\n", "#if 08\nB\n#endif\n", "#if 0x\nB\n#endif\n",
+        "#if 1uu\nB\n#endif\n", "#if 1.2.3\nB\n#endif\n", "#if 1.5\nB\n#endif\n"}) {
+    SCOPED_TRACE(source);
+    token_buf out;
+    EXPECT_EQ(pp_run(&out, source), 1);
+    EXPECT_EQ(out.count, 1) << "the group is skipped";
+    token_buf_free(&out);
+  }
+}
+
 TEST_F(PreprocessorTest, AnUnknownCharacterEscapeIsAnError) {
   run("#if '\\q'\nA\n#endif");
   EXPECT_EQ(rc, 1);
@@ -3199,10 +3372,10 @@ TEST_F(PreprocessorTest, TheFileNameFormOfLineCostsTheExpectedAllocations) {
   int with_name = tb_free_calls;
   token_buf_free(&named);
 
-  EXPECT_EQ(with_name - without_name, 5)
+  EXPECT_EQ(with_name - without_name, 4)
       << "the string token costs three value-frees because expand_token_list "
          "clones it once into the expansion frame and once into the output, "
-         "plus the lexer's scratch buffer and the presumed_name strdup";
+         "plus the lexer's scratch buffer; the presumed name is interned, not freed";
 }
 
 TEST_F(PreprocessorTest, LineInADeadBranchHasNoEffect) {
@@ -3220,6 +3393,45 @@ TEST_F(IncludeTest, LineDirectiveInAHeaderDoesNotLeakToTheIncluder) {
       << "the offset and presumed name belong to the frame, so they must be "
          "gone once it pops";
   remove("pp_test_inc/lined.h");
+}
+
+TEST_F(IncludeTest, EveryTokenKnowsItsFileAndPresumedLine) {
+  run("int a;\n"
+      "#include \"simple.h\"\n"
+      "int b;\n"
+      "#line 40\n"
+      "c = 1;\n"
+      "#line 7 \"gen.c\"\n"
+      "d = 2;\n"
+      "int e;\n"
+      "#include \"simple.h\"\n");
+  EXPECT_EQ(rc, 0);
+  std::map<std::string, const token *> by_name;
+  std::vector<const token *> from_inc;
+  for (int i = 0; i < tb.count; i++) {
+    if (tb.tokens[i].type != TOKEN_IDENTIFIER)
+      continue;
+    by_name[tb.tokens[i].value] = &tb.tokens[i];
+    if (strcmp(tb.tokens[i].value, "from_inc") == 0)
+      from_inc.push_back(&tb.tokens[i]);
+  }
+  ASSERT_EQ(by_name.size(), 6u);
+  ASSERT_EQ(from_inc.size(), 2u);
+  EXPECT_EQ(from_inc[0]->file, from_inc[1]->file)
+      << "a file included twice is named by one interned string";
+  EXPECT_STREQ(by_name["a"]->file, "pp_test_src/main.c");
+  EXPECT_EQ(by_name["a"]->line, 1);
+  ASSERT_NE(by_name["from_inc"]->file, nullptr);
+  EXPECT_NE(std::string(by_name["from_inc"]->file).find("simple.h"), std::string::npos);
+  EXPECT_EQ(by_name["from_inc"]->line, 1);
+  EXPECT_EQ(by_name["b"]->file, by_name["a"]->file) << "one interned name per file";
+  EXPECT_EQ(by_name["b"]->line, 3);
+  EXPECT_STREQ(by_name["c"]->file, "pp_test_src/main.c");
+  EXPECT_EQ(by_name["c"]->line, 40) << "the line right after #line already has the new number";
+  EXPECT_STREQ(by_name["d"]->file, "gen.c");
+  EXPECT_EQ(by_name["d"]->line, 7);
+  EXPECT_STREQ(by_name["e"]->file, "gen.c");
+  EXPECT_EQ(by_name["e"]->line, 8);
 }
 
 TEST_F(IncludeTest, PresumedNamesDoNotLeakAcrossManyFrames) {
@@ -3247,10 +3459,9 @@ TEST_F(IncludeTest, PresumedNamesDoNotLeakAcrossManyFrames) {
 
   EXPECT_EQ((frees_many - frees_one) % 50, 0)
       << "each extra include must cost the same fixed amount";
-  EXPECT_EQ(frees_many - frees_one, 50 * 33)
-      << "one of the 33 frees per included frame is the presumed_name that "
-         "source_pop releases; 50*32 means it is leaked. A delta test on a "
-         "single frame cannot see this, because free(NULL) is still a call";
+  EXPECT_EQ(frees_many - frees_one, 50 * 31)
+      << "a presumed name is interned once for the whole run, so no included frame "
+         "allocates or frees a copy of it";
 }
 
 TEST_F(IncludeTest, LineDirectiveDoesNotAffectIncludeResolution) {
@@ -3260,4 +3471,64 @@ TEST_F(IncludeTest, LineDirectiveDoesNotAffectIncludeResolution) {
       << "a presumed name is a fiction for reporting; includes resolve "
          "against the real path on disk";
   EXPECT_EQ(rc, 0);
+}
+
+TEST_F(PreprocessorTest, KeywordsCanBeDefinedTestedAndUndefinedAsMacros) {
+  run("#define inline\n"
+      "#define int long\n"
+      "inline int x;\n"
+      "#ifdef int\n"
+      "a\n"
+      "#endif\n"
+      "#if defined(int) && defined inline && !defined(return)\n"
+      "b\n"
+      "#endif\n"
+      "#undef int\n"
+      "#ifndef int\n"
+      "int c;\n"
+      "#endif\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"long", "x", ";", "a", "b", "int", "c", ";"};
+  EXPECT_EQ(spellings(), expected);
+  std::vector<token_type> kinds = {TOKEN_LONG,       TOKEN_IDENTIFIER, TOKEN_SEMICOLON,
+                                   TOKEN_IDENTIFIER, TOKEN_IDENTIFIER, TOKEN_INT,
+                                   TOKEN_IDENTIFIER, TOKEN_SEMICOLON,  TOKEN_EOF};
+  EXPECT_EQ(types(), kinds);
+}
+
+TEST_F(PreprocessorTest, KeywordsCanBeMacroParameters) {
+  run("#define F(int, if) int + if\n"
+      "#define S(for) #for\n"
+      "#define V(do, ...) do(__VA_ARGS__)\n"
+      "F(1, 2) S(x y) V(g, 3)\n"
+      "#if int\n"
+      "bad\n"
+      "#endif\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"1", "+", "2", "x y", "g", "(", "3", ")"};
+  EXPECT_EQ(spellings(), expected);
+  EXPECT_EQ(tb.tokens[3].type, TOKEN_STRING);
+}
+
+TEST_F(PreprocessorTest, AParameterListEndsWithItsLine) {
+  const char *cases[][2] = {
+      {"#define F(a,\nfoo y;", "foo y ;"},   {"#define F(a\n) x\nF", ") x F"},
+      {"#define F(\n) x\nF", ") x F"},       {"#define F(a\n, b) x\nF", ", b ) x F"},
+      {"#define F(a, ...\n) x\nF", ") x F"},
+  };
+  for (const auto &c : cases) {
+    SCOPED_TRACE(c[0]);
+    token_buf out;
+    pp_run(&out, c[0]);
+    std::string got;
+    for (int i = 0; i < out.count; i++) {
+      if (out.tokens[i].type == TOKEN_EOF)
+        continue;
+      if (!got.empty())
+        got += " ";
+      got += out.tokens[i].value;
+    }
+    EXPECT_EQ(got, c[1]);
+    token_buf_free(&out);
+  }
 }

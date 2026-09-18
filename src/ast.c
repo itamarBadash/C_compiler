@@ -63,6 +63,7 @@ void free_ast(ast_node *node) {
     break;
 
   case AST_NODE_TYPE_BLOCK:
+  case AST_NODE_TYPE_DECL_GROUP:
     if (node->block.statements != NULL) {
       for (int i = 0; i < node->block.count; i++) {
         free_ast(node->block.statements[i]);
@@ -85,24 +86,15 @@ void free_ast(ast_node *node) {
     if (node->function_def.name != NULL) {
       free(node->function_def.name);
     }
-    if (node->function_def.return_type != NULL) {
-      free_type_info(node->function_def.return_type);
+    if (node->function_def.type != NULL) {
+      free_type_info(node->function_def.type);
     }
-    if (node->function_def.parameters != NULL) {
-      for (int i = 0; i < node->function_def.param_count; i++) {
-        free(node->function_def.parameters[i]);
-      }
-      free(node->function_def.parameters);
+    if (node->function_def.param_symbols != NULL) {
+      free(node->function_def.param_symbols);
     }
-    if (node->function_def.param_types != NULL) {
-      for (int i = 0; i < node->function_def.param_count; i++) {
-        free_type_info(node->function_def.param_types[i]);
-      }
-      free(node->function_def.param_types);
-    }
+    free_type_info(node->function_def.name_type);
     free_ast(node->function_def.body);
     break;
-
   case AST_NODE_TYPE_RETURN:
     free_ast(node->return_stmt.return_value);
     break;
@@ -136,6 +128,9 @@ void free_ast(ast_node *node) {
       }
       free(node->program.declarations);
     }
+    for (int i = 0; i < node->program.derived_count; i++)
+      free(node->program.derived_types[i]);
+    free(node->program.derived_types);
     break;
 
   case AST_NODE_TYPE_STRING:
@@ -205,6 +200,7 @@ void free_ast(ast_node *node) {
       free_type_info(node->cast_expr.type);
     if (node->cast_expr.operand)
       free_ast(node->cast_expr.operand);
+    free_ast(node->cast_expr.definition);
     break;
 
   case AST_NODE_TYPE_INIT_LIST:
@@ -229,13 +225,7 @@ void free_ast(ast_node *node) {
       free_type_info(node->compound_literal.type);
     if (node->compound_literal.init_list)
       free_ast(node->compound_literal.init_list);
-    break;
-
-  case AST_NODE_TYPE_DESIGNATOR:
-    if (node->designator.member_name)
-      free(node->designator.member_name);
-    if (node->designator.index)
-      free_ast(node->designator.index);
+    free_ast(node->compound_literal.definition);
     break;
 
   case AST_NODE_TYPE_GOTO:
@@ -290,11 +280,13 @@ void free_type_info(type_info *type) {
     }
     free(type->param_names);
   }
+  if (type->param_definitions) {
+    for (int i = 0; i < type->param_count; i++)
+      free_ast(type->param_definitions[i]);
+    free(type->param_definitions);
+  }
   if (type->array_size_expr) {
     free_ast(type->array_size_expr);
-  }
-  if (type->base_type.value) {
-    free(type->base_type.value);
   }
   free(type);
 }

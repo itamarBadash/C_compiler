@@ -13,6 +13,7 @@ typedef enum ast_node_type {
   AST_NODE_TYPE_IF,
   AST_NODE_TYPE_WHILE,
   AST_NODE_TYPE_BLOCK,
+  AST_NODE_TYPE_DECL_GROUP,
   AST_NODE_TYPE_FOR,
   AST_NODE_TYPE_FUNCTION_CALL,
   AST_NODE_TYPE_FUNCTION_DEF,
@@ -34,8 +35,7 @@ typedef enum ast_node_type {
   AST_NODE_TYPE_INIT_LIST,
   AST_NODE_TYPE_GOTO,
   AST_NODE_TYPE_LABEL,
-  AST_NODE_TYPE_COMPOUND_LITERAL,
-  AST_NODE_TYPE_DESIGNATOR
+  AST_NODE_TYPE_COMPOUND_LITERAL
 } ast_node_type;
 
 typedef enum type_kind {
@@ -45,34 +45,76 @@ typedef enum type_kind {
   TYPE_FUNCTION,
   TYPE_UNKNOWN,
   TYPE_STRUCT,
+  TYPE_UNION,
   TYPE_ENUM,
   TYPE_TYPEDEF
 } type_kind;
 
+typedef enum prim_kind {
+  PRIM_NONE,
+  PRIM_VOID,
+  PRIM_BOOL,
+  PRIM_CHAR,
+  PRIM_SCHAR,
+  PRIM_UCHAR,
+  PRIM_SHORT,
+  PRIM_USHORT,
+  PRIM_INT,
+  PRIM_UINT,
+  PRIM_LONG,
+  PRIM_ULONG,
+  PRIM_LLONG,
+  PRIM_ULLONG,
+  PRIM_FLOAT,
+  PRIM_DOUBLE,
+  PRIM_LDOUBLE
+} prim_kind;
+
+struct symbol;
+
 typedef struct type_info {
   type_kind kind;
+  prim_kind prim;
   int is_const;
   int is_volatile;
   int is_restrict;
-  int is_long_long;                 // For long long
   int is_complex;                   // For _Complex
   int is_imaginary;                 // For _Imaginary
-  int is_inline;                    // For inline
-  token_type storage_class;         // TOKEN_STATIC, TOKEN_EXTERN, TOKEN_REGISTER, etc. (0 if none)
-  token base_type;                  // For primitive types (e.g. TOKEN_INT)
   char *tag_name;                   // For structs, enums, and typedefs
   struct type_info *ptr_to;         // For pointers and arrays
-  int array_size;                   // For arrays (-1 if unspecified)
+  long long array_size;             // For arrays (-1 if unspecified)
   struct ast_node *array_size_expr; // For Variable Length Arrays (VLAs)
-  struct type_info **param_types;   // For functions
+  int is_vla;
+  int array_static;
+  int array_star;
+  struct type_info **param_types; // For functions
   char **param_names;
+  struct ast_node **param_definitions;
+  int has_prototype;
   int param_count; // For functions
   int is_variadic; // For functions (e.g. printf)
+  struct ast_node *definition;
+  struct symbol *symbol;
 } type_info;
+
+typedef struct decl_specs {
+  token_type storage_class;
+  int is_inline;
+} decl_specs;
+
+typedef struct source_loc {
+  int line;
+  int column;
+  const char *file;
+} source_loc;
 
 typedef struct ast_node {
   ast_node_type type;
   token tok;
+  source_loc loc;
+  struct symbol *symbol;
+  struct type_info *expr_type;
+  int is_lvalue;
   union {
     struct {
       char *bytes;
@@ -83,6 +125,8 @@ typedef struct ast_node {
     struct {
       struct ast_node **declarations;
       int count;
+      struct type_info **derived_types;
+      int derived_count;
     } program;
 
     struct {
@@ -146,16 +190,19 @@ typedef struct ast_node {
       char *var_name;
       struct ast_node *init_value;
       struct ast_node *bitfield_width;
-      int is_typedef;
+      decl_specs specs;
+      long long offset;
+      int bit_offset;
+      int bit_width;
     } var_decl;
 
     struct {
       char *name;
-      struct type_info *return_type;
-      char **parameters;
-      struct type_info **param_types;
-      int param_count;
+      struct type_info *type;
+      struct symbol **param_symbols;
       struct ast_node *body;
+      decl_specs specs;
+      struct type_info *name_type;
     } function_def;
 
     struct {
@@ -167,6 +214,7 @@ typedef struct ast_node {
       struct ast_node *left;
       char *member_name;
       int is_pointer; // 1 for ->, 0 for .
+      struct ast_node *member;
     } member_access;
 
     struct {
@@ -193,6 +241,7 @@ typedef struct ast_node {
       struct ast_node **members;
       int member_count;
       int is_forward;
+      int is_union;
     } struct_def;
 
     struct {
@@ -205,6 +254,7 @@ typedef struct ast_node {
     struct {
       struct type_info *type;
       struct ast_node *operand;
+      struct ast_node *definition;
     } cast_expr;
 
     struct {
@@ -214,17 +264,14 @@ typedef struct ast_node {
         struct ast_node *value; // The actual value
       } *items;
       int count;
+      int is_designation;
     } init_list;
 
     struct {
       struct type_info *type;
       struct ast_node *init_list;
+      struct ast_node *definition;
     } compound_literal;
-
-    struct {
-      char *member_name;
-      struct ast_node *index;
-    } designator;
 
     struct {
       char *label_name;

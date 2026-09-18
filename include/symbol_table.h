@@ -23,7 +23,20 @@ typedef struct symbol {
   linkage_kind linkage;
   int is_tentative;
   int is_defined;
+  type_kind tag_kind;
+  prim_kind enum_type;
+  ast_node *definition;
+  int has_value;
+  long long value;
+  long long size;
+  int alignment;
+  int has_flexible_member;
+  int is_register;
+  int has_static_storage;
+  int external_declaration;
+  source_loc loc;
   struct symbol *next;
+  struct symbol *all_next;
 } symbol;
 
 typedef struct scope {
@@ -36,6 +49,7 @@ typedef struct scope {
 
 typedef struct symbol_table {
   scope *current_scope;
+  symbol *all_symbols;
 } symbol_table;
 
 symbol_table *symbol_table_create(void);
@@ -44,14 +58,16 @@ void symbol_table_destroy(symbol_table *table);
 void symbol_table_enter_scope(symbol_table *table, scope_kind kind);
 void symbol_table_leave_scope(symbol_table *table);
 
-int symbol_table_insert_ordinary(symbol_table *table, const char *name, symbol_kind kind,
-                                 type_info *type, linkage_kind linkage, int is_tentative,
-                                 int is_defined);
-int symbol_table_insert_tag(symbol_table *table, const char *name, type_info *type);
-int symbol_table_insert_label(symbol_table *table, const char *name);
+symbol *symbol_table_insert_ordinary(symbol_table *table, const char *name, symbol_kind kind,
+                                     type_info *type, source_loc loc);
+symbol *symbol_table_insert_tag(symbol_table *table, const char *name, type_info *type,
+                                source_loc loc);
+symbol *symbol_table_insert_label(symbol_table *table, const char *name, source_loc loc);
 
 symbol *symbol_table_lookup_ordinary(symbol_table *table, const char *name);
+symbol *symbol_table_lookup_ordinary_current(symbol_table *table, const char *name);
 symbol *symbol_table_lookup_tag(symbol_table *table, const char *name);
+symbol *symbol_table_lookup_tag_current(symbol_table *table, const char *name);
 symbol *symbol_table_lookup_label(symbol_table *table, const char *name);
 
 #endif

@@ -45,6 +45,7 @@ typedef enum token_type {
   TOKEN_VOLATILE,
   TOKEN_RESTRICT,
   TOKEN_REGISTER,
+  TOKEN_AUTO,
   TOKEN_INLINE,
   TOKEN_COMPLEX,
   TOKEN_IMAGINARY,
@@ -130,5 +131,6 @@ typedef struct token {
   int line;
   int column;
   int at_line_start;
+  const char *file;
 } token;
 #endif //_TOKEN_H_

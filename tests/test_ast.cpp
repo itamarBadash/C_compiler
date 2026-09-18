@@ -1,5 +1,6 @@
 #include <cstring>
 #include <gtest/gtest.h>
+#include <map>
 
 extern "C" {
 #include "ast.h"
@@ -7,14 +8,32 @@ extern "C" {
 #include <stdlib.h>
 }
 
+std::map<void *, int> *tracked_frees = nullptr;
+
 extern "C" {
 int ast_free_calls = 0;
 void __real_free(void *p);
 void __wrap_free(void *p) {
   ast_free_calls++;
+  if (tracked_frees != nullptr && p != nullptr) {
+    auto it = tracked_frees->find(p);
+    if (it != tracked_frees->end()) {
+      it->second++;
+      return;
+    }
+  }
   __real_free(p);
 }
 }
+
+struct TrackFrees {
+  explicit TrackFrees(std::map<void *, int> &frees) {
+    tracked_frees = &frees;
+  }
+  ~TrackFrees() {
+    tracked_frees = nullptr;
+  }
+};
 
 TEST(AstTests, CreateNodeSetsTheTypeAndZeroesEverythingElse) {
   ast_node *n = create_ast_node(AST_NODE_TYPE_NUMBER);
@@ -24,6 +43,7 @@ TEST(AstTests, CreateNodeSetsTheTypeAndZeroesEverythingElse) {
   EXPECT_EQ(n->literal.bytes, nullptr);
   EXPECT_EQ(n->literal.length, 0);
   EXPECT_EQ(n->literal.is_wide, 0);
+  EXPECT_EQ(n->symbol, nullptr);
   free_ast(n);
 }
 
@@ -44,6 +64,9 @@ TEST(AstTests, CreateTypeInfoDefaultsArraySizeToUnspecified) {
   EXPECT_EQ(t->array_size, -1);
   EXPECT_EQ(t->ptr_to, nullptr);
   EXPECT_EQ(t->param_count, 0);
+  EXPECT_EQ(t->definition, nullptr);
+  EXPECT_EQ(t->symbol, nullptr);
+  EXPECT_EQ(t->is_vla, 0);
   free_type_info(t);
 }
 
@@ -121,6 +144,62 @@ TEST(AstTests, FreeTypeInfoReleasesAVlaSizeExpression) {
   EXPECT_EQ(ast_free_calls, 3) << "the identifier spelling, its node, and the type";
 }
 
+TEST(AstTests, FreeAstReleasesADeclarationGroupLikeABlock) {
+  ast_node *group = create_ast_node(AST_NODE_TYPE_DECL_GROUP);
+  group->block.count = 2;
+  group->block.statements = (ast_node **)malloc(sizeof(ast_node *) * 2);
+  group->block.statements[0] = create_ast_node(AST_NODE_TYPE_EMPTY);
+  group->block.statements[1] = create_ast_node(AST_NODE_TYPE_EMPTY);
+
+  ast_free_calls = 0;
+  free_ast(group);
+  EXPECT_EQ(ast_free_calls, 4) << "two children, the statement array, and the group";
+}
+
+TEST(AstTests, FreeAstReleasesTheParameterSymbolArrayButNotTheSymbols) {
+  int first = 0;
+  int second = 0;
+  ast_node *fn = create_ast_node(AST_NODE_TYPE_FUNCTION_DEF);
+  fn->function_def.param_symbols = (struct symbol **)malloc(sizeof(struct symbol *) * 2);
+  fn->function_def.param_symbols[0] = (struct symbol *)&first;
+  fn->function_def.param_symbols[1] = (struct symbol *)&second;
+  void *array = fn->function_def.param_symbols;
+
+  std::map<void *, int> frees;
+  frees[array] = 0;
+  frees[&first] = 0;
+  frees[&second] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(fn);
+  }
+
+  EXPECT_EQ(frees[array], 1);
+  EXPECT_EQ(frees[&first], 0) << "the symbol table owns the symbols";
+  EXPECT_EQ(frees[&second], 0);
+}
+
+TEST(AstTests, FreeAstReleasesAFunctionDefinitionsTypeOnce) {
+  ast_node *fn = create_ast_node(AST_NODE_TYPE_FUNCTION_DEF);
+  fn->function_def.name = strdup("f");
+  fn->function_def.type = create_type_info(TYPE_FUNCTION);
+  fn->function_def.type->ptr_to = create_type_info(TYPE_PRIMITIVE);
+  fn->function_def.body = create_ast_node(AST_NODE_TYPE_BLOCK);
+  void *type = fn->function_def.type;
+  void *return_type = fn->function_def.type->ptr_to;
+
+  std::map<void *, int> frees;
+  frees[type] = 0;
+  frees[return_type] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(fn);
+  }
+
+  EXPECT_EQ(frees[type], 1);
+  EXPECT_EQ(frees[return_type], 1);
+}
+
 TEST(AstTests, AParsedProgramFreesCompletely) {
   const char *source = "struct S { int x; };\n"
                        "int f(int a, int b) {\n"
@@ -141,4 +220,196 @@ TEST(AstTests, AParsedProgramFreesCompletely) {
   free_ast(program);
   parser_destroy(&p);
   SUCCEED();
+}
+
+static const char *ownership_source = "typedef int word;\n"
+                                      "word add(word a, word b) { return a + b; }\n"
+                                      "int main(void) { word x = add(1, 2); return x; }\n";
+
+static std::map<void *, int> buffer_allocations(const token_buf *tb) {
+  std::map<void *, int> out;
+  out[tb->tokens] = 0;
+  for (int i = 0; i < tb->count; i++) {
+    if (tb->tokens[i].value != nullptr) {
+      out[tb->tokens[i].value] = 0;
+    }
+  }
+  return out;
+}
+
+static int not_freed_exactly_once(const std::map<void *, int> &frees) {
+  int bad = 0;
+  for (const auto &entry : frees) {
+    if (entry.second != 1) {
+      bad++;
+    }
+  }
+  return bad;
+}
+
+TEST(AstTests, ParsingFreesEveryBufferedAllocationExactlyOnce) {
+  lexer lex;
+  lexer_init(&lex, ownership_source);
+  parser p;
+  parser_init(&p, &lex);
+  std::map<void *, int> frees = buffer_allocations(&p.tokens);
+  ASSERT_GT(frees.size(), 10u);
+
+  {
+    TrackFrees track(frees);
+    ast_node *program = parse_program(&p);
+    EXPECT_EQ(p.had_error, 0);
+    free_ast(program);
+    parser_destroy(&p);
+  }
+
+  EXPECT_EQ(not_freed_exactly_once(frees), 0);
+}
+
+TEST(AstTests, DestroyingAParserBeforeParsingFreesEveryBufferedAllocationExactlyOnce) {
+  lexer lex;
+  lexer_init(&lex, ownership_source);
+  parser p;
+  parser_init(&p, &lex);
+  ASSERT_NE(p.current_token.value, nullptr);
+  std::map<void *, int> frees = buffer_allocations(&p.tokens);
+
+  {
+    TrackFrees track(frees);
+    parser_destroy(&p);
+  }
+
+  EXPECT_EQ(not_freed_exactly_once(frees), 0);
+}
+
+TEST(AstTests, AHandedOverBufferHasEveryAllocationFreedExactlyOnce) {
+  token_buf tb;
+  token_buf_init(&tb);
+  lexer lex;
+  lexer_init(&lex, ownership_source);
+  token t;
+  do {
+    t = lexer_next_token(&lex);
+    token_buf_push(&tb, t);
+  } while (t.type != TOKEN_EOF);
+  std::map<void *, int> frees = buffer_allocations(&tb);
+
+  {
+    TrackFrees track(frees);
+    parser p;
+    parser_init_from_buf(&p, &tb);
+    ast_node *program = parse_program(&p);
+    EXPECT_EQ(p.had_error, 0);
+    free_ast(program);
+    parser_destroy(&p);
+    token_buf_free(&tb);
+  }
+
+  EXPECT_EQ(not_freed_exactly_once(frees), 0);
+}
+
+TEST(AstTests, IdentifiersInTheTreeAreCopiesNotAliasesOfBufferedTokens) {
+  lexer lex;
+  lexer_init(&lex, "int f(int a) { return a; }\n");
+  parser p;
+  parser_init(&p, &lex);
+  std::map<void *, int> buffered = buffer_allocations(&p.tokens);
+  TrackFrees track(buffered);
+
+  ast_node *program = parse_program(&p);
+  ASSERT_NE(program, nullptr);
+  ASSERT_EQ(program->program.count, 1);
+  ast_node *body = program->program.declarations[0]->function_def.body;
+  ASSERT_NE(body, nullptr);
+  ASSERT_EQ(body->type, AST_NODE_TYPE_BLOCK);
+  ASSERT_EQ(body->block.count, 1);
+  ast_node *ret = body->block.statements[0];
+  ASSERT_EQ(ret->type, AST_NODE_TYPE_RETURN);
+  ast_node *id = ret->return_stmt.return_value;
+  ASSERT_NE(id, nullptr);
+  ASSERT_EQ(id->type, AST_NODE_TYPE_IDENTIFIER);
+
+  EXPECT_EQ(buffered.count(id->tok.value), 0u);
+
+  parser_destroy(&p);
+  EXPECT_STREQ(id->tok.value, "a");
+  free_ast(program);
+}
+
+TEST(AstTests, FreeReleasesTheDefinitionsATypeNameOrParameterListOwns) {
+  ast_node *cast = create_ast_node(AST_NODE_TYPE_CAST);
+  cast->cast_expr.type = create_type_info(TYPE_PRIMITIVE);
+  cast->cast_expr.definition = create_ast_node(AST_NODE_TYPE_EMPTY);
+  ast_node *literal = create_ast_node(AST_NODE_TYPE_COMPOUND_LITERAL);
+  literal->compound_literal.type = create_type_info(TYPE_PRIMITIVE);
+  literal->compound_literal.definition = create_ast_node(AST_NODE_TYPE_EMPTY);
+  type_info *fn = create_type_info(TYPE_FUNCTION);
+  fn->param_count = 2;
+  fn->param_types = (type_info **)calloc(2, sizeof(type_info *));
+  fn->param_names = (char **)calloc(2, sizeof(char *));
+  fn->param_definitions = (ast_node **)calloc(2, sizeof(ast_node *));
+  fn->param_definitions[1] = create_ast_node(AST_NODE_TYPE_EMPTY);
+
+  std::map<void *, int> frees;
+  frees[cast->cast_expr.definition] = 0;
+  frees[literal->compound_literal.definition] = 0;
+  frees[fn->param_definitions] = 0;
+  frees[fn->param_definitions[1]] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(cast);
+    free_ast(literal);
+    free_type_info(fn);
+  }
+  for (const auto &entry : frees)
+    EXPECT_EQ(entry.second, 1);
+}
+
+TEST(AstTests, FreeAstReleasesEachDerivedTypeButNothingItPointsTo) {
+  ast_node *program = create_ast_node(AST_NODE_TYPE_PROGRAM);
+  type_info *borrowed = create_type_info(TYPE_PRIMITIVE);
+  type_info *pointer = (type_info *)calloc(1, sizeof(type_info));
+  type_info *array = (type_info *)calloc(1, sizeof(type_info));
+  pointer->kind = TYPE_POINTER;
+  pointer->ptr_to = borrowed;
+  array->kind = TYPE_ARRAY;
+  array->ptr_to = borrowed;
+  program->program.derived_types = (type_info **)malloc(2 * sizeof(type_info *));
+  program->program.derived_types[0] = pointer;
+  program->program.derived_types[1] = array;
+  program->program.derived_count = 2;
+  void *list = program->program.derived_types;
+
+  std::map<void *, int> frees;
+  frees[pointer] = 0;
+  frees[array] = 0;
+  frees[list] = 0;
+  frees[borrowed] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(program);
+  }
+  EXPECT_EQ(frees[pointer], 1);
+  EXPECT_EQ(frees[array], 1);
+  EXPECT_EQ(frees[list], 1);
+  EXPECT_EQ(frees[borrowed], 0) << "a derived type borrows what it points to";
+  free_type_info(borrowed);
+}
+
+TEST(AstTests, FreeAstReleasesTheFunctionNameType) {
+  ast_node *fn = create_ast_node(AST_NODE_TYPE_FUNCTION_DEF);
+  fn->function_def.name_type = create_type_info(TYPE_ARRAY);
+  fn->function_def.name_type->ptr_to = create_type_info(TYPE_PRIMITIVE);
+  void *array = fn->function_def.name_type;
+  void *element = fn->function_def.name_type->ptr_to;
+
+  std::map<void *, int> frees;
+  frees[array] = 0;
+  frees[element] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(fn);
+  }
+  EXPECT_EQ(frees[array], 1);
+  EXPECT_EQ(frees[element], 1);
 }
