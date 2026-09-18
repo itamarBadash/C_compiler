@@ -23,6 +23,8 @@ add_executable(C_compiler ${SOURCES}
         src/token_buf.c
         include/preprocessor.h
         src/preprocessor.c
+        include/sema.h
+        src/sema.c
 )
 
 # ==========================================
@@ -40,7 +42,7 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE) # מונע התנגשויות
 FetchContent_MakeAvailable(googletest)
 
 # 2. יצירת קובץ ההרצה של הטסטים (כאן ורק כאן נמצא קובץ ה-cpp)
-add_executable(LexerTests tests/test_lexer.cpp src/lexer.c src/lex_keywords.c)
+add_executable(LexerTests tests/test_lexer.cpp src/lexer.c)
 
 # 3. חיבור ספריית GoogleTest לקובץ ההרצה שלנו
 target_link_libraries(LexerTests gtest_main)
@@ -52,7 +54,8 @@ gtest_discover_tests(LexerTests)
 # ==========================================
 # 5. טסטים עבור ה-Parser
 # ==========================================
-add_executable(ParserTests tests/test_parser.cpp src/lexer.c src/lex_keywords.c src/parser.c src/ast.c)
+add_executable(ParserTests tests/test_parser.cpp src/lexer.c src/parser.c src/ast.c
+        src/token_buf.c src/preprocessor.c)
 target_link_libraries(ParserTests gtest_main)
 gtest_discover_tests(ParserTests)
 
@@ -61,16 +64,23 @@ gtest_discover_tests(ParserTests)
 # ==========================================
 add_executable(SymbolTableTests tests/test_symbol_table.cpp src/symbol_table.c src/ast.c)
 target_link_libraries(SymbolTableTests gtest_main)
+target_link_options(SymbolTableTests PRIVATE -Wl,--wrap=free)
 gtest_discover_tests(SymbolTableTests)
 
-add_executable(AstTests tests/test_ast.cpp src/ast.c src/parser.c src/lexer.c src/lex_keywords.c)
+add_executable(AstTests tests/test_ast.cpp src/ast.c src/parser.c src/lexer.c
+        src/token_buf.c)
 target_link_libraries(AstTests gtest_main)
 target_link_options(AstTests PRIVATE -Wl,--wrap=free)
 gtest_discover_tests(AstTests)
 
-add_executable(PreprocessorTests tests/test_preprocessor.cpp src/token_buf.c src/lexer.c src/lex_keywords.c
+add_executable(PreprocessorTests tests/test_preprocessor.cpp src/token_buf.c src/lexer.c
         include/preprocessor.h
         src/preprocessor.c)
 target_link_libraries(PreprocessorTests gtest_main)
 target_link_options(PreprocessorTests PRIVATE -Wl,--wrap=free,--wrap=realloc)
 gtest_discover_tests(PreprocessorTests)
+
+add_executable(SemaTests tests/test_sema.cpp src/sema.c src/symbol_table.c src/parser.c src/lexer.c
+        src/ast.c src/token_buf.c)
+target_link_libraries(SemaTests gtest_main)
+gtest_discover_tests(SemaTests)

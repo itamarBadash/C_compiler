@@ -55,8 +55,6 @@ typedef struct source_file {
   lexer lex;
   char *spliced;
   char *filename;
-  char *presumed_name;
-  int line_offset;
   token pending;
   int has_pending;
   struct source_file *next;
@@ -92,7 +90,6 @@ static void free_token(token t);
 static void free_tokens(token *toks, int n);
 static void append_token(token **list, int *count, token t);
 
-static int pp_current_line(pp *p, int physical_line);
 static const char *pp_current_file(pp *p);
 static void pp_error(pp *p, int line, int column, const char *message);
 
@@ -165,9 +162,10 @@ static int try_pragma_operator(pp *p, token t);
 static int try_expand(pp *p, token t);
 
 static void skip_directive_line(pp *p);
+static void end_directive(pp *p, const char *extra_message);
 static void abort_define(pp *p, token t, char **params, int param_count, token name);
-static void do_define(pp *p);
-static void do_undef(pp *p);
+static void do_define(pp *p, int line, int column);
+static void do_undef(pp *p, int line, int column);
 static void do_ifdef(pp *p, int line, int column, int negate);
 static void do_if(pp *p, int line, int column);
 static void do_elif(pp *p, int line, int column);
@@ -179,6 +177,10 @@ static char *read_header_name(pp *p, int *is_system, int line, int column);
 static char *resolve_include(pp *p, const char *name, int is_system);
 static void do_include(pp *p, int line, int column);
 static void handle_directive(pp *p);
+
+static int is_name(token t) {
+  return t.type == TOKEN_IDENTIFIER || token_is_keyword(t.type);
+}
 
 static token clone_token(token t) {
   token new_t = t;
@@ -217,32 +219,40 @@ static void append_token(token **list, int *count, token t) {
   (*count)++;
 }
 
-static int pp_current_line(pp *p, int physical_line) {
-  if (p == NULL || p->sources == NULL) {
-    return physical_line;
+static const char *intern_file_name(const char *name) {
+  static struct interned_name {
+    char *name;
+    struct interned_name *next;
+  } *names = NULL;
+  for (struct interned_name *it = names; it != NULL; it = it->next) {
+    if (strcmp(it->name, name) == 0)
+      return it->name;
   }
-  return physical_line + p->sources->line_offset;
+  struct interned_name *entry = malloc(sizeof(*entry));
+  char *copy = strdup(name);
+  if (entry == NULL || copy == NULL) {
+    free(entry);
+    free(copy);
+    return NULL;
+  }
+  entry->name = copy;
+  entry->next = names;
+  names = entry;
+  return copy;
 }
 
 static const char *pp_current_file(pp *p) {
-  if (p == NULL || p->sources == NULL) {
+  if (p == NULL || p->sources == NULL || p->sources->lex.file == NULL) {
     return "<source>";
   }
-  if (p->sources->presumed_name != NULL) {
-    return p->sources->presumed_name;
-  }
-  if (p->sources->filename != NULL) {
-    return p->sources->filename;
-  }
-  return "<source>";
+  return p->sources->lex.file;
 }
 
 static void pp_error(pp *p, int line, int column, const char *message) {
   if (p == NULL)
     return;
   p->error_count++;
-  fprintf(stderr, "%s:%d:%d: error: %s\n", pp_current_file(p), pp_current_line(p, line), column,
-          message);
+  fprintf(stderr, "%s:%d:%d: error: %s\n", pp_current_file(p), line, column, message);
 }
 
 static void free_params(char **params, int count) {
@@ -343,6 +353,7 @@ static int source_push(pp *p, const char *text, const char *filename) {
   sf->has_pending = 0;
   sf->next = p->sources;
   lexer_init(&sf->lex, sf->spliced);
+  sf->lex.file = filename ? intern_file_name(filename) : NULL;
   p->sources = sf;
   return 1;
 }
@@ -355,9 +366,9 @@ static void source_pop(pp *p) {
   if (sf->has_pending) {
     free_token(sf->pending);
   }
+  p->error_count += sf->lex.error_count;
   free(sf->spliced);
   free(sf->filename);
-  free(sf->presumed_name);
   free(sf);
 }
 
@@ -403,7 +414,7 @@ static void pop_exhausted(pp *p) {
 
 static token pp_next(pp *p) {
   if (p == NULL || p->sources == NULL) {
-    token t = {TOKEN_EOF, NULL, 1, 1, 0};
+    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL};
     return t;
   }
   if (p->sources->has_pending) {
@@ -413,7 +424,7 @@ static token pp_next(pp *p) {
   pop_exhausted(p);
   if (p->stack != NULL) {
     if (p->stack->pos >= p->stack->count) {
-      token t = {TOKEN_EOF, NULL, 1, 1, 0};
+      token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL};
       return t;
     }
     return clone_token(p->stack->tokens[p->stack->pos++]);
@@ -640,9 +651,13 @@ static void ev_convert(ev_value *a, ev_value *b) {
 
 static int ev_number(eval *e, const token *t, ev_value *out) {
   const char *s = t->value ? t->value : "";
-  int hex = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'));
-  if (strchr(s, '.') != NULL || (hex && (strchr(s, 'p') != NULL || strchr(s, 'P') != NULL)) ||
-      (!hex && (strchr(s, 'e') != NULL || strchr(s, 'E') != NULL))) {
+  const char *error;
+  number_kind kind = classify_number(s, &error);
+  if (kind == NUMBER_INVALID) {
+    ev_error(e, error);
+    return 0;
+  }
+  if (kind == NUMBER_FLOATING) {
     ev_error(e, "floating point numbers are not supported in preprocessor expressions");
     return 0;
   }
@@ -655,18 +670,9 @@ static int ev_number(eval *e, const token *t, ev_value *out) {
     return 0;
   }
 
-  int has_unsigned_suffix = 0;
-  while (*end != '\0') {
-    if (*end == 'u' || *end == 'U') {
-      has_unsigned_suffix = 1;
-      end++;
-    } else if (*end == 'l' || *end == 'L') {
-      end++;
-    } else {
-      ev_error(e, "invalid integer constant in #if");
-      return 0;
-    }
-  }
+  int has_unsigned_suffix;
+  int long_count;
+  integer_suffix(end, &has_unsigned_suffix, &long_count);
 
   out->value = (long long)raw;
   out->is_unsigned = has_unsigned_suffix || raw > (unsigned long long)LLONG_MAX;
@@ -675,86 +681,18 @@ static int ev_number(eval *e, const token *t, ev_value *out) {
 
 static int ev_char_value(eval *e, const token *t, int wide, long long *out) {
   const char *s = t->value ? t->value : "";
-  if (s[0] == '\0') {
-    ev_error(e, "empty character constant in #if");
+  char *bytes = malloc(2 * strlen(s) + 2);
+  if (bytes == NULL) {
+    ev_error(e, "out of memory in #if");
     return 0;
   }
-
-  if (s[0] != '\\') {
-    *out = wide ? (long long)(unsigned char)s[0] : (long long)(signed char)s[0];
-    return 1;
-  }
-
-  long long simple = -1;
-  switch (s[1]) {
-  case 'n':
-    simple = '\n';
-    break;
-  case 't':
-    simple = '\t';
-    break;
-  case 'r':
-    simple = '\r';
-    break;
-  case 'a':
-    simple = '\a';
-    break;
-  case 'b':
-    simple = '\b';
-    break;
-  case 'f':
-    simple = '\f';
-    break;
-  case 'v':
-    simple = '\v';
-    break;
-  case '\\':
-    simple = '\\';
-    break;
-  case '\'':
-    simple = '\'';
-    break;
-  case '"':
-    simple = '"';
-    break;
-  case '?':
-    simple = '?';
-    break;
-  default:
-    break;
-  }
-  if (simple >= 0) {
-    *out = simple;
-    return 1;
-  }
-
-  if (s[1] >= '0' && s[1] <= '7') {
-    int value = 0;
-    int digits = 0;
-    for (int i = 1; digits < 3 && s[i] >= '0' && s[i] <= '7'; i++, digits++) {
-      value = value * 8 + (s[i] - '0');
-    }
-    *out = wide ? (long long)value : (long long)(signed char)value;
-    return 1;
-  }
-
-  if (s[1] == 'x') {
-    int value = 0;
-    int digits = 0;
-    for (int i = 2; isxdigit((unsigned char)s[i]); i++, digits++) {
-      int d = isdigit((unsigned char)s[i]) ? s[i] - '0' : tolower((unsigned char)s[i]) - 'a' + 10;
-      value = value * 16 + d;
-    }
-    if (digits == 0) {
-      ev_error(e, "\\x used with no following hex digits in #if");
-      return 0;
-    }
-    *out = wide ? (long long)value : (long long)(signed char)value;
-    return 1;
-  }
-
-  ev_error(e, "unknown escape sequence in #if character constant");
-  return 0;
+  int units = 0;
+  const char *error = decode_literal(s, wide, bytes, &units);
+  if (error != NULL)
+    ev_error(e, error);
+  *out = char_constant_value(bytes, units, wide);
+  free(bytes);
+  return error == NULL;
 }
 
 static ev_value ev_primary(eval *e, int live) {
@@ -1050,12 +988,11 @@ static void resolve_defined(pp *p, token *toks, int count, token **out, int *out
     int consumed = 0;
 
     if (i + 1 < count && toks[i + 1].type == TOKEN_LPAREN) {
-      if (i + 3 < count && toks[i + 2].type == TOKEN_IDENTIFIER &&
-          toks[i + 3].type == TOKEN_RPAREN) {
+      if (i + 3 < count && is_name(toks[i + 2]) && toks[i + 3].type == TOKEN_RPAREN) {
         name_index = i + 2;
         consumed = 4;
       }
-    } else if (i + 1 < count && toks[i + 1].type == TOKEN_IDENTIFIER) {
+    } else if (i + 1 < count && is_name(toks[i + 1])) {
       name_index = i + 1;
       consumed = 2;
     }
@@ -1072,6 +1009,7 @@ static void resolve_defined(pp *p, token *toks, int count, token **out, int *out
     n.line = toks[i].line;
     n.column = toks[i].column;
     n.at_line_start = 0;
+    n.file = toks[i].file;
     append_token(out, out_count, n);
     i += consumed;
   }
@@ -1161,6 +1099,7 @@ static token stringize(token *toks, int n) {
   out.line = (n > 0) ? toks[0].line : 0;
   out.column = (n > 0) ? toks[0].column : 0;
   out.at_line_start = 0;
+  out.file = (n > 0) ? toks[0].file : NULL;
 
   size_t cap = 32;
   size_t len = 0;
@@ -1240,6 +1179,7 @@ static int paste_tokens(token lhs, token rhs, token *out) {
     first.line = lhs.line;
     first.column = lhs.column;
     first.at_line_start = lhs.at_line_start;
+    first.file = lhs.file;
     *out = first;
     free_token(second);
     free(a);
@@ -1418,7 +1358,7 @@ static void substitute(pp *p, macro *m, arg *args, int arg_count) {
     token bt = m->body[i];
 
     if (m->is_function_like && bt.type == TOKEN_HASH && i + 1 < m->body_count &&
-        m->body[i + 1].type == TOKEN_IDENTIFIER) {
+        is_name(m->body[i + 1])) {
       int pidx = param_index(m, m->body[i + 1].value);
       if (pidx >= 0 && pidx < arg_count) {
         append_token(&out, &out_count, stringize(args[pidx].raw, args[pidx].raw_count));
@@ -1428,7 +1368,7 @@ static void substitute(pp *p, macro *m, arg *args, int arg_count) {
     }
 
     int idx = -1;
-    if (bt.type == TOKEN_IDENTIFIER) {
+    if (is_name(bt)) {
       idx = param_index(m, bt.value);
     }
 
@@ -1502,10 +1442,11 @@ static token make_dynamic_token(pp *p, dynamic_macro kind, token at) {
   out.line = at.line;
   out.column = at.column;
   out.at_line_start = at.at_line_start;
+  out.file = at.file;
 
   if (kind == DYNAMIC_LINE) {
     char buffer[32];
-    snprintf(buffer, sizeof(buffer), "%d", pp_current_line(p, p->invocation_line));
+    snprintf(buffer, sizeof(buffer), "%d", p->invocation_line);
     out.type = TOKEN_NUMBER;
     out.value = strdup(buffer);
     return out;
@@ -1566,7 +1507,7 @@ static int try_pragma_operator(pp *p, token t) {
 }
 
 static int try_expand(pp *p, token t) {
-  if (t.type != TOKEN_IDENTIFIER) {
+  if (!is_name(t)) {
     return 0;
   }
 
@@ -1634,6 +1575,14 @@ static void skip_directive_line(pp *p) {
   }
 }
 
+static void end_directive(pp *p, const char *extra_message) {
+  token t = pp_next(p);
+  if (t.type != TOKEN_EOF && !t.at_line_start)
+    pp_error(p, t.line, t.column, extra_message);
+  pp_unget(p, t);
+  skip_directive_line(p);
+}
+
 static void abort_define(pp *p, token t, char **params, int param_count, token name) {
   if (t.type == TOKEN_EOF || t.at_line_start) {
     pp_unget(p, t);
@@ -1645,14 +1594,62 @@ static void abort_define(pp *p, token t, char **params, int param_count, token n
   free_token(name);
 }
 
-static void do_define(pp *p) {
+static int param_index_in(char **params, int param_count, const char *name) {
+  for (int i = 0; i < param_count; i++) {
+    if (strcmp(params[i], name) == 0)
+      return i;
+  }
+  return -1;
+}
+
+static const char *replacement_list_problem(char **params, int param_count, int is_function_like,
+                                            token *body, int body_count) {
+  if (body_count > 0 &&
+      (body[0].type == TOKEN_HASH_HASH || body[body_count - 1].type == TOKEN_HASH_HASH))
+    return "'##' cannot appear at either end of a macro replacement list";
+  for (int i = 0; is_function_like && i < body_count; i++) {
+    if (body[i].type == TOKEN_HASH &&
+        (i + 1 == body_count || param_index_in(params, param_count, body[i + 1].value) < 0))
+      return "'#' is not followed by a macro parameter";
+  }
+  return NULL;
+}
+
+static int space_before(const token *list, int i) {
+  const token *previous = &list[i - 1];
+  return list[i].line != previous->line ||
+         list[i].column != previous->column + (int)strlen(previous->value ? previous->value : "");
+}
+
+static int same_definition(macro *m, char **params, int param_count, int is_function_like,
+                           token *body, int body_count) {
+  if (m->is_function_like != is_function_like || m->param_count != param_count ||
+      m->body_count != body_count)
+    return 0;
+  for (int i = 0; i < param_count; i++) {
+    if (strcmp(m->params[i], params[i]) != 0)
+      return 0;
+  }
+  for (int i = 0; i < body_count; i++) {
+    const char *a = m->body[i].value ? m->body[i].value : "";
+    const char *b = body[i].value ? body[i].value : "";
+    if (m->body[i].type != body[i].type || strcmp(a, b) != 0)
+      return 0;
+    if (i > 0 && space_before(m->body, i) != space_before(body, i))
+      return 0;
+  }
+  return 1;
+}
+
+static void do_define(pp *p, int line, int column) {
   token name = pp_next(p);
   char **params = NULL;
   int param_count = 0;
   int is_function_like = 0;
   int is_variadic = 0;
 
-  if (name.type != TOKEN_IDENTIFIER || name.at_line_start) {
+  if (!is_name(name) || name.at_line_start) {
+    pp_error(p, line, column, "expected a macro name after #define");
     pp_unget(p, name);
     skip_directive_line(p);
     return;
@@ -1672,11 +1669,16 @@ static void do_define(pp *p) {
     free_token(t);
     is_function_like = 1;
     t = pp_next(p);
-    if (t.type == TOKEN_RPAREN) {
+    if (t.type == TOKEN_RPAREN && !t.at_line_start) {
       free_token(t);
       t = pp_next(p);
     } else {
       while (1) {
+        if (t.at_line_start) {
+          pp_error(p, name.line, name.column, "missing ')' in macro parameter list");
+          abort_define(p, t, params, param_count, name);
+          return;
+        }
         if (t.type == TOKEN_ELLIPSIS) {
           char **tmp = realloc(params, sizeof(char *) * (param_count + 1));
           if (tmp == NULL) {
@@ -1688,7 +1690,7 @@ static void do_define(pp *p) {
           is_variadic = 1;
           free_token(t);
           t = pp_next(p);
-          if (t.type != TOKEN_RPAREN) {
+          if (t.type != TOKEN_RPAREN || t.at_line_start) {
             pp_error(p, t.line, t.column, "... must be the last macro parameter");
             abort_define(p, t, params, param_count, name);
             return;
@@ -1697,9 +1699,14 @@ static void do_define(pp *p) {
           t = pp_next(p);
           break;
         }
-        if (t.type == TOKEN_IDENTIFIER) {
+        if (is_name(t)) {
           if (strcmp(t.value, "__VA_ARGS__") == 0) {
             pp_error(p, t.line, t.column, "__VA_ARGS__ cannot be used as a parameter name");
+            abort_define(p, t, params, param_count, name);
+            return;
+          }
+          if (param_index_in(params, param_count, t.value) >= 0) {
+            pp_error(p, t.line, t.column, "duplicate macro parameter");
             abort_define(p, t, params, param_count, name);
             return;
           }
@@ -1712,25 +1719,32 @@ static void do_define(pp *p) {
           params[param_count++] = strdup(t.value);
           free_token(t);
           t = pp_next(p);
-          if (t.type == TOKEN_COMMA) {
+          if (t.type == TOKEN_COMMA && !t.at_line_start) {
             free_token(t);
             t = pp_next(p);
             continue;
-          } else if (t.type == TOKEN_RPAREN) {
+          } else if (t.type == TOKEN_RPAREN && !t.at_line_start) {
             free_token(t);
             t = pp_next(p);
             break;
           } else {
+            pp_error(p, t.at_line_start ? name.line : t.line,
+                     t.at_line_start ? name.column : t.column,
+                     "expected ',' or ')' in macro parameter list");
             abort_define(p, t, params, param_count, name);
             return;
           }
         } else {
+          pp_error(p, t.line, t.column, "expected a macro parameter name");
           abort_define(p, t, params, param_count, name);
           return;
         }
       }
     }
   }
+
+  if (t.type != TOKEN_EOF && !t.at_line_start && t.column == name.column + (int)strlen(name.value))
+    pp_error(p, t.line, t.column, "an object-like macro needs whitespace after its name");
 
   token *body = NULL;
   int body_count = 0;
@@ -1755,6 +1769,18 @@ static void do_define(pp *p) {
       }
     }
   }
+  const char *operator_problem =
+      replacement_list_problem(params, param_count, is_function_like, body, body_count);
+  if (operator_problem != NULL) {
+    pp_error(p, name.line, name.column, operator_problem);
+    free_params(params, param_count);
+    free_tokens(body, body_count);
+    free_token(name);
+    return;
+  }
+  macro *old = macro_find(p, name.value);
+  if (old != NULL && !same_definition(old, params, param_count, is_function_like, body, body_count))
+    pp_error(p, name.line, name.column, "macro redefined with a different definition");
   macro_remove(p, name.value);
 
   macro *m = calloc(1, sizeof(macro));
@@ -1779,9 +1805,9 @@ static void do_define(pp *p) {
   free_token(name);
 }
 
-static void do_undef(pp *p) {
+static void do_undef(pp *p, int line, int column) {
   token name = pp_next(p);
-  if (name.type == TOKEN_IDENTIFIER && !name.at_line_start) {
+  if (is_name(name) && !name.at_line_start) {
     if (is_reserved_macro_name(name.value)) {
       pp_error(p, name.line, name.column, "this macro name cannot be undefined");
     } else {
@@ -1789,15 +1815,16 @@ static void do_undef(pp *p) {
     }
     free_token(name);
   } else {
+    pp_error(p, line, column, "expected a macro name after #undef");
     pp_unget(p, name);
   }
-  skip_directive_line(p);
+  end_directive(p, "extra tokens after #undef");
 }
 
 static void do_ifdef(pp *p, int line, int column, int negate) {
   token name = pp_next(p);
 
-  if (name.type != TOKEN_IDENTIFIER || name.at_line_start) {
+  if (!is_name(name) || name.at_line_start) {
     pp_error(p, line, column, "expected a macro name after #ifdef");
     pp_unget(p, name);
     cond_push(p, 0, line, column);
@@ -1808,7 +1835,7 @@ static void do_ifdef(pp *p, int line, int column, int negate) {
   int defined = (macro_find(p, name.value) != NULL);
   cond_push(p, negate ? !defined : defined, line, column);
   free_token(name);
-  skip_directive_line(p);
+  end_directive(p, negate ? "extra tokens after #ifndef" : "extra tokens after #ifdef");
 }
 
 static void do_if(pp *p, int line, int column) {
@@ -1870,7 +1897,7 @@ static void do_else(pp *p, int line, int column) {
   if (c->emitting) {
     c->taken = 1;
   }
-  skip_directive_line(p);
+  end_directive(p, "extra tokens after #else");
 }
 
 static void do_endif(pp *p, int line, int column) {
@@ -1880,7 +1907,7 @@ static void do_endif(pp *p, int line, int column) {
     return;
   }
   cond_pop(p);
-  skip_directive_line(p);
+  end_directive(p, "extra tokens after #endif");
 }
 
 static void do_line(pp *p, int line, int column) {
@@ -1932,8 +1959,10 @@ static void do_line(pp *p, int line, int column) {
     if (expanded[1].type != TOKEN_STRING) {
       pp_error(p, line, column, "#line file name must be a string literal");
     } else if (p->sources != NULL) {
-      free(p->sources->presumed_name);
-      p->sources->presumed_name = strdup(expanded[1].value ? expanded[1].value : "");
+      const char *name = intern_file_name(expanded[1].value ? expanded[1].value : "");
+      p->sources->lex.file = name;
+      if (terminator.type != TOKEN_EOF)
+        terminator.file = name;
     }
     if (expanded_count > 2) {
       pp_error(p, line, column, "extra tokens after #line");
@@ -1941,7 +1970,10 @@ static void do_line(pp *p, int line, int column) {
   }
 
   if (p->sources != NULL) {
-    p->sources->line_offset = (int)value - (line + 1);
+    int old_offset = p->sources->lex.line_offset;
+    p->sources->lex.line_offset = (int)value - (line - old_offset + 1);
+    if (terminator.type != TOKEN_EOF)
+      terminator.line += p->sources->lex.line_offset - old_offset;
   }
 
   free_tokens(expanded, expanded_count);
@@ -2148,9 +2180,9 @@ static void handle_directive(pp *p) {
   } else if (strcmp(name, "include") == 0) {
     do_include(p, d.line, d.column);
   } else if (strcmp(name, "define") == 0) {
-    do_define(p);
+    do_define(p, d.line, d.column);
   } else if (strcmp(name, "undef") == 0) {
-    do_undef(p);
+    do_undef(p, d.line, d.column);
   } else if (strcmp(name, "line") == 0) {
     do_line(p, d.line, d.column);
   } else if (strcmp(name, "error") == 0) {
@@ -2165,6 +2197,20 @@ static void handle_directive(pp *p) {
   free_token(d);
 }
 
+static char phase_one_char(const char *s, int *width) {
+  static const char trigraphs[] = "=#([/\\)]'^<{!|>}-~";
+  *width = 1;
+  if (s[0] == '?' && s[1] == '?') {
+    for (const char *t = trigraphs; *t; t += 2) {
+      if (*t == s[2]) {
+        *width = 3;
+        return t[1];
+      }
+    }
+  }
+  return s[0];
+}
+
 char *pp_splice_lines(const char *source) {
   if (source == NULL) {
     return NULL;
@@ -2177,20 +2223,23 @@ char *pp_splice_lines(const char *source) {
   int i = 0, j = 0;
   int pending_newlines = 0;
   while (source[i] != '\0') {
-    if (source[i] == '\\' && source[i + 1] == '\n') {
-      i += 2;
+    int width;
+    char c = phase_one_char(source + i, &width);
+    if (c == '\\' && source[i + width] == '\n') {
+      i += width + 1;
       pending_newlines++;
-    } else if (source[i] == '\\' && source[i + 1] == '\r' && source[i + 2] == '\n') {
-      i += 3;
+    } else if (c == '\\' && source[i + width] == '\r' && source[i + width + 1] == '\n') {
+      i += width + 2;
       pending_newlines++;
-    } else if (source[i] == '\n') {
+    } else if (c == '\n') {
       output[j++] = source[i++];
       while (pending_newlines > 0) {
         output[j++] = '\n';
         pending_newlines--;
       }
     } else {
-      output[j++] = source[i++];
+      output[j++] = c;
+      i += width;
     }
   }
   while (pending_newlines > 0) {
@@ -2249,9 +2298,8 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
     token_buf_push(out, t);
   }
 
-  int errors = p.error_count;
   pp_destroy(&p);
-  return errors;
+  return p.error_count;
 }
 
 int pp_run(token_buf *out, const char *source) {

@@ -2,36 +2,41 @@
 #define _PARSER_H_
 #include "ast.h"
 #include "lexer.h"
+#include "token_buf.h"
 
-typedef enum symbol_kind { SYMBOL_TYPEDEF, SYMBOL_STRUCT_TAG, SYMBOL_ENUM_TAG } symbol_kind;
+typedef enum parser_symbol_kind {
+  PARSER_SYMBOL_TYPEDEF,
+  PARSER_SYMBOL_ORDINARY
+} parser_symbol_kind;
 
-typedef struct symbol {
+typedef struct parser_symbol {
   char *name;
-  symbol_kind kind;
-  struct symbol *next;
-} symbol;
+  parser_symbol_kind kind;
+  struct parser_symbol *next;
+} parser_symbol;
 
-typedef struct scope {
-  symbol *symbols;
-  struct scope *parent;
-} scope;
+typedef struct parser_scope {
+  parser_symbol *symbols;
+  struct parser_scope *parent;
+} parser_scope;
 
 typedef struct parser {
-  lexer *lex;
+  token_buf tokens;
   token current_token;
   token next_token;
-  scope *current_scope;
+  parser_scope *current_scope;
   int had_error;
 } parser;
 
 void parser_init(parser *p, lexer *lex);
+void parser_init_from_buf(parser *p, token_buf *tb);
 void parser_destroy(parser *p);
 void parser_advance(parser *p);
 
 void parser_enter_scope(parser *p);
 void parser_leave_scope(parser *p);
-void parser_define_symbol(parser *p, const char *name, symbol_kind kind);
-symbol *parser_lookup_symbol(parser *p, const char *name);
+void parser_define_symbol(parser *p, const char *name, parser_symbol_kind kind);
+parser_symbol *parser_lookup_symbol(parser *p, const char *name);
 void parser_error(parser *p, const char *message);
 
 ast_node *parse_primary(parser *p);
