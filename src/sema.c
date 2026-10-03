@@ -1,21 +1,38 @@
 #include "sema.h"
 #include "lexer.h"
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct vm_scope {
+  scope *scope;
+  struct vm_scope *outer;
+  struct vm_scope *all_next;
+} vm_scope;
+
+typedef struct jump_record {
+  ast_node *node;
+  vm_scope *vm;
+} jump_record;
+
 typedef struct sema {
   symbol_table *table;
   ast_node *program;
-  ast_node **gotos;
+  jump_record *gotos;
   int goto_count;
+  jump_record *labels;
+  int label_count;
+  vm_scope *vm;
+  vm_scope *vm_nodes;
   int error_count;
   type_info *return_type;
   int loops;
   int breakables;
   struct switch_context *current_switch;
   int inline_definition;
+  int in_sizeof;
 } sema;
 
 static void resolve(sema *s, ast_node *node);
@@ -320,7 +337,29 @@ static constant evaluate_char_constant(ast_node *node) {
   return constant_of(convert_value((unsigned long long)value, type));
 }
 
+static prim_kind floating_constant_type(const char *text) {
+  char suffix = text[strlen(text) - 1];
+  if (suffix == 'f' || suffix == 'F')
+    return PRIM_FLOAT;
+  if (suffix == 'l' || suffix == 'L')
+    return PRIM_LDOUBLE;
+  return PRIM_DOUBLE;
+}
+
+static int floating_constant_overflows(const char *text) {
+  switch (floating_constant_type(text)) {
+  case PRIM_FLOAT:
+    return isinf(strtof(text, NULL));
+  case PRIM_LDOUBLE:
+    return isinf(strtold(text, NULL));
+  default:
+    return isinf(strtod(text, NULL));
+  }
+}
+
 static constant evaluate_floating_cast(ast_node *number, prim_kind target, source_loc loc) {
+  if (floating_constant_overflows(number->tok.value ? number->tok.value : ""))
+    return unknown_constant(target);
   double value = strtod(number->tok.value ? number->tok.value : "", NULL);
   if (target == PRIM_BOOL)
     return constant_of(convert_value(value != 0.0, PRIM_BOOL));
@@ -439,22 +478,6 @@ static int propagate(constant *out, constant a, constant b, prim_kind type) {
     return 1;
   }
   return 0;
-}
-
-static int add_overflows(long long a, long long b) {
-  return (b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b);
-}
-
-static int sub_overflows(long long a, long long b) {
-  return (b < 0 && a > LLONG_MAX + b) || (b > 0 && a < LLONG_MIN + b);
-}
-
-static int mul_overflows(long long a, long long b) {
-  if (a == 0 || b == 0)
-    return 0;
-  if (a > 0)
-    return b > 0 ? a > LLONG_MAX / b : b < LLONG_MIN / a;
-  return b > 0 ? a < LLONG_MIN / b : b < LLONG_MAX / a;
 }
 
 static constant evaluate_arithmetic(token_type op, int_value l, int_value r, source_loc loc) {
@@ -747,10 +770,13 @@ static constant evaluate(sema *s, ast_node *node, int evaluated) {
   if (!node)
     return non_constant();
   switch (node->type) {
-  case AST_NODE_TYPE_NUMBER:
+  case AST_NODE_TYPE_NUMBER: {
     if (is_floating_constant(node))
       return non_constant();
-    return evaluate_integer_constant(node);
+    constant value = evaluate_integer_constant(node);
+    value.problem = NULL;
+    return value;
+  }
   case AST_NODE_TYPE_CHAR_LITERAL:
     return evaluate_char_constant(node);
   case AST_NODE_TYPE_IDENTIFIER:
@@ -899,7 +925,7 @@ static int compatible_functions(type_info *a, type_info *b) {
   type_info *old = a->has_prototype ? b : a;
   if (prototype->is_variadic)
     return 0;
-  if (old->param_count == 0) {
+  if (old->param_count == 0 && !old->from_definition) {
     for (int i = 0; i < prototype->param_count; i++) {
       if (!survives_promotion(prototype->param_types[i]))
         return 0;
@@ -923,7 +949,7 @@ static int is_incomplete(type_info *type) {
   case TYPE_PRIMITIVE:
     return t->prim == PRIM_VOID;
   case TYPE_ARRAY:
-    return t->array_size < 0 && !t->array_size_expr;
+    return t->array_size < 0 && !t->array_size_expr && !t->array_star;
   case TYPE_STRUCT:
   case TYPE_UNION:
     return !t->symbol->is_defined;
@@ -1019,6 +1045,30 @@ static type_info *adjusted_parameter_type(sema *s, type_info *type) {
   return pointer;
 }
 
+static type_info *composite_type(sema *s, type_info *a, type_info *b) {
+  int a_qualifiers;
+  int b_qualifiers;
+  type_info *ta = strip_typedefs(a, &a_qualifiers);
+  type_info *tb = strip_typedefs(b, &b_qualifiers);
+  if (is_unknown(ta) || is_unknown(tb) || ta->kind != tb->kind)
+    return a;
+  if (ta->kind == TYPE_FUNCTION)
+    return !ta->has_prototype && tb->has_prototype ? b : a;
+  if (ta->kind != TYPE_ARRAY && ta->kind != TYPE_POINTER)
+    return a;
+  int take_b = ta->kind == TYPE_ARRAY && ta->array_size < 0 &&
+               (tb->array_size >= 0 || (tb->is_vla && !ta->is_vla));
+  type_info *base = take_b ? tb : ta;
+  type_info *target = composite_type(s, base->ptr_to, (take_b ? ta : tb)->ptr_to);
+  if (target == base->ptr_to)
+    return take_b ? b : a;
+  type_info *copy = copy_type(s, base);
+  if (!copy)
+    return a;
+  copy->ptr_to = target;
+  return qualified(s, copy, take_b ? b_qualifiers : a_qualifiers);
+}
+
 static linkage_kind linkage_of(sema *s, const char *name, symbol_kind kind, token_type storage) {
   if (kind != SYMBOL_VAR && kind != SYMBOL_FUNC)
     return LINKAGE_NONE;
@@ -1041,6 +1091,11 @@ static void check_storage_class(sema *s, const char *name, symbol_kind kind, tok
     report(s, loc, "invalid storage class at file scope for", name);
   else if (!at_file_scope && kind == SYMBOL_FUNC && storage != 0 && storage != TOKEN_EXTERN)
     report(s, loc, "invalid storage class for block-scope function", name);
+}
+
+static void check_inline_main(sema *s, const char *name, decl_specs specs, source_loc loc) {
+  if (specs.is_inline && strcmp(name, "main") == 0)
+    report_at(s, loc, "main cannot be declared inline");
 }
 
 static void check_variably_modified(sema *s, ast_node *decl, linkage_kind linkage) {
@@ -1081,23 +1136,12 @@ static int check_redeclaration(sema *s, symbol *prior, const char *name, symbol_
   return 0;
 }
 
-static int completes(type_info *prior, type_info *type) {
-  prior = resolved_type(prior);
-  type = resolved_type(type);
-  if (is_unknown(prior) || is_unknown(type))
-    return 0;
-  if (prior->kind == TYPE_ARRAY)
-    return prior->array_size < 0 && type->array_size >= 0;
-  return prior->kind == TYPE_FUNCTION && !prior->has_prototype && type->has_prototype;
-}
-
 static symbol *declare(sema *s, const char *name, symbol_kind kind, type_info *type,
                        linkage_kind linkage, source_loc loc) {
   symbol *prior = symbol_table_lookup_ordinary_current(s->table, name);
   if (prior && prior->linkage != LINKAGE_NONE && linkage != LINKAGE_NONE) {
-    if (check_redeclaration(s, prior, name, kind, type, linkage, loc) &&
-        completes(prior->type, type))
-      prior->type = type;
+    if (check_redeclaration(s, prior, name, kind, type, linkage, loc))
+      prior->type = composite_type(s, prior->type, type);
     return prior;
   }
   if (prior) {
@@ -1107,6 +1151,10 @@ static symbol *declare(sema *s, const char *name, symbol_kind kind, type_info *t
     symbol *linked = linked_symbol(s, name);
     if (linked)
       check_redeclaration(s, linked, name, kind, type, linkage, loc);
+    symbol *visible = symbol_table_lookup_ordinary(s->table, name);
+    if (visible && visible->linkage != LINKAGE_NONE && visible->kind == kind &&
+        compatible_types(visible->type, 0, type, 0))
+      type = composite_type(s, visible->type, type);
   }
   symbol *sym = symbol_table_insert_ordinary(s->table, name, kind, type, loc);
   if (sym)
@@ -1133,14 +1181,21 @@ static void record_tentative_definition(sema *s, symbol *sym, ast_node *decl) {
     sym->definition = decl;
 }
 
-static void check_tentative_definitions(sema *s, ast_node *program) {
+static void check_end_of_file(sema *s, ast_node *program) {
   for (int i = 0; i < program->program.count; i++) {
     ast_node *item = program->program.declarations[i];
     int count = item->type == AST_NODE_TYPE_DECL_GROUP ? item->block.count : 1;
     for (int j = 0; j < count; j++) {
       ast_node *decl = item->type == AST_NODE_TYPE_DECL_GROUP ? item->block.statements[j] : item;
       symbol *sym = decl->symbol;
-      if (!sym || sym->definition != decl || sym->is_defined || sym->linkage != LINKAGE_EXTERNAL)
+      if (!sym)
+        continue;
+      if (sym->kind == SYMBOL_FUNC && sym->linkage == LINKAGE_INTERNAL && sym->is_used &&
+          !sym->is_defined) {
+        report(s, sym->loc, "static function used but never defined", sym->name);
+        sym->is_used = 0;
+      }
+      if (sym->definition != decl || sym->is_defined || sym->linkage != LINKAGE_EXTERNAL)
         continue;
       if (is_incomplete(sym->type) && resolved_type(sym->type)->kind != TYPE_ARRAY)
         report(s, decl->loc, "incomplete type for tentative definition", sym->name);
@@ -1168,9 +1223,11 @@ static void remove_void_parameter(sema *s, type_info *fn) {
   free(fn->param_types);
   free(fn->param_names);
   free(fn->param_definitions);
+  free(fn->param_register);
   fn->param_types = NULL;
   fn->param_names = NULL;
   fn->param_definitions = NULL;
+  fn->param_register = NULL;
   fn->param_count = 0;
 }
 
@@ -1184,6 +1241,8 @@ static void declare_parameters(sema *s, type_info *fn, source_loc loc, symbol **
       continue;
     symbol *sym = declare(s, fn->param_names[i], SYMBOL_VAR,
                           adjusted_parameter_type(s, fn->param_types[i]), LINKAGE_NONE, loc);
+    if (sym && fn->param_register)
+      sym->is_register = fn->param_register[i];
     if (out)
       out[i] = sym;
   }
@@ -1336,6 +1395,8 @@ static void check_declarator(sema *s, type_info *type, source_loc loc) {
 static void resolve_type(sema *s, type_info *type, source_loc loc) {
   type_info *declarator = type;
   for (; type; type = type->ptr_to) {
+    if (type->is_imaginary)
+      report_at(s, loc, "imaginary types are not supported");
     resolve(s, type->array_size_expr);
     if (type->kind == TYPE_ARRAY && type->array_size_expr)
       evaluate_array_size(s, type, loc);
@@ -1362,6 +1423,50 @@ static void resolve_type(sema *s, type_info *type, source_loc loc) {
   check_declarator(s, declarator, loc);
 }
 
+static void enter_vm_scope(sema *s) {
+  vm_scope *vm = (vm_scope *)malloc(sizeof(vm_scope));
+  if (!vm)
+    return;
+  vm->scope = s->table->current_scope;
+  vm->outer = s->vm;
+  vm->all_next = s->vm_nodes;
+  s->vm_nodes = vm;
+  s->vm = vm;
+}
+
+static void leave_scope(sema *s) {
+  while (s->vm && s->vm->scope == s->table->current_scope)
+    s->vm = s->vm->outer;
+  symbol_table_leave_scope(s->table);
+}
+
+static void free_vm_scopes(sema *s) {
+  while (s->vm_nodes) {
+    vm_scope *next = s->vm_nodes->all_next;
+    free(s->vm_nodes);
+    s->vm_nodes = next;
+  }
+  s->vm = NULL;
+}
+
+static int in_scope_of(vm_scope *at, vm_scope *needed) {
+  for (; at; at = at->outer) {
+    if (at == needed)
+      return 1;
+  }
+  return needed == NULL;
+}
+
+static void record_jump(jump_record **records, int *count, ast_node *node, vm_scope *vm) {
+  jump_record *grown = (jump_record *)realloc(*records, sizeof(jump_record) * (size_t)(*count + 1));
+  if (!grown)
+    return;
+  *records = grown;
+  grown[*count].node = node;
+  grown[*count].vm = vm;
+  (*count)++;
+}
+
 static void declare_label(sema *s, ast_node *label) {
   const char *name = label->label_stmt.label_name;
   symbol *prior = symbol_table_lookup_label(s->table, name);
@@ -1370,24 +1475,29 @@ static void declare_label(sema *s, ast_node *label) {
     note_previous(prior->loc, name);
   }
   label->symbol = symbol_table_insert_label(s->table, name, label->loc);
+  record_jump(&s->labels, &s->label_count, label, s->vm);
 }
 
-static void record_goto(sema *s, ast_node *jump) {
-  ast_node **grown = (ast_node **)realloc(s->gotos, sizeof(ast_node *) * (s->goto_count + 1));
-  if (!grown)
-    return;
-  s->gotos = grown;
-  s->gotos[s->goto_count++] = jump;
+static vm_scope *label_vm_scope(sema *s, symbol *label) {
+  for (int i = 0; i < s->label_count; i++) {
+    if (s->labels[i].node->symbol == label)
+      return s->labels[i].vm;
+  }
+  return NULL;
 }
 
 static void resolve_gotos(sema *s) {
   for (int i = 0; i < s->goto_count; i++) {
-    ast_node *jump = s->gotos[i];
+    ast_node *jump = s->gotos[i].node;
     jump->symbol = symbol_table_lookup_label(s->table, jump->goto_stmt.label_name);
     if (!jump->symbol)
       report(s, jump->loc, "use of undeclared label", jump->goto_stmt.label_name);
+    else if (!in_scope_of(s->gotos[i].vm, label_vm_scope(s, jump->symbol)))
+      report_at(s, jump->loc,
+                "a goto cannot jump into the scope of an identifier with variably modified type");
   }
   s->goto_count = 0;
+  s->label_count = 0;
 }
 
 static void resolve_items(sema *s, ast_node *list) {
@@ -1417,7 +1527,7 @@ static void check_for_declaration(sema *s, ast_node *init) {
 static void resolve_in_block(sema *s, ast_node *node) {
   symbol_table_enter_scope(s->table, SCOPE_BLOCK);
   resolve(s, node);
-  symbol_table_leave_scope(s->table);
+  leave_scope(s);
 }
 
 static int is_modifiable_type(type_info *type) {
@@ -1447,6 +1557,8 @@ static void resolve_var_decl(sema *s, ast_node *decl) {
   if (decl->var_decl.specs.is_inline && kind != SYMBOL_FUNC &&
       !is_unresolved(resolved_type(decl->var_decl.type)))
     report(s, decl->loc, "inline can only declare a function, not", name);
+  if (kind == SYMBOL_FUNC)
+    check_inline_main(s, name, decl->var_decl.specs, decl->loc);
   linkage_kind linkage = linkage_of(s, name, kind, storage);
   decl->symbol = declare(s, name, kind, decl->var_decl.type, linkage, decl->loc);
   symbol *sym = decl->symbol;
@@ -1460,6 +1572,8 @@ static void resolve_var_decl(sema *s, ast_node *decl) {
       (!decl->var_decl.specs.is_inline || storage == TOKEN_EXTERN))
     sym->external_declaration = 1;
   check_variably_modified(s, decl, linkage);
+  if (!at_file_scope && linkage == LINKAGE_NONE && is_variably_modified(decl->var_decl.type))
+    enter_vm_scope(s);
   if (s->inline_definition && kind == SYMBOL_VAR && storage == TOKEN_STATIC &&
       is_modifiable_type(decl->var_decl.type))
     report(s, decl->loc,
@@ -1772,11 +1886,22 @@ static void resolve_struct(sema *s, ast_node *def) {
     def->symbol->is_defined = 1;
 }
 
+static int is_inline_definition(sema *s, ast_node *fn, linkage_kind linkage) {
+  decl_specs specs = fn->function_def.specs;
+  if (linkage != LINKAGE_EXTERNAL || !specs.is_inline || specs.storage_class == TOKEN_EXTERN)
+    return 0;
+  symbol *prior = symbol_table_lookup_ordinary_current(s->table, fn->function_def.name);
+  if (!prior || prior->linkage == LINKAGE_NONE)
+    return 1;
+  return prior->kind == SYMBOL_FUNC && !prior->external_declaration;
+}
+
 static void resolve_function(sema *s, ast_node *fn) {
   const char *name = fn->function_def.name;
   type_info *type = fn->function_def.type;
   resolve_type(s, type->ptr_to, fn->loc);
   check_storage_class(s, name, SYMBOL_FUNC, fn->function_def.specs.storage_class, fn->loc);
+  check_inline_main(s, name, fn->function_def.specs, fn->loc);
   for (int i = 0; i < type->param_count; i++) {
     for (type_info *t = type->param_types[i]; t; t = t->ptr_to) {
       if (t->kind == TYPE_ARRAY && t->array_star) {
@@ -1791,19 +1916,23 @@ static void resolve_function(sema *s, ast_node *fn) {
     report(s, fn->loc, "incomplete return type in the definition of", name);
   linkage_kind linkage = linkage_of(s, name, SYMBOL_FUNC, fn->function_def.specs.storage_class);
   remove_void_parameter(s, type);
-  fn->symbol = declare(s, name, SYMBOL_FUNC, type, linkage, fn->loc);
-  if (fn->symbol && fn->symbol->kind == SYMBOL_FUNC) {
-    record_definition(s, fn->symbol, fn, name);
-    if (!fn->function_def.specs.is_inline || fn->function_def.specs.storage_class == TOKEN_EXTERN)
-      fn->symbol->external_declaration = 1;
-    s->inline_definition = linkage == LINKAGE_EXTERNAL && !fn->symbol->external_declaration;
-  }
+  type->from_definition = 1;
+  s->inline_definition = is_inline_definition(s, fn, linkage);
 
   symbol_table_enter_scope(s->table, SCOPE_FUNCTION);
   if (type->param_count > 0)
     fn->function_def.param_symbols = (symbol **)calloc(type->param_count, sizeof(symbol *));
   declare_parameters(s, type, fn->loc, fn->function_def.param_symbols);
   check_definition_parameters(s, fn);
+  scope *body = s->table->current_scope;
+  s->table->current_scope = body->parent;
+  fn->symbol = declare(s, name, SYMBOL_FUNC, type, linkage, fn->loc);
+  s->table->current_scope = body;
+  if (fn->symbol && fn->symbol->kind == SYMBOL_FUNC) {
+    record_definition(s, fn->symbol, fn, name);
+    if (!fn->function_def.specs.is_inline || fn->function_def.specs.storage_class == TOKEN_EXTERN)
+      fn->symbol->external_declaration = 1;
+  }
   type_info *name_type = create_type_info(TYPE_ARRAY);
   name_type->array_size = (long long)strlen(name) + 1;
   name_type->ptr_to = create_type_info(TYPE_PRIMITIVE);
@@ -1817,6 +1946,7 @@ static void resolve_function(sema *s, ast_node *fn) {
   s->return_type = type->ptr_to;
   resolve_items(s, fn->function_def.body);
   resolve_gotos(s);
+  free_vm_scopes(s);
   s->inline_definition = 0;
   symbol_table_leave_scope(s->table);
 }
@@ -1929,19 +2059,19 @@ static int is_null_pointer_constant(sema *s, ast_node *node) {
   return value.status == CONST_VALUE && value.value.bits == 0;
 }
 
-static type_info *number_type(ast_node *node) {
+static type_info *number_type(sema *s, ast_node *node) {
   const char *text = node->tok.value ? node->tok.value : "";
   number_kind kind = classify_number(text, NULL);
-  if (kind == NUMBER_INTEGER)
-    return arithmetic_type(evaluate_integer_constant(node).value.type, 0);
+  if (kind == NUMBER_INTEGER) {
+    constant value = evaluate_integer_constant(node);
+    report_problem(s, value);
+    return arithmetic_type(value.value.type, 0);
+  }
   if (kind != NUMBER_FLOATING)
     return NULL;
-  char suffix = text[strlen(text) - 1];
-  if (suffix == 'f' || suffix == 'F')
-    return arithmetic_type(PRIM_FLOAT, 0);
-  if (suffix == 'l' || suffix == 'L')
-    return arithmetic_type(PRIM_LDOUBLE, 0);
-  return arithmetic_type(PRIM_DOUBLE, 0);
+  if (floating_constant_overflows(text))
+    report_at(s, node->loc, "floating constant is out of range for its type");
+  return arithmetic_type(floating_constant_type(text), 0);
 }
 
 static type_info *string_type(sema *s, ast_node *node) {
@@ -2194,7 +2324,10 @@ static type_info *conditional_type(sema *s, ast_node *node) {
     return a;
   if (is_pointer(b) && is_null_pointer_constant(s, node->ternary.true_branch))
     return b;
-  if (comparable_pointers(a, b) || (void_pointer_pair(a, b) && is_void(pointee(a))))
+  if (comparable_pointers(a, b))
+    return pointer_to(
+        s, qualified(s, composite_type(s, pointee(a), pointee(b)), pointee_qualifiers(b)));
+  if (void_pointer_pair(a, b) && is_void(pointee(a)))
     return pointer_to(s, qualified(s, pointee(a), pointee_qualifiers(b)));
   if (void_pointer_pair(a, b))
     return pointer_to(s, qualified(s, pointee(b), pointee_qualifiers(a)));
@@ -2393,6 +2526,10 @@ static int check_argument(sema *s, type_info *fn, int index, ast_node *argument)
   type_info *value = value_type(s, argument);
   if (!value)
     return 1;
+  if (!is_void(value) && is_incomplete(value)) {
+    report_at(s, argument->loc, "an argument needs a complete object type");
+    return 0;
+  }
   if (fn->has_prototype && index < fn->param_count) {
     type_info *parameter = unqualified(s, adjusted_parameter_type(s, fn->param_types[index]));
     const char *problem = is_unknown(parameter) ? NULL : conversion_problem(s, parameter, argument);
@@ -2645,6 +2782,8 @@ static void initialize_leaf(initializer *init, type_info *type, ast_node *value)
   else if (init->is_static && classify_constant(init->s, value) == NOT_CONSTANT)
     report_at(init->s, value->loc,
               "an initializer for an object with static storage must be constant");
+  else if (init->is_static && is_integer(value->expr_type))
+    report_problem(init->s, evaluate(init->s, value, 1));
 }
 
 static long long initialize_string(initializer *init, type_info *array, ast_node *string) {
@@ -2843,7 +2982,7 @@ static type_info *sized_array(sema *s, type_info *type, long long count) {
 static void type_expression(sema *s, ast_node *node) {
   switch (node->type) {
   case AST_NODE_TYPE_NUMBER:
-    node->expr_type = number_type(node);
+    node->expr_type = number_type(s, node);
     break;
   case AST_NODE_TYPE_CHAR_LITERAL:
     node->expr_type = arithmetic_type(node->literal.is_wide ? PRIM_USHORT : PRIM_INT, 0);
@@ -2892,8 +3031,15 @@ typedef struct switch_context {
   source_loc *locations;
   int count;
   ast_node *default_label;
+  vm_scope *vm;
   struct switch_context *outer;
 } switch_context;
+
+static void check_switch_label(sema *s, ast_node *label) {
+  if (!in_scope_of(s->current_switch->vm, s->vm))
+    report_at(s, label->loc,
+              "a switch cannot jump into the scope of an identifier with variably modified type");
+}
 
 static void check_condition(sema *s, ast_node *statement, ast_node *condition,
                             const char *message) {
@@ -2920,6 +3066,7 @@ static void resolve_switch(sema *s, ast_node *node) {
     report_at(s, node->loc, "the controlling expression of 'switch' needs an integer type");
   else if (type)
     context.type = promote(integer_type_of(type));
+  context.vm = s->vm;
   context.outer = s->current_switch;
   s->current_switch = &context;
   s->breakables++;
@@ -2928,7 +3075,7 @@ static void resolve_switch(sema *s, ast_node *node) {
   s->current_switch = context.outer;
   free(context.values);
   free(context.locations);
-  symbol_table_leave_scope(s->table);
+  leave_scope(s);
 }
 
 static void record_case(sema *s, switch_context *context, ast_node *node) {
@@ -2966,10 +3113,13 @@ static void record_case(sema *s, switch_context *context, ast_node *node) {
 
 static void resolve_case(sema *s, ast_node *node) {
   resolve(s, node->case_stmt.value);
-  if (!s->current_switch)
+  if (!s->current_switch) {
     report_at(s, node->loc, "a case label must be inside a switch");
-  else if (node->case_stmt.value)
-    record_case(s, s->current_switch, node);
+  } else {
+    check_switch_label(s, node);
+    if (node->case_stmt.value)
+      record_case(s, s->current_switch, node);
+  }
   resolve(s, node->case_stmt.body);
 }
 
@@ -2981,6 +3131,7 @@ static void resolve_default(sema *s, ast_node *node) {
     report_at(s, node->loc, "duplicate default label");
     note_at(context->default_label->loc, "previous default label is here");
   } else {
+    check_switch_label(s, node);
     context->default_label = node;
   }
   resolve(s, node->default_stmt.body);
@@ -3014,13 +3165,20 @@ static void resolve(sema *s, ast_node *node) {
   switch (node->type) {
   case AST_NODE_TYPE_IDENTIFIER:
     node->symbol = symbol_table_lookup_ordinary(s->table, node->tok.value);
-    if (!node->symbol)
+    if (node->symbol && !s->in_sizeof)
+      node->symbol->is_used = 1;
+    if (!node->symbol) {
       report(s, node->loc, "use of undeclared identifier", node->tok.value);
-    else if (s->inline_definition && node->symbol->linkage == LINKAGE_INTERNAL)
+    } else if (node->symbol->kind == SYMBOL_TYPEDEF) {
+      report(s, node->loc, "expected an expression, found type name", node->tok.value);
+      note_previous(node->symbol->loc, node->symbol->name);
+      node->symbol = NULL;
+    } else if (s->inline_definition && node->symbol->linkage == LINKAGE_INTERNAL) {
       report(
           s, node->loc,
           "an inline definition with external linkage cannot refer to internal linkage identifier",
           node->tok.value);
+    }
     break;
   case AST_NODE_TYPE_VAR_DECL:
     resolve_var_decl(s, node);
@@ -3040,7 +3198,7 @@ static void resolve(sema *s, ast_node *node) {
   case AST_NODE_TYPE_BLOCK:
     symbol_table_enter_scope(s->table, SCOPE_BLOCK);
     resolve_items(s, node);
-    symbol_table_leave_scope(s->table);
+    leave_scope(s);
     break;
   case AST_NODE_TYPE_IF:
     symbol_table_enter_scope(s->table, SCOPE_BLOCK);
@@ -3048,7 +3206,7 @@ static void resolve(sema *s, ast_node *node) {
     check_condition(s, node, node->if_stmt.condition, "the condition of 'if' needs a scalar type");
     resolve_in_block(s, node->if_stmt.then_branch);
     resolve_in_block(s, node->if_stmt.else_branch);
-    symbol_table_leave_scope(s->table);
+    leave_scope(s);
     break;
   case AST_NODE_TYPE_WHILE:
     symbol_table_enter_scope(s->table, SCOPE_BLOCK);
@@ -3056,7 +3214,7 @@ static void resolve(sema *s, ast_node *node) {
     check_condition(s, node, node->while_stmt.condition,
                     "the condition of 'while' needs a scalar type");
     resolve_loop_body(s, node->while_stmt.body);
-    symbol_table_leave_scope(s->table);
+    leave_scope(s);
     break;
   case AST_NODE_TYPE_DO_WHILE:
     symbol_table_enter_scope(s->table, SCOPE_BLOCK);
@@ -3064,7 +3222,7 @@ static void resolve(sema *s, ast_node *node) {
     resolve(s, node->do_while_stmt.condition);
     check_condition(s, node, node->do_while_stmt.condition,
                     "the condition of 'do' needs a scalar type");
-    symbol_table_leave_scope(s->table);
+    leave_scope(s);
     break;
   case AST_NODE_TYPE_FOR:
     symbol_table_enter_scope(s->table, SCOPE_BLOCK);
@@ -3075,7 +3233,7 @@ static void resolve(sema *s, ast_node *node) {
                     "the condition of 'for' needs a scalar type");
     resolve(s, node->for_stmt.increment);
     resolve_loop_body(s, node->for_stmt.body);
-    symbol_table_leave_scope(s->table);
+    leave_scope(s);
     break;
   case AST_NODE_TYPE_SWITCH:
     resolve_switch(s, node);
@@ -3099,7 +3257,7 @@ static void resolve(sema *s, ast_node *node) {
     resolve(s, node->label_stmt.statement);
     break;
   case AST_NODE_TYPE_GOTO:
-    record_goto(s, node);
+    record_jump(&s->gotos, &s->goto_count, node, s->vm);
     break;
   case AST_NODE_TYPE_RETURN:
     resolve_return(s, node);
@@ -3112,9 +3270,13 @@ static void resolve(sema *s, ast_node *node) {
     resolve(s, node->assignment.left);
     resolve(s, node->assignment.right);
     break;
-  case AST_NODE_TYPE_UNARY_OP:
+  case AST_NODE_TYPE_UNARY_OP: {
+    int is_sizeof = node->unary_op.op.type == TOKEN_SIZEOF;
+    s->in_sizeof += is_sizeof;
     resolve(s, node->unary_op.operand);
+    s->in_sizeof -= is_sizeof;
     break;
+  }
   case AST_NODE_TYPE_TERNARY:
     resolve(s, node->ternary.condition);
     resolve(s, node->ternary.true_branch);
@@ -3161,8 +3323,9 @@ int sema_check(symbol_table *table, ast_node *program) {
   symbol_table_enter_scope(table, SCOPE_FILE);
   for (int i = 0; i < program->program.count; i++)
     resolve(&s, program->program.declarations[i]);
-  check_tentative_definitions(&s, program);
+  check_end_of_file(&s, program);
   symbol_table_leave_scope(table);
   free(s.gotos);
+  free(s.labels);
   return s.error_count;
 }

@@ -2865,12 +2865,16 @@ TEST_F(PreprocessorTest, VaArgsKeepsTheCommasBetweenTrailingArguments) {
 }
 
 TEST_F(PreprocessorTest, VaArgsWithNoTrailingArgumentsIsEmpty) {
+  StderrCapture capture;
   run("#define L(f, ...) g(f, __VA_ARGS__)\nL(1)");
+  std::string diagnostics = capture.finish();
   std::vector<std::string> expected = {"g", "(", "1", ",", ")"};
   EXPECT_EQ(spellings(), expected)
       << "C99 has no comma swallowing, so the comma written in the body "
          "stays; that is exactly why the GNU , ## __VA_ARGS__ exists";
-  EXPECT_EQ(rc, 0);
+  EXPECT_EQ(rc, 1) << "C99 6.10.3p4 requires at least one argument for the '...'";
+  EXPECT_EQ(diagnostics,
+            "<source>:2:1: error: at least one argument is required for '...' in macro 'L'\n");
 }
 
 TEST_F(PreprocessorTest, VariadicMacroWithNoNamedParameters) {
@@ -3459,7 +3463,7 @@ TEST_F(IncludeTest, PresumedNamesDoNotLeakAcrossManyFrames) {
 
   EXPECT_EQ((frees_many - frees_one) % 50, 0)
       << "each extra include must cost the same fixed amount";
-  EXPECT_EQ(frees_many - frees_one, 50 * 31)
+  EXPECT_EQ(frees_many - frees_one, 50 * 32)
       << "a presumed name is interned once for the whole run, so no included frame "
          "allocates or frees a copy of it";
 }
@@ -3531,4 +3535,413 @@ TEST_F(PreprocessorTest, AParameterListEndsWithItsLine) {
     EXPECT_EQ(got, c[1]);
     token_buf_free(&out);
   }
+}
+
+static std::string spelled(const token_buf &tb) {
+  std::string out;
+  for (int i = 0; i < tb.count; i++) {
+    const token &t = tb.tokens[i];
+    if (t.type == TOKEN_EOF)
+      continue;
+    std::string text = t.value ? t.value : "<null>";
+    if (t.type == TOKEN_STRING)
+      text = "\"" + text + "\"";
+    else if (t.type == TOKEN_CHAR_LITERAL)
+      text = "'" + text + "'";
+    if (!out.empty())
+      out += " ";
+    out += text;
+  }
+  return out;
+}
+
+TEST_F(PreprocessorTest, StandardExampleThreeReplacesEachMacroOnce) {
+  run("#define x 3\n"
+      "#define f(a) f(x * (a))\n"
+      "#undef x\n"
+      "#define x 2\n"
+      "#define g f\n"
+      "#define z z[0]\n"
+      "#define h g(~\n"
+      "#define m(a) a(w)\n"
+      "#define w 0,1\n"
+      "#define t(a) a\n"
+      "#define p() int\n"
+      "#define q(x) x\n"
+      "#define r(x,y) x ## y\n"
+      "#define str(x) # x\n"
+      "f(y+1) + f(f(z)) % t(t(g)(0) + t)(1);\n"
+      "g(x+(3,4)-w) | h 5) & m\n"
+      "(f)^m(m);\n"
+      "p() i[q()] = { q(1), r(2,3), r(4,), r(,5), r(,) };\n"
+      "char c[2][6] = { str(hello), str() };\n");
+  EXPECT_EQ(spelled(tb),
+            "f ( 2 * ( y + 1 ) ) + f ( 2 * ( f ( 2 * ( z [ 0 ] ) ) ) ) % f ( 2 * ( 0 ) ) + t ( 1 ) "
+            "; f ( 2 * ( 2 + ( 3 , 4 ) - 0 , 1 ) ) | f ( 2 * ( ~ 5 ) ) & f ( 2 * ( 0 , 1 ) ) ^ m ( "
+            "0 , 1 ) ; int i [ ] = { 1 , 23 , 4 , 5 , } ; char c [ 2 ] [ 6 ] = { \"hello\" , \"\" "
+            "} ;")
+      << "C99 6.10.3.5 EXAMPLE 3";
+  EXPECT_EQ(rc, 0);
+}
+
+TEST_F(PreprocessorTest, StandardExampleFourStringizesAndPastes) {
+  run("#define str(s) # s\n"
+      "#define xstr(s) str(s)\n"
+      "#define debug(s, t) printf(\"x\" # s \"= %d, x\" # t \"= %s\", \\\n"
+      " x ## s, x ## t)\n"
+      "#define INCFILE(n) vers ## n\n"
+      "#define glue(a, b) a ## b\n"
+      "#define xglue(a, b) glue(a, b)\n"
+      "#define HIGHLOW \"hello\"\n"
+      "#define LOW LOW \", world\"\n"
+      "debug(1, 2);\n"
+      "fputs(str(strncmp(\"abc\\0d\", \"abc\", '\\4') // this goes away\n"
+      " == 0) str(: @\\n), s);\n"
+      "glue(HIGH, LOW);\n"
+      "xglue(HIGH, LOW)\n");
+  EXPECT_EQ(spelled(tb),
+            "printf ( \"x\" \"1\" \"= %d, x\" \"2\" \"= %s\" , x1 , x2 ) ; "
+            "fputs ( \"strncmp(\\\"abc\\\\0d\\\", \\\"abc\\\", '\\\\4') == 0\" \": @\\n\" , s ) ; "
+            "\"hello\" ; \"hello\" \", world\"")
+      << "C99 6.10.3.5 EXAMPLE 4";
+  EXPECT_EQ(rc, 0);
+}
+
+TEST_F(PreprocessorTest, AMacroNameLeftUnreplacedIsNeverReplacedLater) {
+  run("#define z z[0]\n#define f(a) a\nf(f(z))");
+  EXPECT_EQ(spelled(tb), "z [ 0 ]")
+      << "C99 6.10.3.4p2: a name not replaced because its macro was being expanded is no longer "
+         "available for replacement";
+}
+
+TEST_F(PreprocessorTest, APaintedNameSurvivesLaterRescans) {
+  run("#define foo a foo\n#define id(x) x\nid(foo)");
+  EXPECT_EQ(spelled(tb), "a foo");
+}
+
+TEST_F(PreprocessorTest, APastedHashHashIsAnOrdinaryToken) {
+  run("#define hash_hash # ## #\n"
+      "#define mkstr(a) # a\n"
+      "#define in_between(a) mkstr(a)\n"
+      "#define join(c, d) in_between(c hash_hash d)\n"
+      "char p[] = join(x, y);\n");
+  EXPECT_EQ(spelled(tb), "char p [ ] = \"x ## y\" ;") << "C99 6.10.3.3 EXAMPLE";
+}
+
+TEST_F(PreprocessorTest, HashHashFromAnArgumentDoesNotPaste) {
+  run("#define hh # ## #\n#define cat(a) [a]\ncat(x hh y)");
+  EXPECT_EQ(spelled(tb), "[ x ## y ]")
+      << "only a ## written in the replacement list is the paste operator";
+}
+
+TEST_F(PreprocessorTest, AnEmptyArgumentIsAPlacemarker) {
+  run("#define c(a, x, y) a x ## y\nc(1, , 2)");
+  EXPECT_EQ(spelled(tb), "1 2")
+      << "the empty x is a placemarker, so the paste keeps 2 apart from 1";
+}
+
+TEST_F(PreprocessorTest, StringizeEscapesOnlyInsideLiterals) {
+  run("#define s(x) #x\ns(a\\b) s(\"a\\nb\") s('q') s(: @\\n)");
+  std::vector<std::string> expected = {"a\\b", "\\\"a\\\\nb\\\"", "'q'", ": @\\n"};
+  EXPECT_EQ(spellings(), expected)
+      << "C99 6.10.3.2p2 inserts a backslash before \" and \\ of a character constant or string "
+         "literal only";
+  EXPECT_EQ(rc, 0);
+}
+
+TEST_F(PreprocessorTest, StringizeSpacesFollowTheSourceNotTheMacroBody) {
+  run("#define str(s) # s\n"
+      "#define xstr(s) str(s)\n"
+      "#define INCFILE(n) vers ## n\n"
+      "#define F() y\n"
+      "#define j(a) [ a ]\n"
+      "xstr(INCFILE(2).h) xstr(INCFILE(2) . h) xstr(a /**/ b) xstr(a F()) xstr(a(F())) "
+      "xstr(j(1))\n");
+  std::vector<std::string> expected = {"vers2.h", "vers2 . h", "a b", "a y", "a(y)", "[ 1 ]"};
+  EXPECT_EQ(spellings(), expected)
+      << "whitespace comes from the source, not from the position a token had in a macro body";
+}
+
+TEST_F(PreprocessorTest, StrayCharactersAreTokensUntilTheyReachTheOutput) {
+  run("#define s(x) #x\nchar *a = s(@);\n#if 0\n\\ @\n#endif\nchar *b = s(\\);\n");
+  EXPECT_EQ(rc, 0) << "a stray character is a preprocessing token (C99 6.4p1); inside # and inside "
+                      "a skipped group it never becomes a token";
+  std::vector<std::string> expected = {"char", "*", "a", "=", "@",  ";",
+                                       "char", "*", "b", "=", "\\", ";"};
+  EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(PreprocessorTest, AStrayCharacterThatReachesTheOutputIsAnError) {
+  StderrCapture capture;
+  run("int a @;");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 1) << "C99 6.4p2: every preprocessing token converted to a token must be one of "
+                      "the token forms";
+  EXPECT_EQ(diagnostics, "<source>:1:7: error: unexpected character '@' in source\n");
+}
+
+TEST_F(PreprocessorTest, AStrayCharacterFromAMacroIsAnError) {
+  StderrCapture capture;
+  run("#define AT @\nint a AT;");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics, "<source>:1:12: error: unexpected character '@' in source\n");
+}
+
+TEST_F(PreprocessorTest, TooFewArgumentsIsDiagnosed) {
+  StderrCapture capture;
+  run("#define F(a,b) a b\nF(1)");
+  std::string diagnostics = capture.finish();
+  std::vector<std::string> expected = {"F"};
+  EXPECT_EQ(spellings(), expected);
+  EXPECT_EQ(rc, 1) << "C99 6.10.3p4";
+  EXPECT_EQ(diagnostics, "<source>:2:1: error: wrong number of arguments to macro 'F'\n");
+}
+
+TEST_F(PreprocessorTest, TooManyArgumentsIsDiagnosed) {
+  StderrCapture capture;
+  run("#define F(a) [a]\nF(1,2)");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics, "<source>:2:1: error: wrong number of arguments to macro 'F'\n");
+}
+
+TEST_F(PreprocessorTest, AWrongArgumentCountIsNeverSilent) {
+  StderrCapture capture;
+  run("int F(int);\n#define F(a, b) a + b\nint (*x)(int) = F(1);\n");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 1) << "the macro name alone is valid here, so only the diagnostic catches it";
+  EXPECT_EQ(diagnostics, "<source>:3:17: error: wrong number of arguments to macro 'F'\n");
+}
+
+TEST_F(PreprocessorTest, AnUnterminatedArgumentListIsDiagnosed) {
+  StderrCapture capture;
+  run("int x;\n#define G(a) a\nG(");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics, "<source>:3:1: error: unterminated argument list invoking macro 'G'\n");
+}
+
+TEST_F(PreprocessorTest, AVariadicMacroNeedsOneVariableArgument) {
+  const struct {
+    const char *source;
+    int errors;
+  } cases[] = {
+      {"#define L(a, ...) a\nL(1)", 1},          {"#define L(a, ...) a\nL(1, )", 0},
+      {"#define L(a, ...) a\nL(1, 2)", 0},       {"#define E(...) [__VA_ARGS__]\nE()", 0},
+      {"#define E(...) [__VA_ARGS__]\nE(1)", 0}, {"#define L(a, b, ...) a\nL(1, 2)", 1},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    StderrCapture capture;
+    run(test.source);
+    std::string diagnostics = capture.finish();
+    EXPECT_EQ(rc, test.errors) << diagnostics;
+    token_buf_free(&tb);
+    initialised = false;
+  }
+}
+
+TEST_F(PreprocessorTest, VaArgsOutsideAVariadicReplacementListIsAnError) {
+  const struct {
+    const char *source;
+    int errors;
+  } cases[] = {
+      {"int __VA_ARGS__;", 1},
+      {"#define V(...) __VA_ARGS__\nV(__VA_ARGS__)", 1},
+      {"#define B 1\n__VA_ARGS__ x;", 1},
+      {"#if 0\n__VA_ARGS__\n#endif\nint x;", 0},
+      {"#define V(...) __VA_ARGS__\nV(1)", 0},
+      {"#undef __VA_ARGS__\nint x;", 1},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    StderrCapture capture;
+    run(test.source);
+    std::string diagnostics = capture.finish();
+    EXPECT_EQ(rc, test.errors) << diagnostics;
+    token_buf_free(&tb);
+    initialised = false;
+  }
+}
+
+TEST_F(PreprocessorTest, VaArgsInOrdinaryTextNamesItsPlace) {
+  StderrCapture capture;
+  run("int __VA_ARGS__;");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(diagnostics, "<source>:1:5: error: __VA_ARGS__ can only appear in a variadic macro\n");
+}
+
+TEST_F(PreprocessorTest, SignedOverflowInAConditionIsAnError) {
+  const struct {
+    const char *expression;
+    int errors;
+  } cases[] = {
+      {"0x7fffffffffffffff + 1", 1},
+      {"-0x7fffffffffffffff - 2", 1},
+      {"0x7fffffffffffffff * 2", 1},
+      {"-(-0x7fffffffffffffff - 1)", 1},
+      {"0x4000000000000000 << 1", 1},
+      {"18446744073709551615", 1},
+      {"9223372036854775808", 1},
+      {"0x7fffffffffffffff - 1", 0},
+      {"-0x7fffffffffffffff - 1", 0},
+      {"0x2000000000000000 << 1", 0},
+      {"-1 << 1", 0},
+      {"0xffffffffffffffff + 1", 0},
+      {"0x4000000000000000u * 2", 0},
+      {"18446744073709551615u + 1", 0},
+      {"9223372036854775807", 0},
+      {"0 && (0x7fffffffffffffff + 1)", 0},
+      {"1 || (0x7fffffffffffffff * 2)", 0},
+      {"0 ? (0x7fffffffffffffff + 1) : 1", 0},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.expression);
+    std::string source = "#if ";
+    source += test.expression;
+    source += "\n#endif\nint x;\n";
+    StderrCapture capture;
+    run(source.c_str());
+    std::string diagnostics = capture.finish();
+    EXPECT_EQ(rc, test.errors) << diagnostics;
+    token_buf_free(&tb);
+    initialised = false;
+  }
+}
+
+TEST_F(PreprocessorTest, OnlySpaceAndTabSeparateTheTokensOfADirective) {
+  const struct {
+    const char *source;
+    int errors;
+  } cases[] = {
+      {"#define A\f1\nint x;", 1},
+      {"#define B\v1\nint x;", 1},
+      {"#define C 1 \f\nint x;", 1},
+      {"#\f\nint x;", 1},
+      {"#define D 1\t 1\nint x;", 0},
+      {"\f#define E 1\nint x;", 0},
+      {"#define F 1\n\fint x;", 0},
+      {"int a;\f\nint b;", 0},
+      {"#if 0\n#define G\f1\n#endif\nint x;", 0},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    StderrCapture capture;
+    run(test.source);
+    std::string diagnostics = capture.finish();
+    EXPECT_EQ(rc, test.errors) << diagnostics;
+    token_buf_free(&tb);
+    initialised = false;
+  }
+}
+
+TEST_F(PreprocessorTest, AFormFeedInADirectiveNamesTheDirective) {
+  StderrCapture capture;
+  run("#define A\f1\nint x;");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(diagnostics,
+            "<source>:1:1: error: form feed or vertical tab in a preprocessing directive\n")
+      << "C99 6.10p5";
+}
+
+TEST_F(IncludeTest, AComputedIncludeIsMacroExpandedFirst) {
+  run("#define HDR \"simple.h\"\n#include HDR\nint after;");
+  std::vector<std::string> expected = {"int", "from_inc", ";", "int", "after", ";"};
+  EXPECT_EQ(spellings(), expected) << "C99 6.10.2p4";
+  EXPECT_EQ(rc, 0);
+}
+
+TEST_F(IncludeTest, AComputedIncludeCanFormAnAngledName) {
+  run("#define SYS <sub/deep.h>\n#include SYS");
+  std::vector<std::string> expected = {"int", "deep", ";"};
+  EXPECT_EQ(spellings(), expected);
+  EXPECT_EQ(rc, 0);
+}
+
+TEST_F(IncludeTest, StandardExampleFourIncludesTheStringizedName) {
+  write_file("pp_test_inc/vers2.h", "int vers2;\n");
+  run("#define str(s) # s\n"
+      "#define xstr(s) str(s)\n"
+      "#define INCFILE(n) vers ## n\n"
+      "#include xstr(INCFILE(2).h)\n");
+  std::vector<std::string> expected = {"int", "vers2", ";"};
+  EXPECT_EQ(spellings(), expected) << "C99 6.10.3.5 EXAMPLE 4";
+  EXPECT_EQ(rc, 0);
+  remove("pp_test_inc/vers2.h");
+}
+
+TEST_F(IncludeTest, AComputedIncludeMustStillFormAHeaderName) {
+  StderrCapture capture;
+  run("#define N 3\n#include N\nint x;");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics,
+            "pp_test_src/main.c:2:2: error: expected \"FILE\" or <FILE> after #include\n");
+}
+
+TEST_F(IncludeTest, ExtraTokensAfterAnIncludeAreAnError) {
+  const struct {
+    const char *source;
+    int errors;
+  } cases[] = {
+      {"#include \"simple.h\" extra\n", 1},
+      {"#define H \"simple.h\" junk\n#include H\n", 1},
+      {"#include \"simple.h\"\n", 0},
+      {"#include \"simple.h\" /* a comment is not a token */\n", 0},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    StderrCapture capture;
+    run(test.source);
+    std::string diagnostics = capture.finish();
+    EXPECT_EQ(rc, test.errors) << diagnostics;
+    std::vector<std::string> expected = {"int", "from_inc", ";"};
+    EXPECT_EQ(spellings(), expected) << "the file is still included";
+    token_buf_free(&tb);
+    initialised = false;
+  }
+}
+
+TEST_F(IncludeTest, ExtraTokensAfterAnIncludeNameTheirPosition) {
+  StderrCapture capture;
+  run("#include \"simple.h\" extra\n");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(diagnostics, "pp_test_src/main.c:1:21: error: extra tokens after #include\n");
+}
+
+TEST_F(IncludeTest, ConditionalsMustBalanceWithinEachFile) {
+  write_file("pp_test_inc/open.h", "#if 1\nint in_open;\n");
+  StderrCapture capture;
+  run("#include \"open.h\"\n#endif\nint after;");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 2);
+  EXPECT_EQ(diagnostics, "pp_test_inc/open.h:1:2: error: unterminated #if\n"
+                         "pp_test_src/main.c:2:2: error: #endif without #if\n")
+      << "an included file is processed as its own preprocessing file (C99 5.1.1.2 phase 4)";
+  std::vector<std::string> expected = {"int", "in_open", ";", "int", "after", ";"};
+  EXPECT_EQ(spellings(), expected);
+  remove("pp_test_inc/open.h");
+}
+
+TEST_F(IncludeTest, AnIncludedFileCannotCloseTheIncludersConditional) {
+  write_file("pp_test_inc/closes.h", "#endif\nint in_closes;\n");
+  StderrCapture capture;
+  run("#if 1\n#include \"closes.h\"\n#endif\nint after;");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics, "pp_test_inc/closes.h:1:2: error: #endif without #if\n");
+  std::vector<std::string> expected = {"int", "in_closes", ";", "int", "after", ";"};
+  EXPECT_EQ(spellings(), expected) << "the includer's group is still open inside the header";
+  remove("pp_test_inc/closes.h");
+}
+
+TEST_F(IncludeTest, AnIncludedFileCannotContinueTheIncludersConditional) {
+  write_file("pp_test_inc/elses.h", "#else\nint in_elses;\n");
+  StderrCapture capture;
+  run("#if 1\n#include \"elses.h\"\n#endif\nint after;");
+  std::string diagnostics = capture.finish();
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics, "pp_test_inc/elses.h:1:2: error: #else without #if\n");
+  remove("pp_test_inc/elses.h");
 }
