@@ -1,4 +1,5 @@
 #include "lexer.h"
+#include "target.h"
 #include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
@@ -131,34 +132,30 @@ static int utf8_decode(const char *s, unsigned long *code_point) {
   return length;
 }
 
-static void put_unit(char *out, int *units, int wide, unsigned long value) {
-  if (wide) {
-    out[*units * 2] = (char)(value & 0xFF);
-    out[*units * 2 + 1] = (char)((value >> 8) & 0xFF);
-  } else {
-    out[*units] = (char)(value & 0xFF);
-  }
+static void put_unit(char *out, int *units, int size, unsigned long value) {
+  for (int i = 0; i < size; i++)
+    out[*units * size + i] = (char)((value >> (8 * i)) & 0xFF);
   (*units)++;
 }
 
-static void put_code_point(char *out, int *units, int wide, unsigned long code_point) {
-  if (wide && code_point > 0xFFFF) {
-    put_unit(out, units, 1, 0xD800 | ((code_point - 0x10000) >> 10));
-    put_unit(out, units, 1, 0xDC00 | (code_point & 0x3FF));
-  } else if (wide || code_point < 0x80) {
-    put_unit(out, units, wide, code_point);
+static void put_code_point(char *out, int *units, int size, unsigned long code_point) {
+  if (size == 2 && code_point > 0xFFFF) {
+    put_unit(out, units, 2, 0xD800 | ((code_point - 0x10000) >> 10));
+    put_unit(out, units, 2, 0xDC00 | (code_point & 0x3FF));
+  } else if (size > 1 || code_point < 0x80) {
+    put_unit(out, units, size, code_point);
   } else if (code_point < 0x800) {
-    put_unit(out, units, 0, 0xC0 | (code_point >> 6));
-    put_unit(out, units, 0, 0x80 | (code_point & 0x3F));
+    put_unit(out, units, 1, 0xC0 | (code_point >> 6));
+    put_unit(out, units, 1, 0x80 | (code_point & 0x3F));
   } else if (code_point < 0x10000) {
-    put_unit(out, units, 0, 0xE0 | (code_point >> 12));
-    put_unit(out, units, 0, 0x80 | ((code_point >> 6) & 0x3F));
-    put_unit(out, units, 0, 0x80 | (code_point & 0x3F));
+    put_unit(out, units, 1, 0xE0 | (code_point >> 12));
+    put_unit(out, units, 1, 0x80 | ((code_point >> 6) & 0x3F));
+    put_unit(out, units, 1, 0x80 | (code_point & 0x3F));
   } else {
-    put_unit(out, units, 0, 0xF0 | (code_point >> 18));
-    put_unit(out, units, 0, 0x80 | ((code_point >> 12) & 0x3F));
-    put_unit(out, units, 0, 0x80 | ((code_point >> 6) & 0x3F));
-    put_unit(out, units, 0, 0x80 | (code_point & 0x3F));
+    put_unit(out, units, 1, 0xF0 | (code_point >> 18));
+    put_unit(out, units, 1, 0x80 | ((code_point >> 12) & 0x3F));
+    put_unit(out, units, 1, 0x80 | ((code_point >> 6) & 0x3F));
+    put_unit(out, units, 1, 0x80 | (code_point & 0x3F));
   }
 }
 
@@ -181,27 +178,28 @@ static void keep_first(const char **error, const char *message) {
 
 const char *decode_literal(const char *spelling, int wide, char *out, int *units) {
   const char *error = NULL;
-  unsigned long limit = wide ? 0xFFFF : 0xFF;
+  int size = wide ? target_current()->wchar_size : 1;
+  unsigned long long limit = (1ull << (8 * size)) - 1;
   const char *s = spelling;
   while (*s) {
     unsigned long value;
     if (*s != '\\') {
       int length = wide ? utf8_decode(s, &value) : 0;
       if (length > 0) {
-        put_code_point(out, units, 1, value);
+        put_code_point(out, units, size, value);
         s += length;
         continue;
       }
       if (wide)
         keep_first(&error, "invalid UTF-8 in a wide literal");
-      put_unit(out, units, wide, (unsigned char)*s++);
+      put_unit(out, units, size, (unsigned char)*s++);
       continue;
     }
 
     int ucn = ucn_at(s, &value);
     if (ucn) {
       if (ucn_is_valid(value))
-        put_code_point(out, units, wide, value);
+        put_code_point(out, units, size, value);
       else
         keep_first(&error, "invalid universal character name");
       s += ucn;
@@ -227,12 +225,13 @@ const char *decode_literal(const char *spelling, int wide, char *out, int *units
         keep_first(&error, "\\x used with no following hex digits");
         continue;
       }
-      value = 0;
+      unsigned long long hex = 0;
       for (; hex_digit(*s) >= 0; s++) {
-        value = value * 16 + (unsigned long)hex_digit(*s);
-        if (value > limit)
+        hex = hex * 16 + (unsigned long long)hex_digit(*s);
+        if (hex > limit)
           keep_first(&error, "hex escape sequence out of range");
       }
+      value = (unsigned long)hex;
     } else if (*s == 'u' || *s == 'U') {
       keep_first(&error, "incomplete universal character name");
       s++;
@@ -241,7 +240,7 @@ const char *decode_literal(const char *spelling, int wide, char *out, int *units
       keep_first(&error, "unknown escape sequence in literal");
       value = (unsigned char)*s++;
     }
-    put_unit(out, units, wide, value);
+    put_unit(out, units, size, value);
   }
   return error;
 }
@@ -249,8 +248,14 @@ const char *decode_literal(const char *spelling, int wide, char *out, int *units
 long long char_constant_value(const char *bytes, int units, int wide) {
   if (units < 1)
     return 0;
-  if (wide)
-    return (unsigned char)bytes[units * 2 - 2] | (unsigned char)bytes[units * 2 - 1] << 8;
+  if (wide) {
+    const target *t = target_current();
+    const unsigned char *last = (const unsigned char *)bytes + (units - 1) * t->wchar_size;
+    unsigned long value = 0;
+    for (int i = t->wchar_size - 1; i >= 0; i--)
+      value = (value << 8) | last[i];
+    return t->wchar_type == PRIM_INT ? (long long)(int)value : (long long)value;
+  }
   if (units == 1)
     return (signed char)bytes[0];
   unsigned int value = 0;

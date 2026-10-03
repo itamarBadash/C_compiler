@@ -1,5 +1,6 @@
 #include "preprocessor.h"
 #include "lexer.h"
+#include "target.h"
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -572,6 +573,8 @@ static void install_predefined_macros(pp *p) {
   predefine(p, "__STDC__", "1");
   predefine(p, "__STDC_VERSION__", "199901L");
   predefine(p, "__STDC_HOSTED__", "1");
+  for (const char *const *name = target_current()->macros; *name; name++)
+    predefine(p, *name, "1");
   predefine_dynamic(p, "__FILE__", DYNAMIC_FILE);
   predefine_dynamic(p, "__LINE__", DYNAMIC_LINE);
 
@@ -699,7 +702,7 @@ static int ev_number(eval *e, const token *t, ev_value *out) {
 
 static int ev_char_value(eval *e, const token *t, int wide, long long *out) {
   const char *s = t->value ? t->value : "";
-  char *bytes = malloc(2 * strlen(s) + 2);
+  char *bytes = malloc(4 * strlen(s) + 4);
   if (bytes == NULL) {
     ev_error(e, "out of memory in #if");
     return 0;

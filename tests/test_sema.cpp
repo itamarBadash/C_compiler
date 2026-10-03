@@ -1,3 +1,4 @@
+#include "target_guard.h"
 #include <algorithm>
 #include <cstring>
 #include <gtest/gtest.h>
@@ -1441,6 +1442,122 @@ TEST(ConstantExpressionTest, IntegerConstantsTakeTheFirstTypeThatFits) {
                     });
 }
 
+TEST(TargetTypeTest, ConstantsFollowTheTargetsSizes) {
+  const struct {
+    const char *expression;
+    long long on_windows;
+    long long on_linux;
+  } rows[] = {
+      {"sizeof(long)", 4, 8},
+      {"sizeof(unsigned long)", 4, 8},
+      {"sizeof(struct { char c; long l; })", 8, 16},
+      {"-1L < 1U", 0, 1},
+      {"-1LL < 0UL", 1, 0},
+      {"0x80000000L - 0x80000001L < 0", 0, 1},
+      {"(long)4294967296 > 0", 0, 1},
+      {"(unsigned long)-1 > 4294967295", 0, 1},
+      {"sizeof L'a'", 2, 4},
+      {"L'\\xffff'", 65535, 65535},
+      {"L'\\U0001F600'", 0xDE00, 0x1F600},
+      {"L'ab'", 98, 98},
+      {"sizeof(L\"ab\")", 6, 12},
+      {"sizeof(L\"\\U0001F600\")", 6, 8},
+      {"sizeof(sizeof 0)", 8, 8},
+  };
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    for (const auto &row : rows) {
+      long long expected = kind == TARGET_LINUX_X64 ? row.on_linux : row.on_windows;
+      SCOPED_TRACE(std::string(kind == TARGET_LINUX_X64 ? "linux: " : "windows: ") +
+                   row.expression);
+      Evaluated result = evaluate_in("", row.expression);
+      EXPECT_EQ(result.parse_errors, 0);
+      EXPECT_EQ(result.errors, 0) << result.diagnostics;
+      EXPECT_TRUE(result.has_value);
+      EXPECT_EQ(result.value, expected);
+    }
+  }
+}
+
+TEST(TargetTypeTest, AWideConstantOnLinuxIsASignedInt) {
+  TargetGuard guard(TARGET_LINUX_X64);
+  expect_values("", {{"L'\\xffffffff'", -1}, {"L'\\x80000000' < 0", 1}, {"L'\\x7fffffff' > 0", 1}});
+  Evaluated too_wide = evaluate_in("", "L'\\x100000000'");
+  EXPECT_EQ(too_wide.parse_errors, 1) << "the decoder reports an escape past 32 bits";
+  EXPECT_EQ(too_wide.errors, 0) << too_wide.diagnostics;
+}
+
+static prim_kind prim_of(ast_node *expression) {
+  type_info *type = expression->expr_type;
+  if (type != nullptr && type->kind == TYPE_ARRAY)
+    type = type->ptr_to;
+  return type != nullptr ? type->prim : PRIM_NONE;
+}
+
+TEST(TargetTypeTest, SizeofPointerDifferencesAndWideCharactersTakeTheTargetsTypes) {
+  const char *src = "char *p, *q;\n"
+                    "void f(void) { sizeof 0; p - q; L'a'; L\"ab\"; 1L + 1u; 2147483648; }\n";
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    bool on_linux = kind == TARGET_LINUX_X64;
+    SCOPED_TRACE(on_linux ? "linux" : "windows");
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.parse_errors, 0);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    std::vector<ast_node *> unary = nodes_of(c, AST_NODE_TYPE_UNARY_OP);
+    std::vector<ast_node *> binary = nodes_of(c, AST_NODE_TYPE_BINARY_OP);
+    std::vector<ast_node *> chars = nodes_of(c, AST_NODE_TYPE_CHAR_LITERAL);
+    std::vector<ast_node *> strings = nodes_of(c, AST_NODE_TYPE_STRING);
+    std::vector<ast_node *> numbers = nodes_of(c, AST_NODE_TYPE_NUMBER);
+    ASSERT_EQ(unary.size(), 1u);
+    ASSERT_EQ(binary.size(), 2u);
+    ASSERT_EQ(chars.size(), 1u);
+    ASSERT_EQ(strings.size(), 1u);
+    EXPECT_EQ(prim_of(unary[0]), on_linux ? PRIM_ULONG : PRIM_ULLONG) << "size_t";
+    EXPECT_EQ(prim_of(binary[0]), on_linux ? PRIM_LONG : PRIM_LLONG) << "ptrdiff_t";
+    EXPECT_EQ(prim_of(chars[0]), on_linux ? PRIM_INT : PRIM_USHORT) << "wchar_t";
+    EXPECT_EQ(prim_of(strings[0]), on_linux ? PRIM_INT : PRIM_USHORT) << "an array of wchar_t";
+    EXPECT_EQ(prim_of(binary[1]), on_linux ? PRIM_LONG : PRIM_ULONG)
+        << "long holds every unsigned int only where it is wider";
+    EXPECT_EQ(prim_of(numbers.back()), on_linux ? PRIM_LONG : PRIM_LLONG)
+        << "2147483648 takes the first of int, long, long long that holds it";
+  }
+}
+
+TEST(TargetTypeTest, AWideStringInitializesAnArrayOfTheTargetsWcharT) {
+  const char *src = "int wi[] = L\"ab\";\n"
+                    "unsigned short wu[] = L\"ab\";\n";
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    bool on_linux = kind == TARGET_LINUX_X64;
+    SCOPED_TRACE(on_linux ? "linux" : "windows");
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.parse_errors, 0);
+    EXPECT_EQ(c.diagnostics, error_at(src, "L\"ab\"", on_linux ? 2 : 1,
+                                      "an array needs a brace-enclosed initializer"));
+    std::vector<ast_node *> accepted = declarations(c, on_linux ? "wi" : "wu");
+    ASSERT_EQ(accepted.size(), 1u);
+    EXPECT_EQ(accepted[0]->var_decl.type->array_size, 3) << "two characters and the terminator";
+  }
+}
+
+TEST(TargetTypeTest, ALongBitFieldIsAsWideAsTheTargetsLong) {
+  const char *src = "struct S { long x : 40; };\n";
+  {
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.parse_errors, 0);
+    EXPECT_EQ(c.diagnostics, error_at(src, "x", 1, "width exceeds its type for bit-field 'x'"));
+  }
+  TargetGuard guard(TARGET_LINUX_X64);
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.diagnostics, "");
+}
+
 TEST(ConstantExpressionTest, BadIntegerConstantsAreReportedOnce) {
   expect_one_error("", {
                            {"18446744073709551616", "integer constant is too large"},
@@ -2611,19 +2728,45 @@ static symbol *record_symbol(const Checked &c, const char *tag) {
   return nullptr;
 }
 
+struct MemberAt {
+  const char *name;
+  long long offset;
+  int bit_offset;
+  int bit_width;
+};
+
+struct RecordLayout {
+  const char *source;
+  long long size;
+  int alignment;
+  std::vector<MemberAt> members;
+};
+
+static void expect_layouts(const std::vector<RecordLayout> &cases) {
+  for (const RecordLayout &test : cases) {
+    SCOPED_TRACE(test.source);
+    Checked c;
+    check(c, test.source);
+    ASSERT_EQ(c.parse_errors, 0);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    symbol *record = record_symbol(c, "R");
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(record->size, test.size);
+    EXPECT_EQ(record->alignment, test.alignment);
+    for (const MemberAt &expected : test.members) {
+      SCOPED_TRACE(expected.name);
+      std::vector<ast_node *> member = declarations(c, expected.name);
+      ASSERT_FALSE(member.empty());
+      ast_node *last = member.back();
+      EXPECT_EQ(last->var_decl.offset, expected.offset);
+      EXPECT_EQ(last->var_decl.bit_offset, expected.bit_offset);
+      EXPECT_EQ(last->var_decl.bit_width, expected.bit_width);
+    }
+  }
+}
+
 TEST(LayoutTest, RecordsFollowThePlatformLayout) {
-  struct MemberAt {
-    const char *name;
-    long long offset;
-    int bit_offset;
-    int bit_width;
-  };
-  const struct {
-    const char *source;
-    long long size;
-    int alignment;
-    std::vector<MemberAt> members;
-  } cases[] = {
+  expect_layouts({
       {"struct R { char c; int i; };\n", 8, 4, {{"c", 0, 0, 0}, {"i", 4, 0, 0}}},
       {"struct R { int i; char c; };\n", 8, 4, {{"i", 0, 0, 0}, {"c", 4, 0, 0}}},
       {"struct R { char c; long double d; };\n", 32, 16, {{"c", 0, 0, 0}, {"d", 16, 0, 0}}},
@@ -2684,27 +2827,54 @@ TEST(LayoutTest, RecordsFollowThePlatformLayout) {
        {{"c", 0, 0, 0}, {"a", 4, 0, 3}, {"b", 4, 3, 4}}},
       {"struct R { struct In { char x; } in; int i; };\n", 8, 4, {{"in", 0, 0, 0}, {"i", 4, 0, 0}}},
       {"struct R { char a, b; int c; };\n", 8, 4, {{"a", 0, 0, 0}, {"b", 1, 0, 0}, {"c", 4, 0, 0}}},
-  };
-  for (const auto &test : cases) {
-    SCOPED_TRACE(test.source);
-    Checked c;
-    check(c, test.source);
-    ASSERT_EQ(c.parse_errors, 0);
-    ASSERT_EQ(c.errors, 0) << c.diagnostics;
-    symbol *record = record_symbol(c, "R");
-    ASSERT_NE(record, nullptr);
-    EXPECT_EQ(record->size, test.size);
-    EXPECT_EQ(record->alignment, test.alignment);
-    for (const MemberAt &expected : test.members) {
-      SCOPED_TRACE(expected.name);
-      std::vector<ast_node *> member = declarations(c, expected.name);
-      ASSERT_FALSE(member.empty());
-      ast_node *last = member.back();
-      EXPECT_EQ(last->var_decl.offset, expected.offset);
-      EXPECT_EQ(last->var_decl.bit_offset, expected.bit_offset);
-      EXPECT_EQ(last->var_decl.bit_width, expected.bit_width);
-    }
-  }
+  });
+}
+
+TEST(LayoutTest, RecordsOnLinuxFollowTheSystemVLayout) {
+  TargetGuard guard(TARGET_LINUX_X64);
+  expect_layouts({
+      {"struct R { char c; long l; };\n", 16, 8, {{"c", 0, 0, 0}, {"l", 8, 0, 0}}},
+      {"struct R { char a : 4; int b : 4; };\n", 4, 4, {{"a", 0, 0, 4}, {"b", 0, 4, 4}}},
+      {"struct R { char a; int b : 3; char c; int d : 5; };\n",
+       4,
+       4,
+       {{"a", 0, 0, 0}, {"b", 0, 8, 3}, {"c", 2, 0, 0}, {"d", 0, 24, 5}}},
+      {"struct R { int a : 3; unsigned b : 5; };\n", 4, 4, {{"a", 0, 0, 3}, {"b", 0, 3, 5}}},
+      {"struct R { _Bool a : 1; int b : 3; };\n", 4, 4, {{"a", 0, 0, 1}, {"b", 0, 1, 3}}},
+      {"struct R { int a : 30; int b : 3; };\n", 8, 4, {{"a", 0, 0, 30}, {"b", 4, 0, 3}}},
+      {"struct R { int a : 29; int b : 3; };\n", 4, 4, {{"a", 0, 0, 29}, {"b", 0, 29, 3}}},
+      {"struct R { int a : 3; char c; int b : 3; };\n",
+       4,
+       4,
+       {{"a", 0, 0, 3}, {"c", 1, 0, 0}, {"b", 0, 16, 3}}},
+      {"struct R { char a : 7; char b : 2; };\n", 2, 1, {{"a", 0, 0, 7}, {"b", 1, 0, 2}}},
+      {"struct R { short a : 10; char b : 7; };\n", 4, 2, {{"a", 0, 0, 10}, {"b", 2, 0, 7}}},
+      {"struct R { char c; long long a : 40; };\n", 8, 8, {{"c", 0, 0, 0}, {"a", 0, 8, 40}}},
+      {"struct R { long a : 40; int b : 3; };\n", 8, 8, {{"a", 0, 0, 40}, {"b", 4, 8, 3}}},
+      {"struct R { char c; int : 4; };\n", 2, 1, {{"c", 0, 0, 0}}},
+      {"struct R { char a; int : 0; char b; };\n", 5, 1, {{"a", 0, 0, 0}, {"b", 4, 0, 0}}},
+      {"struct R { _Bool a : 1; int : 0; _Bool b : 1; };\n",
+       5,
+       1,
+       {{"a", 0, 0, 1}, {"b", 4, 0, 1}}},
+      {"struct R { char a : 3; char c; };\n", 2, 1, {{"a", 0, 0, 3}, {"c", 1, 0, 0}}},
+      {"struct R { char a : 3; char b : 5; char c : 1; };\n",
+       2,
+       1,
+       {{"a", 0, 0, 3}, {"b", 0, 3, 5}, {"c", 1, 0, 1}}},
+      {"struct R { char c; int a : 3; int b : 4; };\n",
+       4,
+       4,
+       {{"c", 0, 0, 0}, {"a", 0, 8, 3}, {"b", 0, 11, 4}}},
+      {"union R { char c; int a : 3; };\n", 4, 4, {{"c", 0, 0, 0}, {"a", 0, 0, 3}}},
+      {"union R { int a : 3; int b : 5; };\n", 4, 4, {{"a", 0, 0, 3}, {"b", 0, 0, 5}}},
+      {"union R { char c[3]; int : 20; };\n", 3, 1, {{"c", 0, 0, 0}}},
+      {"union R { _Bool a : 1; int : 0; };\n", 1, 1, {{"a", 0, 0, 1}}},
+      {"enum E { Y };\nstruct R { enum E a : 2; unsigned b : 2; };\n",
+       4,
+       4,
+       {{"a", 0, 0, 2}, {"b", 0, 2, 2}}},
+  });
 }
 
 TEST(LayoutTest, SizeofReadsTheLayout) {
@@ -2796,29 +2966,35 @@ TEST(LayoutTest, BitFieldsFollowTheConstraints) {
                     "  long long ll : 64;\n"
                     "};\n"
                     "struct Z { char z : 8; unsigned : 32; };\n";
-  Checked c;
-  check(c, src);
-  ASSERT_EQ(c.parse_errors, 0);
-  EXPECT_EQ(c.errors, 10) << c.diagnostics;
-  EXPECT_EQ(c.diagnostics,
-            error_at(src, "d : 3", 1, "invalid type for bit-field 'd'") +
-                error_at(src, "p : 2", 1, "invalid type for bit-field 'p'") +
-                error_at(src, ": 7", 1, "invalid type for an unnamed bit-field") +
-                error_at(src, "w : n", 1,
-                         "width is not an integer constant expression for bit-field 'w'") +
-                error_at(src, "/ 0", 1, "division by zero in a constant expression") +
-                error_at(src, "neg", 1, "negative width for bit-field 'neg'") +
-                error_at(src, "wide", 1, "width exceeds its type for bit-field 'wide'") +
-                error_at(src, "b9", 1, "width exceeds its type for bit-field 'b9'") +
-                error_at(src, "ch :", 1, "width exceeds its type for bit-field 'ch'") +
-                error_at(src, "zero", 1, "zero width for bit-field 'zero'"));
-  symbol *s = record_symbol(c, "S");
-  ASSERT_NE(s, nullptr);
-  EXPECT_EQ(s->alignment, 0) << "a record with a bad bit-field has no layout";
-  symbol *z = record_symbol(c, "Z");
-  ASSERT_NE(z, nullptr);
-  EXPECT_EQ(z->size, 8);
-  EXPECT_EQ(z->alignment, 4);
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    bool on_linux = kind == TARGET_LINUX_X64;
+    SCOPED_TRACE(on_linux ? "linux" : "windows");
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.parse_errors, 0);
+    EXPECT_EQ(c.errors, 10) << c.diagnostics;
+    EXPECT_EQ(c.diagnostics,
+              error_at(src, "d : 3", 1, "invalid type for bit-field 'd'") +
+                  error_at(src, "p : 2", 1, "invalid type for bit-field 'p'") +
+                  error_at(src, ": 7", 1, "invalid type for an unnamed bit-field") +
+                  error_at(src, "w : n", 1,
+                           "width is not an integer constant expression for bit-field 'w'") +
+                  error_at(src, "/ 0", 1, "division by zero in a constant expression") +
+                  error_at(src, "neg", 1, "negative width for bit-field 'neg'") +
+                  error_at(src, "wide", 1, "width exceeds its type for bit-field 'wide'") +
+                  error_at(src, "b9", 1, "width exceeds its type for bit-field 'b9'") +
+                  error_at(src, "ch :", 1, "width exceeds its type for bit-field 'ch'") +
+                  error_at(src, "zero", 1, "zero width for bit-field 'zero'"))
+        << "the constraints are C99's and the same on every target";
+    symbol *s = record_symbol(c, "S");
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->alignment, 0) << "a record with a bad bit-field has no layout";
+    symbol *z = record_symbol(c, "Z");
+    ASSERT_NE(z, nullptr);
+    EXPECT_EQ(z->size, 8);
+    EXPECT_EQ(z->alignment, on_linux ? 1 : 4) << "an unnamed bit-field aligns nothing on Linux";
+  }
 }
 
 TEST(LayoutTest, AMemberTypeThatFailedToResolveAddsNoError) {
