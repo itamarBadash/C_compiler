@@ -57,6 +57,7 @@ typedef struct source_file {
   char *filename;
   token pending;
   int has_pending;
+  cond *conds_at_entry;
   struct source_file *next;
 } source_file;
 
@@ -91,6 +92,7 @@ static void free_tokens(token *toks, int n);
 static void append_token(token **list, int *count, token t);
 
 static const char *pp_current_file(pp *p);
+static void pp_error_in(pp *p, const char *file, int line, int column, const char *message);
 static void pp_error(pp *p, int line, int column, const char *message);
 
 static void free_params(char **params, int count);
@@ -123,6 +125,7 @@ static void install_predefined_macros(pp *p);
 static int pp_emitting(pp *p);
 static void cond_push(pp *p, int condition_true, int line, int column);
 static void cond_pop(pp *p);
+static cond *file_conds(pp *p);
 
 static token_type ev_peek(eval *e);
 static void ev_error(eval *e, const char *message);
@@ -152,14 +155,15 @@ static char *token_spelling(token t);
 static token stringize(token *toks, int n);
 static int paste_tokens(token lhs, token rhs, token *out);
 
-static int collect_args(pp *p, macro *m, arg **out, int *out_count);
+static void report_arguments(pp *p, macro *m, token name, const char *problem);
+static int collect_args(pp *p, macro *m, token name, arg **out, int *out_count);
 static void free_args(arg *args, int n);
 static void expand_token_list(pp *p, token *in, int count, token **out, int *out_count);
 static void expand_arg(pp *p, arg *a);
-static void substitute(pp *p, macro *m, arg *args, int arg_count);
+static void substitute(pp *p, macro *m, arg *args, int arg_count, int leading_space);
 static token make_dynamic_token(pp *p, dynamic_macro kind, token at);
 static int try_pragma_operator(pp *p, token t);
-static int try_expand(pp *p, token t);
+static int try_expand(pp *p, token *t);
 
 static void skip_directive_line(pp *p);
 static void end_directive(pp *p, const char *extra_message);
@@ -176,7 +180,7 @@ static void do_error(pp *p, int line, int column);
 static char *read_header_name(pp *p, int *is_system, int line, int column);
 static char *resolve_include(pp *p, const char *name, int is_system);
 static void do_include(pp *p, int line, int column);
-static void handle_directive(pp *p);
+static void handle_directive(pp *p, int line, int column);
 
 static int is_name(token t) {
   return t.type == TOKEN_IDENTIFIER || token_is_keyword(t.type);
@@ -248,11 +252,15 @@ static const char *pp_current_file(pp *p) {
   return p->sources->lex.file;
 }
 
-static void pp_error(pp *p, int line, int column, const char *message) {
+static void pp_error_in(pp *p, const char *file, int line, int column, const char *message) {
   if (p == NULL)
     return;
   p->error_count++;
-  fprintf(stderr, "%s:%d:%d: error: %s\n", pp_current_file(p), line, column, message);
+  fprintf(stderr, "%s:%d:%d: error: %s\n", file, line, column, message);
+}
+
+static void pp_error(pp *p, int line, int column, const char *message) {
+  pp_error_in(p, pp_current_file(p), line, column, message);
 }
 
 static void free_params(char **params, int count) {
@@ -351,6 +359,7 @@ static int source_push(pp *p, const char *text, const char *filename) {
   sf->spliced = spliced;
   sf->filename = filename ? strdup(filename) : NULL;
   sf->has_pending = 0;
+  sf->conds_at_entry = p->conds;
   sf->next = p->sources;
   lexer_init(&sf->lex, sf->spliced);
   sf->lex.file = filename ? intern_file_name(filename) : NULL;
@@ -414,7 +423,7 @@ static void pop_exhausted(pp *p) {
 
 static token pp_next(pp *p) {
   if (p == NULL || p->sources == NULL) {
-    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL};
+    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0};
     return t;
   }
   if (p->sources->has_pending) {
@@ -424,7 +433,7 @@ static token pp_next(pp *p) {
   pop_exhausted(p);
   if (p->stack != NULL) {
     if (p->stack->pos >= p->stack->count) {
-      token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL};
+      token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0};
       return t;
     }
     return clone_token(p->stack->tokens[p->stack->pos++]);
@@ -619,6 +628,10 @@ static void cond_pop(pp *p) {
   free(c);
 }
 
+static cond *file_conds(pp *p) {
+  return p->sources != NULL ? p->sources->conds_at_entry : NULL;
+}
+
 static token_type ev_peek(eval *e) {
   return (e->pos < e->count) ? e->toks[e->pos].type : TOKEN_EOF;
 }
@@ -674,6 +687,11 @@ static int ev_number(eval *e, const token *t, ev_value *out) {
   int long_count;
   integer_suffix(end, &has_unsigned_suffix, &long_count);
 
+  int decimal = s[0] != '0';
+  if (decimal && !has_unsigned_suffix && raw > (unsigned long long)LLONG_MAX) {
+    ev_error(e, "integer constant is too large for #if");
+    return 0;
+  }
   out->value = (long long)raw;
   out->is_unsigned = has_unsigned_suffix || raw > (unsigned long long)LLONG_MAX;
   return 1;
@@ -750,6 +768,8 @@ static ev_value ev_unary(eval *e, int live) {
   case TOKEN_MINUS: {
     e->pos++;
     ev_value v = ev_unary(e, live);
+    if (live && !v.is_unsigned && v.value == LLONG_MIN)
+      ev_error(e, "integer overflow in #if expression");
     v.value = (long long)(0ULL - (unsigned long long)v.value);
     return v;
   }
@@ -781,6 +801,8 @@ static ev_value ev_multiplicative(eval *e, int live) {
     ev_convert(&v, &rhs);
 
     if (op == TOKEN_STAR) {
+      if (live && !v.is_unsigned && mul_overflows(v.value, rhs.value))
+        ev_error(e, "integer overflow in #if expression");
       v.value = (long long)((unsigned long long)v.value * (unsigned long long)rhs.value);
       continue;
     }
@@ -819,6 +841,9 @@ static ev_value ev_additive(eval *e, int live) {
     e->pos++;
     ev_value rhs = ev_multiplicative(e, live);
     ev_convert(&v, &rhs);
+    if (live && !v.is_unsigned &&
+        (op == TOKEN_PLUS ? add_overflows(v.value, rhs.value) : sub_overflows(v.value, rhs.value)))
+      ev_error(e, "integer overflow in #if expression");
     unsigned long long a = (unsigned long long)v.value;
     unsigned long long b = (unsigned long long)rhs.value;
     v.value = (long long)(op == TOKEN_PLUS ? a + b : a - b);
@@ -847,6 +872,8 @@ static ev_value ev_shift(eval *e, int live) {
     }
     int count = (int)rhs.value;
     if (op == TOKEN_LSHIFT) {
+      if (!v.is_unsigned && v.value > (LLONG_MAX >> count))
+        ev_error(e, "integer overflow in #if expression");
       v.value = (long long)((unsigned long long)v.value << count);
     } else if (v.is_unsigned) {
       v.value = (long long)((unsigned long long)v.value >> count);
@@ -1010,6 +1037,8 @@ static void resolve_defined(pp *p, token *toks, int count, token **out, int *out
     n.column = toks[i].column;
     n.at_line_start = 0;
     n.file = toks[i].file;
+    n.no_expand = 0;
+    n.leading_space = toks[i].leading_space;
     append_token(out, out_count, n);
     i += consumed;
   }
@@ -1100,6 +1129,8 @@ static token stringize(token *toks, int n) {
   out.column = (n > 0) ? toks[0].column : 0;
   out.at_line_start = 0;
   out.file = (n > 0) ? toks[0].file : NULL;
+  out.no_expand = 0;
+  out.leading_space = 0;
 
   size_t cap = 32;
   size_t len = 0;
@@ -1108,15 +1139,12 @@ static token stringize(token *toks, int n) {
     return out;
   text[0] = '\0';
 
-  int prev_line = 0;
-  int prev_end_col = 0;
-
   for (int i = 0; i < n; i++) {
     char *sp = token_spelling(toks[i]);
     if (sp == NULL)
       continue;
 
-    int gap = (i > 0) && (toks[i].line != prev_line || toks[i].column != prev_end_col);
+    int gap = i > 0 && toks[i].leading_space;
 
     size_t need = len + 1 + strlen(sp) * 2 + 1;
     if (need > cap) {
@@ -1132,15 +1160,14 @@ static token stringize(token *toks, int n) {
 
     if (gap)
       text[len++] = ' ';
+    int literal = toks[i].type == TOKEN_STRING || toks[i].type == TOKEN_CHAR_LITERAL ||
+                  toks[i].type == TOKEN_WIDE_STRING || toks[i].type == TOKEN_WIDE_CHAR;
     for (char *c = sp; *c != '\0'; c++) {
-      if (*c == '\\' || *c == '"')
+      if (literal && (*c == '\\' || *c == '"'))
         text[len++] = '\\';
       text[len++] = *c;
     }
     text[len] = '\0';
-
-    prev_line = toks[i].line;
-    prev_end_col = toks[i].column + (int)strlen(sp);
     free(sp);
   }
 
@@ -1180,6 +1207,7 @@ static int paste_tokens(token lhs, token rhs, token *out) {
     first.column = lhs.column;
     first.at_line_start = lhs.at_line_start;
     first.file = lhs.file;
+    first.leading_space = lhs.leading_space;
     *out = first;
     free_token(second);
     free(a);
@@ -1196,7 +1224,13 @@ static int paste_tokens(token lhs, token rhs, token *out) {
   }
 }
 
-static int collect_args(pp *p, macro *m, arg **out, int *out_count) {
+static void report_arguments(pp *p, macro *m, token name, const char *problem) {
+  char message[128];
+  snprintf(message, sizeof message, "%s '%.64s'", problem, m->name);
+  pp_error(p, name.line, name.column, message);
+}
+
+static int collect_args(pp *p, macro *m, token name, arg **out, int *out_count) {
   arg *args = malloc(sizeof(arg));
   if (args == NULL)
     return 0;
@@ -1214,6 +1248,7 @@ static int collect_args(pp *p, macro *m, arg **out, int *out_count) {
     if (t.type == TOKEN_EOF) {
       free_token(t);
       free_args(args, count);
+      report_arguments(p, m, name, "unterminated argument list invoking macro");
       return 0;
     }
 
@@ -1259,6 +1294,7 @@ static int collect_args(pp *p, macro *m, arg **out, int *out_count) {
   }
 
   if (m->is_variadic && count == m->param_count - 1) {
+    report_arguments(p, m, name, "at least one argument is required for '...' in macro");
     arg *tmp = realloc(args, sizeof(arg) * (count + 1));
     if (tmp == NULL) {
       free_args(args, count);
@@ -1274,6 +1310,7 @@ static int collect_args(pp *p, macro *m, arg **out, int *out_count) {
 
   if (count != m->param_count) {
     free_args(args, count);
+    report_arguments(p, m, name, "wrong number of arguments to macro");
     return 0;
   }
 
@@ -1323,7 +1360,7 @@ static void expand_token_list(pp *p, token *in, int count, token **out, int *out
       free_token(t);
       break;
     }
-    if (try_expand(p, t))
+    if (try_expand(p, &t))
       continue;
     append_token(out, out_count, t);
   }
@@ -1350,90 +1387,59 @@ static void expand_arg(pp *p, arg *a) {
   expand_token_list(p, a->raw, a->raw_count, &a->expanded, &a->expanded_count);
 }
 
-static void substitute(pp *p, macro *m, arg *args, int arg_count) {
+static void substitute(pp *p, macro *m, arg *args, int arg_count, int leading_space) {
   token *out = NULL;
   int out_count = 0;
+  int paste = 0;
+  int left_empty = 1;
 
   for (int i = 0; i < m->body_count; i++) {
-    token bt = m->body[i];
-
-    if (m->is_function_like && bt.type == TOKEN_HASH && i + 1 < m->body_count &&
-        is_name(m->body[i + 1])) {
-      int pidx = param_index(m, m->body[i + 1].value);
-      if (pidx >= 0 && pidx < arg_count) {
-        append_token(&out, &out_count, stringize(args[pidx].raw, args[pidx].raw_count));
-        i++;
-        continue;
-      }
+    if (m->body[i].type == TOKEN_HASH_HASH) {
+      paste = 1;
+      continue;
     }
 
-    int idx = -1;
-    if (is_name(bt)) {
-      idx = param_index(m, bt.value);
+    int spaced = m->body[i].leading_space;
+    token *piece = &m->body[i];
+    int piece_count = 1;
+    token stringized = {TOKEN_EOF, NULL, 0, 0, 0, NULL, 0, 0};
+    int hashed = -1;
+    if (m->is_function_like && m->body[i].type == TOKEN_HASH && i + 1 < m->body_count &&
+        is_name(m->body[i + 1]))
+      hashed = param_index(m, m->body[i + 1].value);
+    int idx = is_name(m->body[i]) ? param_index(m, m->body[i].value) : -1;
+    if (hashed >= 0 && hashed < arg_count) {
+      stringized = stringize(args[hashed].raw, args[hashed].raw_count);
+      piece = &stringized;
+      i++;
+    } else if (idx >= 0 && idx < arg_count) {
+      int raw = paste || (i + 1 < m->body_count && m->body[i + 1].type == TOKEN_HASH_HASH);
+      piece = raw ? args[idx].raw : args[idx].expanded;
+      piece_count = raw ? args[idx].raw_count : args[idx].expanded_count;
     }
 
-    if (idx >= 0 && idx < arg_count) {
-
-      int use_raw = 0;
-      if (i > 0 && m->body[i - 1].type == TOKEN_HASH_HASH) {
-        use_raw = 1;
-      }
-      if (i + 1 < m->body_count && m->body[i + 1].type == TOKEN_HASH_HASH) {
-        use_raw = 1;
-      }
-
-      token *src = use_raw ? args[idx].raw : args[idx].expanded;
-      int n = use_raw ? args[idx].raw_count : args[idx].expanded_count;
-      for (int j = 0; j < n; j++) {
-        append_token(&out, &out_count, clone_token(src[j]));
-      }
-    } else {
-      append_token(&out, &out_count, clone_token(bt));
+    int first = 0;
+    token pasted;
+    if (paste && !left_empty && piece_count > 0 &&
+        paste_tokens(out[out_count - 1], piece[0], &pasted)) {
+      free_token(out[out_count - 1]);
+      out[out_count - 1] = pasted;
+      first = 1;
     }
-  }
-  token *final = NULL;
-  int final_count = 0;
-
-  for (int i = 0; i < out_count; i++) {
-    if (out[i].type == TOKEN_HASH_HASH) {
-      if (i + 1 < out_count && out[i + 1].type == TOKEN_HASH_HASH) {
-        free_token(out[i]);
-        continue;
-      }
-
-      int have_left = (final_count > 0);
-      int have_right = (i + 1 < out_count);
-
-      if (!have_right) {
-        free_token(out[i]);
-      } else if (!have_left) {
-        free_token(out[i]);
-        append_token(&final, &final_count, out[i + 1]);
-        i++;
-      } else {
-        token left = final[final_count - 1];
-        final_count--;
-        token right = out[i + 1];
-        token pasted;
-
-        if (paste_tokens(left, right, &pasted)) {
-          free_token(left);
-          free_token(right);
-          append_token(&final, &final_count, pasted);
-        } else {
-          append_token(&final, &final_count, left);
-          append_token(&final, &final_count, right);
-        }
-        free_token(out[i]);
-        i++;
-      }
-    } else {
-      append_token(&final, &final_count, out[i]);
+    for (int j = first; j < piece_count; j++) {
+      token copy = clone_token(piece[j]);
+      if (j == 0)
+        copy.leading_space = spaced;
+      append_token(&out, &out_count, copy);
     }
+    left_empty = paste ? left_empty && piece_count == 0 : piece_count == 0;
+    paste = 0;
+    free_token(stringized);
   }
 
-  free(out);
-  push_token_list(p, m->name, final, final_count);
+  if (out_count > 0)
+    out[0].leading_space = leading_space;
+  push_token_list(p, m->name, out, out_count);
 }
 
 static token make_dynamic_token(pp *p, dynamic_macro kind, token at) {
@@ -1443,6 +1449,8 @@ static token make_dynamic_token(pp *p, dynamic_macro kind, token at) {
   out.column = at.column;
   out.at_line_start = at.at_line_start;
   out.file = at.file;
+  out.no_expand = 0;
+  out.leading_space = at.leading_space;
 
   if (kind == DYNAMIC_LINE) {
     char buffer[32];
@@ -1506,27 +1514,31 @@ static int try_pragma_operator(pp *p, token t) {
   return 1;
 }
 
-static int try_expand(pp *p, token t) {
-  if (!is_name(t)) {
+static int try_expand(pp *p, token *t) {
+  if (!is_name(*t) || t->no_expand) {
     return 0;
   }
 
-  if (try_pragma_operator(p, t)) {
+  if (try_pragma_operator(p, *t)) {
     return 1;
   }
 
-  macro *m = macro_find(p, t.value);
-  if (m == NULL || macro_disabled(p, t.value)) {
+  macro *m = macro_find(p, t->value);
+  if (m == NULL) {
+    return 0;
+  }
+  if (macro_disabled(p, t->value)) {
+    t->no_expand = 1;
     return 0;
   }
 
   if (p->stack == NULL) {
-    p->invocation_line = t.line;
+    p->invocation_line = t->line;
   }
 
   if (m->dynamic != DYNAMIC_NONE) {
-    token value = make_dynamic_token(p, m->dynamic, t);
-    free_token(t);
+    token value = make_dynamic_token(p, m->dynamic, *t);
+    free_token(*t);
     token *list = malloc(sizeof(token));
     if (list == NULL) {
       free_token(value);
@@ -1538,8 +1550,8 @@ static int try_expand(pp *p, token t) {
   }
 
   if (!m->is_function_like) {
-    free_token(t);
-    substitute(p, m, NULL, 0);
+    free_token(*t);
+    substitute(p, m, NULL, 0, t->leading_space);
     return 1;
   }
 
@@ -1552,12 +1564,12 @@ static int try_expand(pp *p, token t) {
 
   arg *args = NULL;
   int arg_count = 0;
-  if (!collect_args(p, m, &args, &arg_count)) {
+  if (!collect_args(p, m, *t, &args, &arg_count)) {
     return 0;
   }
 
-  free_token(t);
-  substitute(p, m, args, arg_count);
+  free_token(*t);
+  substitute(p, m, args, arg_count, t->leading_space);
   free_args(args, arg_count);
   return 1;
 }
@@ -1849,7 +1861,7 @@ static void do_if(pp *p, int line, int column) {
 }
 
 static void do_elif(pp *p, int line, int column) {
-  if (p->conds == NULL) {
+  if (p->conds == file_conds(p)) {
     pp_error(p, line, column, "#elif without #if");
     skip_directive_line(p);
     return;
@@ -1878,7 +1890,7 @@ static void do_elif(pp *p, int line, int column) {
 }
 
 static void do_else(pp *p, int line, int column) {
-  if (p->conds == NULL) {
+  if (p->conds == file_conds(p)) {
     pp_error(p, line, column, "#else without #if");
     skip_directive_line(p);
     return;
@@ -1901,7 +1913,7 @@ static void do_else(pp *p, int line, int column) {
 }
 
 static void do_endif(pp *p, int line, int column) {
-  if (p->conds == NULL) {
+  if (p->conds == file_conds(p)) {
     pp_error(p, line, column, "#endif without #if");
     skip_directive_line(p);
     return;
@@ -2016,56 +2028,75 @@ static void do_error(pp *p, int line, int column) {
   free(message);
 }
 
+static char *join_spellings(token *toks, int count) {
+  char *name = strdup("");
+  size_t len = 0;
+  for (int i = 0; name != NULL && i < count; i++) {
+    char *spelling = token_spelling(toks[i]);
+    if (spelling == NULL)
+      continue;
+    size_t add = strlen(spelling);
+    char *joined = realloc(name, len + add + 1);
+    if (joined == NULL)
+      free(name);
+    else
+      memcpy(joined + len, spelling, add + 1);
+    name = joined;
+    len += add;
+    free(spelling);
+  }
+  return name;
+}
+
 static char *read_header_name(pp *p, int *is_system, int line, int column) {
   *is_system = 0;
-  token t = pp_next(p);
-
-  if (t.type == TOKEN_STRING && !t.at_line_start) {
-    char *name = strdup(t.value ? t.value : "");
-    free_token(t);
-    return name;
-  }
-
-  if (t.type == TOKEN_LT && !t.at_line_start) {
-    free_token(t);
-    *is_system = 1;
-    char *name = strdup("");
-    if (name == NULL)
-      return NULL;
-    size_t len = 0;
-    while (1) {
-      token part = pp_next(p);
-      if (part.type == TOKEN_GT && !part.at_line_start) {
-        free_token(part);
-        return name;
-      }
-      if (part.type == TOKEN_EOF || part.at_line_start) {
-        pp_unget(p, part);
-        pp_error(p, line, column, "missing > at the end of an #include header name");
-        free(name);
-        return NULL;
-      }
-      char *spelling = token_spelling(part);
-      free_token(part);
-      if (spelling == NULL)
-        continue;
-      size_t add = strlen(spelling);
-      char *joined = realloc(name, len + add + 1);
-      if (joined == NULL) {
-        free(spelling);
-        free(name);
-        return NULL;
-      }
-      name = joined;
-      memcpy(name + len, spelling, add + 1);
-      len += add;
-      free(spelling);
+  token *toks = NULL;
+  int count = 0;
+  token terminator;
+  for (;;) {
+    token t = pp_next(p);
+    if (t.type == TOKEN_EOF || t.at_line_start) {
+      terminator = t;
+      break;
     }
+    append_token(&toks, &count, t);
   }
 
-  pp_unget(p, t);
-  pp_error(p, line, column, "expected \"FILE\" or <FILE> after #include");
-  return NULL;
+  if (count > 0 && toks[0].type != TOKEN_STRING && toks[0].type != TOKEN_LT) {
+    token *expanded = NULL;
+    int expanded_count = 0;
+    p->invocation_line = line;
+    expand_token_list(p, toks, count, &expanded, &expanded_count);
+    free_tokens(toks, count);
+    toks = expanded;
+    count = expanded_count;
+  }
+  pp_unget(p, terminator);
+
+  char *name = NULL;
+  int end = 0;
+  if (count > 0 && toks[0].type == TOKEN_STRING) {
+    name = strdup(toks[0].value ? toks[0].value : "");
+    end = 1;
+  } else if (count > 0 && toks[0].type == TOKEN_LT) {
+    end = 1;
+    while (end < count && toks[end].type != TOKEN_GT)
+      end++;
+    if (end == count) {
+      pp_error(p, line, column, "missing > at the end of an #include header name");
+      free_tokens(toks, count);
+      return NULL;
+    }
+    *is_system = 1;
+    name = join_spellings(toks + 1, end - 1);
+    end++;
+  } else {
+    pp_error(p, line, column, "expected \"FILE\" or <FILE> after #include");
+  }
+  if (name != NULL && end < count)
+    pp_error(p, toks[end].line, toks[end].column, "extra tokens after #include");
+  free_tokens(toks, count);
+  return name;
 }
 
 static char *resolve_include(pp *p, const char *name, int is_system) {
@@ -2150,14 +2181,20 @@ static void do_include(pp *p, int line, int column) {
   free(name);
 }
 
-static void handle_directive(pp *p) {
+static void handle_directive(pp *p, int line, int column) {
   if (p == NULL)
     return;
 
+  lexer *lex = &p->sources->lex;
+  int vertical_spaces = lex->vertical_spaces;
+  int processed = pp_emitting(p);
+  const char *file = pp_current_file(p);
   token d = pp_next(p);
 
   if (d.type == TOKEN_EOF || d.at_line_start) {
     pp_unget(p, d);
+    if (processed && lex->vertical_spaces != vertical_spaces)
+      pp_error_in(p, file, line, column, "form feed or vertical tab in a preprocessing directive");
     return;
   }
 
@@ -2194,6 +2231,8 @@ static void handle_directive(pp *p) {
     skip_directive_line(p);
   }
 
+  if (processed && lex->vertical_spaces != vertical_spaces)
+    pp_error_in(p, file, line, column, "form feed or vertical tab in a preprocessing directive");
   free_token(d);
 }
 
@@ -2268,13 +2307,14 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
     token t = pp_next(&p);
 
     if (t.type == TOKEN_EOF) {
+      while (p.conds != file_conds(&p)) {
+        pp_error(&p, p.conds->line, p.conds->column, "unterminated #if");
+        cond_pop(&p);
+      }
       if (p.sources != NULL && p.sources->next != NULL) {
         free_token(t);
         source_pop(&p);
         continue;
-      }
-      for (cond *c = p.conds; c != NULL; c = c->next) {
-        pp_error(&p, c->line, c->column, "unterminated #if");
       }
       token_buf_push(out, t);
       break;
@@ -2282,7 +2322,7 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
 
     if (t.type == TOKEN_HASH && t.at_line_start) {
       free_token(t);
-      handle_directive(&p);
+      handle_directive(&p, t.line, t.column);
       continue;
     }
 
@@ -2291,10 +2331,17 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
       continue;
     }
 
-    if (try_expand(&p, t)) {
+    if (try_expand(&p, &t)) {
       continue;
     }
 
+    if (t.type == TOKEN_UNKNOWN && t.value != NULL) {
+      char message[48];
+      snprintf(message, sizeof message, "unexpected character '%s' in source", t.value);
+      pp_error(&p, t.line, t.column, message);
+    } else if (t.type == TOKEN_IDENTIFIER && strcmp(t.value, "__VA_ARGS__") == 0) {
+      pp_error(&p, t.line, t.column, "__VA_ARGS__ can only appear in a variadic macro");
+    }
     token_buf_push(out, t);
   }
 

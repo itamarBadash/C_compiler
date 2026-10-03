@@ -1311,6 +1311,33 @@ TEST(SemaTest, CallingAnUndeclaredFunctionIsAnError) {
   EXPECT_EQ(c.diagnostics, error_at(src, "missing", 1, "use of undeclared identifier 'missing'"));
 }
 
+TEST(SemaTest, ATypedefNameIsNotAnExpression) {
+  const char *src = "typedef int T;\n"
+                    "int a = T;\n"
+                    "void g(int);\n"
+                    "void f(void) { g(T); }\n"
+                    "int h(void) { return T + 1; }\n"
+                    "int s = sizeof T;\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 4);
+  const std::string message = "expected an expression, found type name 'T'";
+  const std::string declared = note_at(src, "T;", 1, "T");
+  EXPECT_EQ(c.diagnostics, error_at(src, "T;", 2, message) + declared +
+                               error_at(src, "T)", 1, message) + declared +
+                               error_at(src, "T +", 1, message) + declared +
+                               error_at(src, "T;", 3, message) + declared);
+  int uses = 0;
+  for (ast_node *n : nodes_of(c, AST_NODE_TYPE_IDENTIFIER)) {
+    if (std::strcmp(n->tok.value, "T") == 0) {
+      EXPECT_EQ(n->symbol, nullptr) << "a type name used as a value resolves to nothing";
+      uses++;
+    }
+  }
+  EXPECT_EQ(uses, 4);
+}
+
 static symbol *find_symbol(const Checked &c, const char *name, symbol_kind kind) {
   for (symbol *sym = c.table->all_symbols; sym != nullptr; sym = sym->all_next) {
     if (sym->kind == kind && sym->name != nullptr && std::strcmp(sym->name, name) == 0)
@@ -2137,7 +2164,6 @@ TEST(CompatibilityTest, RedeclarationsMustHaveCompatibleTypes) {
       {"char c; signed char c;", 1},
       {"double _Complex z; long double _Complex z;", 1},
       {"double _Complex z; double z;", 1},
-      {"float _Imaginary z; float z;", 1},
       {"int *p; const int *p;", 1},
       {"int *p; int *const p;", 1},
       {"volatile int v; int v;", 1},
@@ -2207,6 +2233,80 @@ TEST(CompatibilityTest, RedeclarationsMustHaveCompatibleTypes) {
     EXPECT_EQ(c.diagnostics.find("conflicting types for") != std::string::npos, test.conflicts == 1)
         << c.diagnostics;
   }
+}
+
+TEST(CompatibilityTest, ADefinitionIsComparedWithItsParametersResolved) {
+  const struct {
+    const char *source;
+    int conflicts;
+  } cases[] = {
+      {"typedef long L; int f(int); int f(L x) { return 0; }", 1},
+      {"typedef int I; int f(int); int f(I x) { return x; }", 0},
+      {"struct A; struct B; int f(struct A *); int f(struct B *x) { return 0; }", 1},
+      {"struct A; int f(struct A *); int f(struct A *x) { return 0; }", 0},
+      {"int f(struct A *); int f(struct A *x) { return 0; }", 1},
+      {"enum E { X }; enum F { Y = -1 }; int f(enum F); int f(enum E x) { return 0; }", 1},
+      {"typedef long L; int f(int); int f(a) L a; { return 0; }", 1},
+      {"typedef int I; int f(int); int f(a) I a; { return a; }", 0},
+      {"struct A; struct B; int f(struct A *); int f(a) struct B *a; { return 0; }", 1},
+      {"struct A; struct B; int (*f(struct A *))(void); int (*f(struct B *x))(void) { return 0; }",
+       1},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    Checked c;
+    check(c, test.source);
+    ASSERT_EQ(c.parse_errors, 0);
+    EXPECT_EQ(c.errors, test.conflicts) << c.diagnostics;
+    EXPECT_EQ(c.diagnostics.find("conflicting types for") != std::string::npos, test.conflicts == 1)
+        << c.diagnostics;
+  }
+}
+
+TEST(CompatibilityTest, ADefinitionsNameIsDeclaredInTheEnclosingScopeAfterItsParameters) {
+  const char *src = "struct A;\n"
+                    "int f(struct A *);\n"
+                    "int f(struct A *a) { return f(a); }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 0) << c.diagnostics;
+  std::vector<ast_node *> prototypes = nodes_of(c, AST_NODE_TYPE_VAR_DECL);
+  std::vector<ast_node *> definitions = nodes_of(c, AST_NODE_TYPE_FUNCTION_DEF);
+  ASSERT_EQ(prototypes.size(), 1u);
+  ASSERT_EQ(definitions.size(), 1u);
+  symbol *f = prototypes[0]->symbol;
+  ASSERT_NE(f, nullptr);
+  EXPECT_EQ(definitions[0]->symbol, f) << "the definition joins the file-scope declaration";
+  EXPECT_TRUE(f->is_defined);
+  int uses = 0;
+  for (ast_node *n : nodes_of(c, AST_NODE_TYPE_IDENTIFIER)) {
+    if (std::strcmp(n->tok.value, "f") == 0) {
+      EXPECT_EQ(n->symbol, f);
+      uses++;
+    }
+  }
+  EXPECT_EQ(uses, 1);
+}
+
+TEST(CompatibilityTest, AnInlineDefinitionThatConflictsKeepsItsKind) {
+  const char *src = "static int hidden;\n"
+                    "typedef int k;\n"
+                    "inline int k(void) { return hidden; }\n"
+                    "int v;\n"
+                    "inline int v(void) { return hidden; }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "k(void)", 1, "redeclaration of 'k'") + note_at(src, "k;", 1, "k") +
+                error_at(src, "hidden; }", 1,
+                         "an inline definition with external linkage cannot refer to internal "
+                         "linkage identifier 'hidden'") +
+                error_at(src, "v(void)", 1, "conflicting kind of symbol for 'v'") +
+                note_at(src, "v;", 1, "v"))
+      << "a definition replacing a typedef is a new inline function; one replacing an object is "
+         "not a function at all";
 }
 
 TEST(CompatibilityTest, ATypeThatFailedToResolveConflictsWithNothing) {
@@ -4017,7 +4117,8 @@ TEST(InlineTest, InlineDefinitionsKeepToThemselves) {
       "void s(void) { int j(void); }\n"
       "inline int j(void) { static int nj; return nj; }\n"
       "static int *after = &hidden;\n"
-      "void l(void) { static int nl; hidden = nl; }\n";
+      "void l(void) { static int nl; hidden = nl; }\n"
+      "static int helper(void) { return 0; }\n";
   Checked c;
   check(c, src);
   ASSERT_EQ(c.parse_errors, 0);
@@ -4072,4 +4173,279 @@ TEST(InitializerTest, UntypedPartsAddNoError) {
                                error_at(broken, "su = 1", 1, "unknown type name 'U'") +
                                error_at(broken, "(U)1", 1, "unknown type name 'U'"))
       << "declarators and initializers with a type that failed to resolve check nothing";
+}
+
+static void expect_clean_source(const char *source) {
+  SCOPED_TRACE(source);
+  Checked c;
+  check(c, source);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 0) << c.diagnostics;
+}
+
+TEST(DeclaratorTest, AnArrayOfUnspecifiedSizeIsACompleteElementType) {
+  expect_clean_source("double maximum(int n, int m, double a[n][m]);\n"
+                      "double maximum(int n, int m, double a[*][*]);\n"
+                      "double maximum(int n, int m, double a[ ][*]);\n"
+                      "double maximum(int n, int m, double a[ ][m]);\n"
+                      "void g(int n, double a[n][*]);\n");
+}
+
+TEST(CompositeTypeTest, CompatibleDeclarationsShareTheCompositeType) {
+  expect_clean_source("int (*p)[];\n"
+                      "int (*p)[3];\n"
+                      "int sp[sizeof(*p) == 12 ? 1 : -1];\n");
+  expect_clean_source("int a10[10];\n"
+                      "int f10(void) { extern int a10[]; return (int)sizeof a10 == 40; }\n");
+  expect_clean_source("int (*q3)[3];\n"
+                      "int (*qu)[];\n"
+                      "void g(int c) {\n"
+                      "  int s1[sizeof(*(c ? qu : q3)) == 12 ? 1 : -1];\n"
+                      "  int s2[sizeof(*(c ? q3 : qu)) == 12 ? 1 : -1];\n"
+                      "  (void)s1; (void)s2;\n"
+                      "}\n");
+  expect_clean_source("int (*fp)();\n"
+                      "int (*fp)(int);\n"
+                      "int use(void) { return fp(1); }\n");
+}
+
+TEST(CompositeTypeTest, APrototypeInOneDeclarationTypesEveryCall) {
+  const char *src = "int (*fp)();\n"
+                    "int (*fp)(int);\n"
+                    "void bad(void) { fp(1, 2); }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.diagnostics, error_at(src, "(1, 2)", 1, "too many arguments in call"))
+      << "the composite type keeps the prototype, so later calls are checked against it";
+}
+
+TEST(CallTest, AVoidArgumentIsAConversionProblem) {
+  const char *src = "void ip(int);\n"
+                    "void gv(void);\n"
+                    "void n(void) { ip(gv()); }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.diagnostics, error_at(src, "()); }", 1, "incompatible types in argument"))
+      << "void is incomplete, but the useful diagnostic is the conversion, not completeness";
+}
+
+TEST(CompositeTypeTest, AnIncompatibleBlockScopeDeclarationStillConflicts) {
+  const char *src = "int b5[5];\n"
+                    "void h(void) { extern int b5[3]; }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 1);
+  EXPECT_NE(c.diagnostics.find("conflicting types for 'b5'"), std::string::npos) << c.diagnostics;
+}
+
+TEST(StatementTest, AGotoCannotEnterTheScopeOfAVariablyModifiedIdentifier) {
+  const char *src = "void f(int n) {\n"
+                    "  goto lab3;\n"
+                    "  {\n"
+                    "    double a[n];\n"
+                    "  lab3:\n"
+                    "    a[0] = 3;\n"
+                    "    goto lab4;\n"
+                    "    a[0] = 5;\n"
+                    "  lab4:\n"
+                    "    a[0] = 6;\n"
+                    "  }\n"
+                    "  goto lab4;\n"
+                    "  goto out;\n"
+                    "out:\n"
+                    "  ;\n"
+                    "}\n"
+                    "void g(int n) {\n"
+                    "back:\n"
+                    "  ;\n"
+                    "  int v[n];\n"
+                    "  goto back;\n"
+                    "  goto after;\n"
+                    "after:\n"
+                    "  ;\n"
+                    "}\n"
+                    "void h(int n) {\n"
+                    "  goto t1;\n"
+                    "  {\n"
+                    "    typedef int VLA[n];\n"
+                    "  t1:\n"
+                    "    ;\n"
+                    "  }\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  const std::string problem =
+      "a goto cannot jump into the scope of an identifier with variably modified type";
+  EXPECT_EQ(c.diagnostics, error_at(src, "goto lab3", 1, problem) +
+                               error_at(src, "goto lab4;\n  goto out", 1, problem) +
+                               error_at(src, "goto t1", 1, problem))
+      << "C99 6.8.6.1p1; jumping within or out of the scope is allowed";
+}
+
+TEST(StatementTest, ASwitchCannotEnterTheScopeOfAVariablyModifiedIdentifier) {
+  const char *src = "void f(int n, int x) {\n"
+                    "  switch (x) { case 1: ; int a[n]; case 2: a[0] = 1; }\n"
+                    "  switch (x) { case 3: ; int b[n]; default: ; }\n"
+                    "  { int d[n]; switch (x) { case 4: d[0] = 1; default: ; } }\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  const std::string problem =
+      "a switch cannot jump into the scope of an identifier with variably modified type";
+  EXPECT_EQ(c.diagnostics, error_at(src, "case 2", 1, problem) +
+                               error_at(src, "default: ; }\n  { int d", 1, problem))
+      << "C99 6.8.4.2p2; a switch entirely inside the scope is allowed";
+}
+
+TEST(DefinitionTest, AStaticFunctionThatIsUsedMustBeDefined) {
+  const char *src = "static int f(void);\n"
+                    "static int g(void);\n"
+                    "static int h(void);\n"
+                    "static int k(void);\n"
+                    "static int k(void) { return 0; }\n"
+                    "static int i;\n"
+                    "int p(void);\n"
+                    "int use(void) { return f() + (int)sizeof(g()) + k() + i + p(); }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "f(void)", 1, "static function used but never defined 'f'"))
+      << "C99 6.9p3; a use inside sizeof with a constant result does not count, and an unused "
+         "declaration needs no definition";
+}
+
+TEST(CompatibilityTest, AnOldStyleDefinitionFixesTheNumberOfParameters) {
+  const struct {
+    const char *source;
+    int conflicts;
+  } cases[] = {
+      {"int g() { return 0; } int g(int);", 1},
+      {"int g(int); int g() { return 0; }", 1},
+      {"int g() { return 0; } int g(void);", 0},
+      {"int g() { return 0; } int g();", 0},
+      {"int g(); int g(int);", 0},
+      {"int f(a) int a; { return a; } int f(int);", 0},
+      {"int f(a) int a; { return a; } int f(int, int);", 1},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    Checked c;
+    check(c, test.source);
+    ASSERT_EQ(c.parse_errors, 0);
+    EXPECT_EQ(c.errors, test.conflicts) << c.diagnostics;
+  }
+}
+
+TEST(LvalueTest, RegisterParametersHaveNoAddress) {
+  const char *src = "void f(register int r) { int *p = &r; (void)p; }\n"
+                    "int g(a) register int a; { int *p = &a; return *p; }\n"
+                    "void h(int r) { int *p = &r; (void)p; }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "&r", 1, "cannot take the address of register object 'r'") +
+                error_at(src, "&a", 1, "cannot take the address of register object 'a'"))
+      << "C99 6.5.3.2p1";
+}
+
+TEST(InlineTest, MainCannotBeInline) {
+  const char *src = "inline int main(void);\n"
+                    "inline int main(void) { return 0; }\n"
+                    "inline int notmain(void) { return 0; }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  const std::string problem = "main cannot be declared inline";
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "main(void);", 1, problem) + error_at(src, "main(void) {", 1, problem))
+      << "C99 6.7.4p4";
+}
+
+TEST(CallTest, AnArgumentNeedsACompleteType) {
+  const char *src = "struct I;\n"
+                    "void g(struct I);\n"
+                    "void old();\n"
+                    "void h(struct I *p) { g(*p); old(*p); }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  const std::string problem = "an argument needs a complete object type";
+  EXPECT_EQ(c.diagnostics, error_at(src, "*p", 2, problem) + error_at(src, "*p", 3, problem))
+      << "C99 6.5.2.2p2; a prototype does not excuse an incomplete argument";
+}
+
+TEST(InitializerTest, AStaticInitializerMustEvaluate) {
+  const char *src = "static int a = 1 / 0;\n"
+                    "static int b = 2147483647 + 1;\n"
+                    "static int ok1 = 1 ? 2 : 1 / 0;\n"
+                    "static int ok2 = 0 && (1 / 0);\n"
+                    "static int ok3 = 2147483647;\n"
+                    "int *const cl = (int[]){1 / 0};\n"
+                    "void f(void) { int r = 1 / 0; (void)r; }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.diagnostics, error_at(src, "/ 0", 1, "division by zero in a constant expression") +
+                               error_at(src, "+ 1", 1, "overflow in a constant expression") +
+                               error_at(src, "/ 0", 4, "division by zero in a constant expression"))
+      << "C99 6.6p4 applies to the constant expressions an initializer requires, not to a value "
+         "computed at run time";
+}
+
+TEST(DeclaratorTest, ImaginaryTypesAreRejected) {
+  const char *src = "float _Imaginary z;\n"
+                    "double _Imaginary *p;\n"
+                    "typedef long double _Imaginary LI;\n"
+                    "double _Complex ok;\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  const std::string problem = "imaginary types are not supported";
+  EXPECT_EQ(c.diagnostics, error_at(src, "z;", 1, problem) + error_at(src, "p;", 1, problem) +
+                               error_at(src, "LI;", 1, problem))
+      << "Annex G is optional, so the keyword's types are rejected rather than silently treated as "
+         "their real type";
+}
+
+TEST(ConstantExpressionTest, ConstantsOutOfRangeAreReportedWhereTheyAreWritten) {
+  const struct {
+    const char *source;
+    const char *problem;
+  } cases[] = {
+      {"unsigned long long a = 99999999999999999999;", "integer constant is too large"},
+      {"unsigned long long a = 18446744073709551615;", "integer constant is too large"},
+      {"long long a = 9223372036854775808;", "integer constant is too large"},
+      {"unsigned long long a = 0xffffffffffffffff;", nullptr},
+      {"unsigned long long a = 18446744073709551615u;", nullptr},
+      {"double a = 1e999;", "floating constant is out of range for its type"},
+      {"float a = 1e39f;", "floating constant is out of range for its type"},
+      {"long double a = 1e400L;", nullptr},
+      {"double a = 1e-999;", nullptr},
+      {"double a = 1e308;", nullptr},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.source);
+    Checked c;
+    check(c, test.source);
+    ASSERT_EQ(c.parse_errors, 0);
+    EXPECT_EQ(c.errors, test.problem == nullptr ? 0 : 1) << c.diagnostics;
+    if (test.problem != nullptr)
+      EXPECT_NE(c.diagnostics.find(test.problem), std::string::npos) << c.diagnostics;
+  }
+}
+
+TEST(ConstantExpressionTest, AConstantOutOfRangeIsStillReportedOnlyOnce) {
+  const char *src = "int a[(int)1e999];\n"
+                    "enum { E = 18446744073709551615 };\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 2) << c.diagnostics;
 }

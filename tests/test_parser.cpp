@@ -3422,6 +3422,15 @@ TEST(TagDeclarationTest, OnlyAStructOrUnionTagDeclaredAloneIsADeclaration) {
       {"int;\nconst;\n", "1:4: error: declaration does not declare anything (at ';')\n"
                          "2:6: error: a declaration needs a type specifier (at ';')\n"
                          "2:6: error: declaration does not declare anything (at ';')\n"},
+      {"struct { int a; };\n", "1:18: error: declaration does not declare anything (at ';')\n"},
+      {"union { int a; };\n", "1:17: error: declaration does not declare anything (at ';')\n"},
+      {"typedef struct { int a; };\n",
+       "1:26: error: declaration does not declare anything (at ';')\n"},
+      {"void f(void) {\n  struct { int a; };\n}\n",
+       "2:20: error: declaration does not declare anything (at ';')\n"},
+      {"struct { int a; } v;\n", ""},
+      {"struct S { int a; };\n", ""},
+      {"enum { A };\n", ""},
       {"struct S a, ;\n", "1:13: error: expected a name in this declaration (at ';')\n"},
       {"struct S *;\n", "1:11: error: expected a name in this declaration (at ';')\n"},
       {"struct *p;\n", "1:8: error: expected a tag name or '{' (at '*')\n"},
@@ -4004,6 +4013,70 @@ TEST(TypedefScopeTest, AHiddenTypedefNameIsNotAType) {
   });
 }
 
+static ast_node *last_declared(ast_node *item) {
+  if (item != nullptr && item->type == AST_NODE_TYPE_DECL_GROUP && item->block.count > 0)
+    item = item->block.statements[item->block.count - 1];
+  return item != nullptr && item->type == AST_NODE_TYPE_VAR_DECL ? item : nullptr;
+}
+
+TEST(TypedefScopeTest, AParenthesizedDeclaratorMayRedeclareATypedefName) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int T;\n"
+                                   "void f(void) { int (T); T = 1; }\n"
+                                   "void g(void) { int (*T); T = 0; }\n"
+                                   "void h(void) { int (T)[2]; T[0] = 1; }\n"
+                                   "void i(void) { int ((T)); T = 1; }\n"
+                                   "void j(void) { int x, (T); T = x; }\n"
+                                   "void k(void) { T (T); T = 1; }\n"
+                                   "struct S { int (T); };\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  const type_kind kinds[] = {TYPE_PRIMITIVE, TYPE_POINTER,   TYPE_ARRAY,
+                             TYPE_PRIMITIVE, TYPE_PRIMITIVE, TYPE_TYPEDEF};
+  for (int i = 0; i < 6; i++) {
+    SCOPED_TRACE(i);
+    ast_node *decl = last_declared(function_body_statement(program, i + 1, 0));
+    ASSERT_NE(decl, nullptr);
+    EXPECT_STREQ(decl->var_decl.var_name, "T");
+    EXPECT_EQ(decl->var_decl.type->kind, kinds[i]);
+  }
+  ast_node *def = leading_struct_def(top_decl(program, 7));
+  ASSERT_NE(def, nullptr);
+  ASSERT_EQ(def->struct_def.member_count, 1);
+  EXPECT_STREQ(def->struct_def.members[0]->var_decl.var_name, "T");
+  EXPECT_EQ(def->struct_def.members[0]->var_decl.type->kind, TYPE_PRIMITIVE);
+  free_ast(program);
+}
+
+TEST(TypedefScopeTest, AParenthesizedTypedefNameInAParameterOrTypeNameIsAParameterList) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int T;\n"
+                                   "void f(int (T));\n"
+                                   "void g(int ((T)));\n"
+                                   "int s = sizeof(int (T));\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  for (int i = 1; i <= 2; i++) {
+    SCOPED_TRACE(i);
+    type_info *fn = top_var_type(program, i);
+    ASSERT_NE(fn, nullptr);
+    ASSERT_EQ(fn->kind, TYPE_FUNCTION);
+    ASSERT_EQ(fn->param_count, 1);
+    EXPECT_EQ(fn->param_names[0], nullptr);
+    type_info *param = fn->param_types[0];
+    ASSERT_EQ(param->kind, TYPE_FUNCTION);
+    ASSERT_EQ(param->param_count, 1);
+    EXPECT_EQ(param->param_types[0]->kind, TYPE_TYPEDEF);
+  }
+  ast_node *s = top_decl(program, 3);
+  ASSERT_NE(s, nullptr);
+  ast_node *init = s->var_decl.init_value;
+  ASSERT_NE(init, nullptr);
+  ASSERT_EQ(init->unary_op.operand->type, AST_NODE_TYPE_CAST);
+  EXPECT_EQ(init->unary_op.operand->cast_expr.type->kind, TYPE_FUNCTION);
+  free_ast(program);
+}
+
 TEST(StatementTest, ADeclarationIsNotAStatement) {
   expect_diagnosed({
       {"void f(int c) { if (c) int x; }", "a declaration is not a statement"},
@@ -4361,4 +4434,30 @@ TEST(ParameterTest, VoidIsOnlyTheEmptyListWhenItIsAloneUnnamedAndUnqualified) {
   expect_clean({"int f(void) { return 0; }", "int f(void *p) { return p != 0; }",
                 "int f(void x) { return 0; }", "int f(void, int a) { return a; }",
                 "int f(const void) { return 0; }"});
+}
+
+TEST(ParameterTest, RegisterOnAParameterIsRecorded) {
+  int errors = -1;
+  ast_node *program = parse_source("void f(register int a, int b);\n"
+                                   "int g(a, b) int a; register char *b; { return a; }\n"
+                                   "void h(int a);\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+
+  type_info *f = top_var_type(program, 0);
+  ASSERT_NE(f, nullptr);
+  ASSERT_NE(f->param_register, nullptr);
+  EXPECT_EQ(f->param_register[0], 1);
+  EXPECT_EQ(f->param_register[1], 0);
+
+  ast_node *g = top_decl(program, 1);
+  ASSERT_NE(g, nullptr);
+  ASSERT_EQ(g->type, AST_NODE_TYPE_FUNCTION_DEF);
+  ASSERT_NE(g->function_def.type->param_register, nullptr);
+  EXPECT_EQ(g->function_def.type->param_register[0], 0);
+  EXPECT_EQ(g->function_def.type->param_register[1], 1);
+
+  EXPECT_EQ(top_var_type(program, 2)->param_register, nullptr)
+      << "the array is allocated only when some parameter is a register";
+  free_ast(program);
 }

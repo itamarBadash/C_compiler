@@ -526,10 +526,10 @@ TEST(LexerTests, ErrorCountStartsAtZero) {
 
 TEST(LexerTests, ErrorsAccumulateRatherThanLatch) {
   lexer lex;
-  lexer_init(&lex, "@ @ @");
-  expect_token(&lex, TOKEN_UNKNOWN, "@");
-  expect_token(&lex, TOKEN_UNKNOWN, "@");
-  expect_token(&lex, TOKEN_UNKNOWN, "@");
+  lexer_init(&lex, "'' '' ''");
+  expect_token(&lex, TOKEN_UNKNOWN);
+  expect_token(&lex, TOKEN_UNKNOWN);
+  expect_token(&lex, TOKEN_UNKNOWN);
   EXPECT_EQ(lex.error_count, 3) << "error_count is a count, not a flag";
 }
 
@@ -537,8 +537,19 @@ TEST(LexerTests, UnknownCharacterTokenCarriesTheCharacter) {
   lexer lex;
   lexer_init(&lex, "@");
   expect_token(&lex, TOKEN_UNKNOWN, "@");
-  EXPECT_EQ(lex.error_count, 1) << "the token's value must be the offending source text, never a "
-                                   "diagnostic message";
+  EXPECT_EQ(lex.error_count, 0) << "a stray character is a preprocessing token (C99 6.4p1); it is "
+                                   "diagnosed only if it becomes a token";
+}
+
+TEST(LexerTests, StrayCharactersArePreprocessingTokensNotErrors) {
+  lexer lex;
+  lexer_init(&lex, "@ \\ $ `");
+  expect_token(&lex, TOKEN_UNKNOWN, "@");
+  expect_token(&lex, TOKEN_UNKNOWN, "\\");
+  expect_token(&lex, TOKEN_UNKNOWN, "$");
+  expect_token(&lex, TOKEN_UNKNOWN, "`");
+  expect_token(&lex, TOKEN_EOF);
+  EXPECT_EQ(lex.error_count, 0);
 }
 
 TEST(LexerTests, OctalEscapesInCharLiteralsLex) {
@@ -637,14 +648,15 @@ TEST(LexerTests, UniversalCharacterNamesExtendIdentifiers) {
   expect_token(&lex, TOKEN_UNKNOWN, "\\");
   expect_token(&lex, TOKEN_IDENTIFIER, "u12");
   expect_token(&lex, TOKEN_EOF);
-  EXPECT_EQ(lex.error_count, 2);
+  EXPECT_EQ(lex.error_count, 1) << "the stray backslash of an incomplete UCN is a preprocessing "
+                                   "token, not a lexer error";
 }
 
 TEST(LexerTests, LexingContinuesAfterAnError) {
   lexer lex;
-  lexer_init(&lex, "int @ x;");
+  lexer_init(&lex, "int '' x;");
   expect_token(&lex, TOKEN_INT, "int");
-  expect_token(&lex, TOKEN_UNKNOWN, "@");
+  expect_token(&lex, TOKEN_UNKNOWN);
   expect_token(&lex, TOKEN_IDENTIFIER, "x");
   expect_token(&lex, TOKEN_SEMICOLON, ";");
   expect_token(&lex, TOKEN_EOF);
@@ -945,7 +957,7 @@ TEST(LexerTests, TokensAndErrorsCarryTheLexersFileAndLineOffset) {
   free(t.value);
 
   lexer lex;
-  lexer_init(&lex, "x\n  @");
+  lexer_init(&lex, "x\n  ''");
   lex.file = "a.c";
   lex.line_offset = 9;
   t = lexer_next_token(&lex);
@@ -959,7 +971,7 @@ TEST(LexerTests, TokensAndErrorsCarryTheLexersFileAndLineOffset) {
   EXPECT_EQ(t.line, 11);
   EXPECT_EQ(t.column, 3);
   free(t.value);
-  EXPECT_EQ(diagnostics, "a.c:11:3: error: unexpected character '@' in source\n");
+  EXPECT_EQ(diagnostics, "a.c:11:3: error: empty character constant\n");
 }
 
 TEST(LexerTests, DigraphsAreTheirPunctuatorsWithTheirOwnSpelling) {
@@ -990,4 +1002,37 @@ TEST(LexerTests, FormFeedAndVerticalTabAreWhitespace) {
   expect_token(&lex, TOKEN_SEMICOLON, ";");
   expect_token(&lex, TOKEN_EOF);
   EXPECT_EQ(lex.error_count, 0);
+}
+
+TEST(LexerTests, VerticalWhitespaceIsCountedOnlyInsideALine) {
+  lexer lex;
+  lexer_init(&lex, "a\f b\v\nc\n\fd \f\n e");
+  EXPECT_EQ(lex.vertical_spaces, 0);
+  expect_token(&lex, TOKEN_IDENTIFIER, "a");
+  expect_token(&lex, TOKEN_IDENTIFIER, "b");
+  EXPECT_EQ(lex.vertical_spaces, 1) << "the form feed between 'a' and 'b' is inside the line";
+  expect_token(&lex, TOKEN_IDENTIFIER, "c");
+  EXPECT_EQ(lex.vertical_spaces, 2) << "the vertical tab before the newline is still inside it";
+  expect_token(&lex, TOKEN_IDENTIFIER, "d");
+  EXPECT_EQ(lex.vertical_spaces, 2) << "a form feed at the start of a line begins the line";
+  expect_token(&lex, TOKEN_IDENTIFIER, "e");
+  EXPECT_EQ(lex.vertical_spaces, 3);
+}
+
+TEST(LexerTests, EveryTokenRecordsWhetherWhitespacePrecededIt) {
+  lexer lex;
+  lexer_init(&lex, "a b(c)/**/d\ne");
+  const struct {
+    const char *value;
+    int leading_space;
+  } expected[] = {{"a", 0}, {"b", 1}, {"(", 0}, {"c", 0},
+                  {")", 0}, {"d", 1}, {"e", 1}, {nullptr, 0}};
+  for (int i = 0; expected[i].value != nullptr; i++) {
+    token t = lexer_next_token(&lex);
+    SCOPED_TRACE(expected[i].value);
+    EXPECT_STREQ(t.value, expected[i].value);
+    EXPECT_EQ(t.leading_space, expected[i].leading_space)
+        << "a comment and a newline are whitespace, just like a space";
+    free(t.value);
+  }
 }

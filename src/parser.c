@@ -13,7 +13,7 @@ typedef enum declaration_context {
 
 static ast_node *parse_declaration(parser *p, declaration_context context);
 static type_info *parse_declarator(parser *p, type_info *base_type, char **out_name,
-                                   source_loc *out_name_loc);
+                                   source_loc *out_name_loc, int allow_abstract);
 static void parser_begin(parser *p);
 static token clone_token(token t);
 
@@ -446,7 +446,15 @@ static void set_param_definition(type_info *fn, int index, ast_node *definition)
   fn->param_definitions[index] = definition;
 }
 
-static void add_param(type_info *fn, char *name, type_info *type, ast_node *definition) {
+static void set_param_register(type_info *fn, int index) {
+  if (!fn->param_register)
+    fn->param_register = calloc(fn->param_count, sizeof(int));
+  if (fn->param_register)
+    fn->param_register[index] = 1;
+}
+
+static void add_param(type_info *fn, char *name, type_info *type, ast_node *definition,
+                      int is_register) {
   fn->param_types = realloc(fn->param_types, sizeof(type_info *) * (fn->param_count + 1));
   fn->param_names = realloc(fn->param_names, sizeof(char *) * (fn->param_count + 1));
   fn->param_types[fn->param_count] = type;
@@ -457,8 +465,14 @@ static void add_param(type_info *fn, char *name, type_info *type, ast_node *defi
         realloc(fn->param_definitions, sizeof(ast_node *) * (size_t)fn->param_count);
     fn->param_definitions[fn->param_count - 1] = NULL;
   }
+  if (fn->param_register) {
+    fn->param_register = realloc(fn->param_register, sizeof(int) * (size_t)fn->param_count);
+    fn->param_register[fn->param_count - 1] = 0;
+  }
   if (definition)
     set_param_definition(fn, fn->param_count - 1, definition);
+  if (is_register)
+    set_param_register(fn, fn->param_count - 1);
 }
 
 static void check_declarator(parser *p, type_info *type, int is_parameter, int is_definition) {
@@ -482,7 +496,7 @@ static int parse_identifier_list(parser *p, type_info *fn) {
       parser_error(p, "expected a parameter name");
       return 0;
     }
-    add_param(fn, strdup(p->current_token.value), NULL, NULL);
+    add_param(fn, strdup(p->current_token.value), NULL, NULL, 0);
     parser_advance(p);
     if (p->current_token.type != TOKEN_COMMA)
       break;
@@ -526,7 +540,7 @@ static int parse_params(parser *p, type_info *fn) {
       parser_error(p, "only register may appear in a parameter declaration");
 
     char *p_name = NULL;
-    type_info *p_type = parse_declarator(p, clone_type_info(p_base), &p_name, NULL);
+    type_info *p_type = parse_declarator(p, clone_type_info(p_base), &p_name, NULL, 1);
     free_type_info(p_base);
     if (!p_type) {
       free(p_name);
@@ -536,7 +550,7 @@ static int parse_params(parser *p, type_info *fn) {
     check_declarator(p, p_type, 1, 0);
     if (p_name)
       parser_define_symbol(p, p_name, PARSER_SYMBOL_ORDINARY);
-    add_param(fn, p_name, p_type, p_def);
+    add_param(fn, p_name, p_type, p_def, p_specs.storage_class == TOKEN_REGISTER);
 
     if (p->current_token.type != TOKEN_COMMA)
       break;
@@ -552,6 +566,8 @@ static int parse_params(parser *p, type_info *fn) {
     fn->param_types = NULL;
     free(fn->param_names);
     fn->param_names = NULL;
+    free(fn->param_register);
+    fn->param_register = NULL;
     fn->param_count = 0;
   }
 
@@ -576,7 +592,7 @@ static int starts_parameter_list(parser *p) {
 }
 
 static type_info *parse_declarator(parser *p, type_info *base_type, char **out_name,
-                                   source_loc *out_name_loc) {
+                                   source_loc *out_name_loc, int allow_abstract) {
   type_info *type = base_type;
   if (out_name)
     *out_name = NULL;
@@ -602,10 +618,10 @@ static type_info *parse_declarator(parser *p, type_info *base_type, char **out_n
   type_info *placeholder = NULL;
   type_info *inner = NULL;
 
-  if (p->current_token.type == TOKEN_LPAREN && !starts_parameter_list(p)) {
+  if (p->current_token.type == TOKEN_LPAREN && (!allow_abstract || !starts_parameter_list(p))) {
     parser_advance(p);
     placeholder = create_type_info(TYPE_UNKNOWN);
-    inner = parse_declarator(p, placeholder, out_name, out_name_loc);
+    inner = parse_declarator(p, placeholder, out_name, out_name_loc, allow_abstract);
     if (!inner) {
       free_type_info(type);
       return NULL;
@@ -865,7 +881,10 @@ static ast_node *finish_group(ast_node *group) {
 static ast_node *declaration_without_declarators(parser *p, type_info *base_type, ast_node *group,
                                                  source_loc start, declaration_context context) {
   int declares_tags = context == DECLARATION_FILE || context == DECLARATION_BLOCK;
-  if (declares_tags && group->block.count == 1)
+  ast_node *definition = group->block.count == 1 ? group->block.statements[0] : NULL;
+  int untagged_record = definition && definition->type == AST_NODE_TYPE_STRUCT_DEF &&
+                        !definition->struct_def.tag_name;
+  if (declares_tags && definition && !untagged_record)
     return finish_group(group);
   if (declares_tags && base_type->tag_name &&
       (base_type->kind == TYPE_STRUCT || base_type->kind == TYPE_UNION)) {
@@ -916,6 +935,8 @@ static int parse_parameter_declarations(parser *p, type_info *fn) {
       }
       fn->param_types[index] = item->var_decl.type;
       item->var_decl.type = NULL;
+      if (item->var_decl.specs.storage_class == TOKEN_REGISTER)
+        set_param_register(fn, index);
       if (definition) {
         set_param_definition(fn, index, definition);
         definition = NULL;
@@ -981,7 +1002,7 @@ static ast_node *parse_declaration(parser *p, declaration_context context) {
     type_info *base_copy = clone_type_info(base_type);
     char *name = NULL;
     source_loc name_loc;
-    type_info *type = parse_declarator(p, base_copy, &name, &name_loc);
+    type_info *type = parse_declarator(p, base_copy, &name, &name_loc, 0);
     int failed = !type;
     ast_node *width = NULL;
     if (!failed && context == DECLARATION_MEMBER && p->current_token.type == TOKEN_COLON) {
@@ -1943,7 +1964,7 @@ static type_info *parse_type_name(parser *p, ast_node **definition) {
   type_info *base = parse_type_specifier(p, definition, NULL);
   if (!base)
     return NULL;
-  type_info *decl = parse_declarator(p, clone_type_info(base), NULL, NULL);
+  type_info *decl = parse_declarator(p, clone_type_info(base), NULL, NULL, 1);
   free_type_info(base);
   if (decl)
     check_declarator(p, decl, 0, 0);

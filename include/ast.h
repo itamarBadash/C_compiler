@@ -90,7 +90,9 @@ typedef struct type_info {
   struct type_info **param_types; // For functions
   char **param_names;
   struct ast_node **param_definitions;
+  int *param_register;
   int has_prototype;
+  int from_definition;
   int param_count; // For functions
   int is_variadic; // For functions (e.g. printf)
   struct ast_node *definition;

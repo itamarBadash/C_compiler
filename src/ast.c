@@ -285,6 +285,9 @@ void free_type_info(type_info *type) {
       free_ast(type->param_definitions[i]);
     free(type->param_definitions);
   }
+  if (type->param_register) {
+    free(type->param_register);
+  }
   if (type->array_size_expr) {
     free_ast(type->array_size_expr);
   }

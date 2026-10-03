@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -277,6 +278,22 @@ int integer_suffix(const char *suffix, int *is_unsigned, int *long_count) {
   return *s == '\0';
 }
 
+int add_overflows(long long a, long long b) {
+  return (b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b);
+}
+
+int sub_overflows(long long a, long long b) {
+  return (b < 0 && a > LLONG_MAX + b) || (b > 0 && a < LLONG_MIN + b);
+}
+
+int mul_overflows(long long a, long long b) {
+  if (a == 0 || b == 0)
+    return 0;
+  if (a > 0)
+    return b > 0 ? a > LLONG_MAX / b : b < LLONG_MIN / a;
+  return b > 0 ? a < LLONG_MIN / b : b < LLONG_MAX / a;
+}
+
 static const char *skip_digits(const char *s, int hex) {
   while (hex ? hex_digit(*s) >= 0 : (*s >= '0' && *s <= '9'))
     s++;
@@ -357,6 +374,7 @@ void lexer_init(lexer *lex, const char *source) {
   lex->error_count = 0;
   lex->file = NULL;
   lex->line_offset = 0;
+  lex->vertical_spaces = 0;
 }
 
 static void lexer_error(lexer *lex, int line, int column, const char *message) {
@@ -394,6 +412,8 @@ static int lexer_skip_whitespace_and_comments(lexer *lex) {
         lex->current_char == '\r' || lex->current_char == '\f' || lex->current_char == '\v') {
       if (lex->current_char == '\n') {
         lex->at_line_start = 1;
+      } else if ((lex->current_char == '\f' || lex->current_char == '\v') && !lex->at_line_start) {
+        lex->vertical_spaces++;
       }
       lexer_advance(lex);
     } else if (lex->current_char == '/' && lexer_peek(lex) == '/') {
@@ -430,6 +450,8 @@ static token lexer_make_token(lexer *lex, token_type type, const char *value) {
   tok.column = lex->column;
   tok.at_line_start = 0;
   tok.file = lex->file;
+  tok.no_expand = 0;
+  tok.leading_space = 0;
   if (value) {
     tok.value = strdup(value);
   } else {
@@ -547,12 +569,13 @@ static token lexer_collect_identifier(lexer *lex) {
 
 token lexer_next_token(lexer *lex) {
   if (!lex || !lex->source) {
-    token tok = {TOKEN_UNKNOWN, NULL, 0, 0, 0, NULL};
+    token tok = {TOKEN_UNKNOWN, NULL, 0, 0, 0, NULL, 0, 0};
     return tok;
   }
 
   int start_line = lex->line;
   int start_column = lex->column;
+  int start_position = lex->position;
 
   if (!lexer_skip_whitespace_and_comments(lex)) {
     lexer_error(lex, start_line, start_column, "unterminated block comment");
@@ -567,6 +590,7 @@ token lexer_next_token(lexer *lex) {
   start_column = lex->column;
 
   int start_of_line = lex->at_line_start;
+  int leading_space = lex->position != start_position;
   lex->at_line_start = 0;
 
   token tok;
@@ -712,14 +736,12 @@ token lexer_next_token(lexer *lex) {
     if (isdigit((unsigned char)lexer_peek(lex))) {
       tok = lexer_collect_number(lex);
     } else if (lexer_peek(lex) == '.' && lex->source[lex->position + 2] == '.') {
+      tok = lexer_make_token(lex, TOKEN_ELLIPSIS, "...");
       lexer_advance(lex);
       lexer_advance(lex);
       lexer_advance(lex);
-      tok.type = TOKEN_ELLIPSIS;
-      tok.value = strdup("...");
     } else {
-      tok.type = TOKEN_DOT;
-      tok.value = strdup(".");
+      tok = lexer_make_token(lex, TOKEN_DOT, ".");
       lexer_advance(lex);
     }
     break;
@@ -824,9 +846,6 @@ token lexer_next_token(lexer *lex) {
       tok = lexer_collect_number(lex);
     } else {
       char text[2] = {lex->current_char, '\0'};
-      char message[64];
-      snprintf(message, sizeof(message), "unexpected character '%c' in source", text[0]);
-      lexer_error(lex, start_line, start_column, message);
       tok = lexer_make_token(lex, TOKEN_UNKNOWN, text);
       lexer_advance(lex);
     }
@@ -835,5 +854,6 @@ token lexer_next_token(lexer *lex) {
   tok.line = start_line + lex->line_offset;
   tok.column = start_column;
   tok.at_line_start = start_of_line;
+  tok.leading_space = leading_space;
   return tok;
 }

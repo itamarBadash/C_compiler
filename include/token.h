@@ -132,5 +132,7 @@ typedef struct token {
   int column;
   int at_line_start;
   const char *file;
+  int no_expand;
+  int leading_space;
 } token;
 #endif //_TOKEN_H_
