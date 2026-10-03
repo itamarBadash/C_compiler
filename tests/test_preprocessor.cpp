@@ -1,3 +1,4 @@
+#include "target_guard.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -360,11 +361,17 @@ TEST_F(PreprocessorTest, GrowthDoublesRatherThanIncrementing) {
     source += "int a" + std::to_string(i) + " = " + std::to_string(i) + ";\n";
   }
 
+  token_buf empty;
+  tb_realloc_calls = 0;
+  pp_run(&empty, "");
+  int fixed_cost = tb_realloc_calls;
+  token_buf_free(&empty);
+
   tb_realloc_calls = 0;
   run(source.c_str());
 
   EXPECT_GT(tb.count, 20000);
-  EXPECT_LT(tb_realloc_calls, 20) << "growth looks linear, not geometric";
+  EXPECT_LT(tb_realloc_calls - fixed_cost, 20) << "growth looks linear, not geometric";
 }
 
 TEST_F(PreprocessorTest, FailedGrowthLeavesTheBufferConsistent) {
@@ -2679,6 +2686,58 @@ TEST_F(PredefinedTest, StdcHostedIsOne) {
   EXPECT_EQ(spellings(), expected);
 }
 
+static std::vector<std::string> expand(const char *source) {
+  token_buf out;
+  pp_run(&out, source);
+  std::vector<std::string> spellings;
+  for (int i = 0; i < out.count; i++) {
+    if (out.tokens[i].type != TOKEN_EOF)
+      spellings.push_back(out.tokens[i].value ? out.tokens[i].value : "<null>");
+  }
+  token_buf_free(&out);
+  return spellings;
+}
+
+static const char *const shared_names[] = {"__x86_64", "__x86_64__", "__amd64", "__amd64__"};
+static const char *const windows_names[] = {"_WIN32",      "_WIN64",      "__WIN32",   "__WIN32__",
+                                            "__WIN64",     "__WIN64__",   "__WINNT",   "__WINNT__",
+                                            "__MINGW32__", "__MINGW64__", "__MSVCRT__"};
+static const char *const linux_names[] = {"__linux",  "__linux__", "__gnu_linux__", "__unix",
+                                          "__unix__", "__ELF__",   "_LP64",         "__LP64__"};
+static const char *const programmer_names[] = {"linux", "unix", "WIN32", "WIN64", "i386"};
+
+static void expect_system_names(const char *const *own, size_t own_count, const char *const *other,
+                                size_t other_count) {
+  for (const char *name : shared_names)
+    EXPECT_EQ(expand(name), std::vector<std::string>({"1"})) << name;
+  for (size_t i = 0; i < own_count; i++)
+    EXPECT_EQ(expand(own[i]), std::vector<std::string>({"1"})) << own[i];
+  for (size_t i = 0; i < other_count; i++)
+    EXPECT_EQ(expand(other[i]), std::vector<std::string>({other[i]})) << other[i];
+  for (const char *name : programmer_names)
+    EXPECT_EQ(expand(name), std::vector<std::string>({name}))
+        << name << " belongs to the programmer (C99 6.10.8p4)";
+}
+
+TEST_F(PredefinedTest, WindowsNamesItsSystemAndNoOther) {
+  TargetGuard guard(TARGET_WINDOWS_X64);
+  expect_system_names(windows_names, sizeof windows_names / sizeof *windows_names, linux_names,
+                      sizeof linux_names / sizeof *linux_names);
+}
+
+TEST_F(PredefinedTest, LinuxNamesItsSystemAndNoOther) {
+  TargetGuard guard(TARGET_LINUX_X64);
+  expect_system_names(linux_names, sizeof linux_names / sizeof *linux_names, windows_names,
+                      sizeof windows_names / sizeof *windows_names);
+}
+
+TEST_F(PredefinedTest, ASystemNameMayBeUndefined) {
+  run("#undef _WIN32\n#ifdef _WIN32\nA\n#else\nB\n#endif\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"B"};
+  EXPECT_EQ(spellings(), expected);
+}
+
 TEST_F(PredefinedTest, DateIsAStringLiteralInTheC99Format) {
   run("__DATE__");
   ASSERT_GE(tb.count, 1);
@@ -3168,6 +3227,26 @@ TEST_F(PreprocessorTest, MultiCharacterAndUniversalCharacterConstantsMatchGcc) {
   EXPECT_EQ(rc, 0);
   std::vector<std::string> expected = {"A", "B", "C"};
   EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(PreprocessorTest, WideCharacterConstantsFollowTheTarget) {
+  {
+    TargetGuard guard(TARGET_LINUX_X64);
+    run("#if L'\\xffffffff' < 0 && L'\\U0001F600' == 0x1F600 && L'ab' == 'b'\nA\n#endif\n"
+        "#if L'\\xffff' == 65535 && L'\\x80000000' == -2147483647 - 1\nB\n#endif\n");
+    EXPECT_EQ(rc, 0);
+    std::vector<std::string> expected = {"A", "B"};
+    EXPECT_EQ(spellings(), expected);
+  }
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    const char *too_wide = kind == TARGET_LINUX_X64 ? "#if L'\\x100000000'\nC\n#endif\n"
+                                                    : "#if L'\\x10000'\nC\n#endif\n";
+    SCOPED_TRACE(too_wide);
+    token_buf out;
+    EXPECT_EQ(pp_run(&out, too_wide), 1) << "one unit is the most a wide constant may hold";
+    token_buf_free(&out);
+  }
 }
 
 TEST_F(PreprocessorTest, AnOutOfRangeCharacterEscapeIsAnError) {

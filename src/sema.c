@@ -1,5 +1,6 @@
 #include "sema.h"
 #include "lexer.h"
+#include "target.h"
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -87,9 +88,10 @@ static int integer_width(prim_kind prim) {
     return 16;
   case PRIM_INT:
   case PRIM_UINT:
+    return 32;
   case PRIM_LONG:
   case PRIM_ULONG:
-    return 32;
+    return target_current()->long_size * 8;
   case PRIM_LLONG:
   case PRIM_ULLONG:
     return 64;
@@ -149,10 +151,11 @@ static long long primitive_size(prim_kind prim) {
     return 2;
   case PRIM_INT:
   case PRIM_UINT:
-  case PRIM_LONG:
-  case PRIM_ULONG:
   case PRIM_FLOAT:
     return 4;
+  case PRIM_LONG:
+  case PRIM_ULONG:
+    return target_current()->long_size;
   case PRIM_LLONG:
   case PRIM_ULLONG:
   case PRIM_DOUBLE:
@@ -329,7 +332,7 @@ static constant evaluate_integer_constant(ast_node *node) {
 }
 
 static constant evaluate_char_constant(ast_node *node) {
-  prim_kind type = node->literal.is_wide ? PRIM_USHORT : PRIM_INT;
+  prim_kind type = node->literal.is_wide ? target_current()->wchar_type : PRIM_INT;
   if (node->literal.length < 1 || !node->literal.bytes)
     return unknown_constant(type);
   long long value =
@@ -438,22 +441,23 @@ static type_layout layout_of(type_info *type) {
 }
 
 static constant evaluate_sizeof_type(type_info *type) {
+  prim_kind size_type = target_current()->size_type;
   type_info *t = resolved_type(type);
   if (t && t->kind == TYPE_ARRAY) {
     if (t->is_vla)
       return non_constant();
     if (t->array_size < 0)
-      return unknown_constant(PRIM_ULLONG);
+      return unknown_constant(size_type);
     constant element = evaluate_sizeof_type(t->ptr_to);
     if (element.status != CONST_VALUE)
       return element;
     return constant_of(
-        convert_value(element.value.bits * (unsigned long long)t->array_size, PRIM_ULLONG));
+        convert_value(element.value.bits * (unsigned long long)t->array_size, size_type));
   }
   type_layout layout = layout_of(t);
   if (!layout.known)
-    return unknown_constant(PRIM_ULLONG);
-  return constant_of(convert_value((unsigned long long)layout.size, PRIM_ULLONG));
+    return unknown_constant(size_type);
+  return constant_of(convert_value((unsigned long long)layout.size, size_type));
 }
 
 static constant evaluate(sema *s, ast_node *node, int evaluated);
@@ -1672,6 +1676,7 @@ static void resolve_member(sema *s, ast_node *member) {
 typedef struct record_layout {
   int is_union;
   long long end;
+  long long bit_end;
   long long size;
   int alignment;
   int unit_size;
@@ -1688,6 +1693,7 @@ static void place(record_layout *layout, ast_node *member, long long size, int a
   long long offset = layout->is_union ? 0 : align_to(layout->end, alignment);
   member->var_decl.offset = offset;
   layout->end = offset + size;
+  layout->bit_end = layout->end * 8;
   if (layout->end > layout->size)
     layout->size = layout->end;
   if (alignment > layout->alignment)
@@ -1701,6 +1707,43 @@ static void report_bitfield(sema *s, ast_node *member, const char *problem) {
   else
     fprintf(stderr, "error: %s for an unnamed bit-field\n", problem);
   s->error_count++;
+}
+
+static void place_microsoft_bitfield(record_layout *layout, ast_node *member, int unit, int bits) {
+  if (bits == 0) {
+    if (layout->unit_size && !layout->is_union) {
+      layout->end = align_to(layout->end, unit);
+      if (unit > layout->alignment)
+        layout->alignment = unit;
+    }
+    layout->unit_size = 0;
+    return;
+  }
+  if (!layout->is_union && layout->unit_size == unit && layout->unit_bits + bits <= unit * 8) {
+    member->var_decl.offset = layout->unit_offset;
+    member->var_decl.bit_offset = layout->unit_bits;
+    layout->unit_bits += bits;
+    return;
+  }
+  place(layout, member, unit, unit);
+  layout->unit_size = unit;
+  layout->unit_offset = member->var_decl.offset;
+  layout->unit_bits = bits;
+}
+
+static void place_system_v_bitfield(record_layout *layout, ast_node *member, int unit, int bits) {
+  int unit_bits = unit * 8;
+  long long start = layout->is_union ? 0 : layout->bit_end;
+  if (bits == 0 || start / unit_bits != (start + bits - 1) / unit_bits)
+    start = align_to(start, unit_bits);
+  member->var_decl.offset = start / unit_bits * unit;
+  member->var_decl.bit_offset = (int)(start % unit_bits);
+  layout->bit_end = start + bits;
+  layout->end = (layout->bit_end + 7) / 8;
+  if (layout->end > layout->size)
+    layout->size = layout->end;
+  if (member->var_decl.var_name && unit > layout->alignment)
+    layout->alignment = unit;
 }
 
 static int lay_out_bitfield(sema *s, record_layout *layout, ast_node *member) {
@@ -1730,29 +1773,14 @@ static int lay_out_bitfield(sema *s, record_layout *layout, ast_node *member) {
   }
   int bits = (int)width.value.bits;
   member->var_decl.bit_width = bits;
-  if (bits == 0) {
-    if (member->var_decl.var_name) {
-      report_bitfield(s, member, "zero width");
-      return 0;
-    }
-    if (layout->unit_size && !layout->is_union) {
-      layout->end = align_to(layout->end, unit);
-      if (unit > layout->alignment)
-        layout->alignment = unit;
-    }
-    layout->unit_size = 0;
-    return 1;
+  if (bits == 0 && member->var_decl.var_name) {
+    report_bitfield(s, member, "zero width");
+    return 0;
   }
-  if (!layout->is_union && layout->unit_size == unit && layout->unit_bits + bits <= unit * 8) {
-    member->var_decl.offset = layout->unit_offset;
-    member->var_decl.bit_offset = layout->unit_bits;
-    layout->unit_bits += bits;
-    return 1;
-  }
-  place(layout, member, unit, unit);
-  layout->unit_size = unit;
-  layout->unit_offset = member->var_decl.offset;
-  layout->unit_bits = bits;
+  if (target_current()->microsoft_bitfields)
+    place_microsoft_bitfield(layout, member, unit, bits);
+  else
+    place_system_v_bitfield(layout, member, unit, bits);
   return 1;
 }
 
@@ -2078,7 +2106,8 @@ static type_info *string_type(sema *s, ast_node *node) {
   type_info array = {0};
   array.kind = TYPE_ARRAY;
   array.array_size = (long long)node->literal.length + 1;
-  array.ptr_to = arithmetic_type(node->literal.is_wide ? PRIM_USHORT : PRIM_CHAR, 0);
+  array.ptr_to =
+      arithmetic_type(node->literal.is_wide ? target_current()->wchar_type : PRIM_CHAR, 0);
   node->is_lvalue = 1;
   return copy_type(s, &array);
 }
@@ -2198,7 +2227,7 @@ static type_info *sizeof_type(sema *s, ast_node *node) {
       report_at(s, node->unary_op.operand->loc,
                 "invalid application of sizeof to an incomplete type");
   }
-  return arithmetic_type(PRIM_ULLONG, 0);
+  return arithmetic_type(target_current()->size_type, 0);
 }
 
 static type_info *unary_type(sema *s, ast_node *node) {
@@ -2262,7 +2291,7 @@ static type_info *binary_result(sema *s, token_type op, ast_node *left, ast_node
     if (points_to_object(a) && is_integer(b))
       return a;
     return points_to_object(a) && points_to_object(b) && comparable_pointers(a, b)
-               ? arithmetic_type(PRIM_LLONG, 0)
+               ? arithmetic_type(target_current()->ptrdiff_type, 0)
                : NULL;
   case TOKEN_LT:
   case TOKEN_GT:
@@ -2716,7 +2745,7 @@ static int is_string_array(type_info *t) {
   type_info *element = t && t->kind == TYPE_ARRAY ? resolved_type(t->ptr_to) : NULL;
   return element && element->kind == TYPE_PRIMITIVE && !element->is_complex &&
          (element->prim == PRIM_CHAR || element->prim == PRIM_SCHAR ||
-          element->prim == PRIM_UCHAR || element->prim == PRIM_USHORT);
+          element->prim == PRIM_UCHAR || element->prim == target_current()->wchar_type);
 }
 
 static int push_frame(initializer *init, type_info *type) {
@@ -2787,7 +2816,7 @@ static void initialize_leaf(initializer *init, type_info *type, ast_node *value)
 }
 
 static long long initialize_string(initializer *init, type_info *array, ast_node *string) {
-  int wide = resolved_type(array->ptr_to)->prim == PRIM_USHORT;
+  int wide = resolved_type(array->ptr_to)->prim == target_current()->wchar_type;
   if (wide != string->literal.is_wide) {
     report_conversion(init->s, string->loc, "incompatible types", "initialization");
     return -1;
@@ -2985,7 +3014,8 @@ static void type_expression(sema *s, ast_node *node) {
     node->expr_type = number_type(s, node);
     break;
   case AST_NODE_TYPE_CHAR_LITERAL:
-    node->expr_type = arithmetic_type(node->literal.is_wide ? PRIM_USHORT : PRIM_INT, 0);
+    node->expr_type =
+        arithmetic_type(node->literal.is_wide ? target_current()->wchar_type : PRIM_INT, 0);
     break;
   case AST_NODE_TYPE_STRING:
     node->expr_type = string_type(s, node);

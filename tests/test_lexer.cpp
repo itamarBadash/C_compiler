@@ -1,4 +1,5 @@
 
+#include "target_guard.h"
 #include <cstring>
 #include <gtest/gtest.h>
 #include <string>
@@ -735,13 +736,16 @@ struct Decoded {
 };
 
 static Decoded decode(const char *spelling, int wide) {
-  std::vector<char> bytes(2 * strlen(spelling) + 2, 'Z');
+  int size = wide ? target_current()->wchar_size : 1;
+  std::vector<char> bytes(4 * strlen(spelling) + 4, 'Z');
   int count = 0;
   const char *error = decode_literal(spelling, wide, bytes.data(), &count);
   Decoded out;
   for (int i = 0; i < count; i++) {
-    unsigned low = (unsigned char)bytes[wide ? 2 * i : i];
-    out.units.push_back(wide ? low | (unsigned char)bytes[2 * i + 1] << 8 : low);
+    unsigned unit = 0;
+    for (int b = size - 1; b >= 0; b--)
+      unit = unit << 8 | (unsigned char)bytes[i * size + b];
+    out.units.push_back(unit);
   }
   out.error = error ? error : "";
   return out;
@@ -811,6 +815,27 @@ TEST(DecodeLiteralTest, EscapesUniversalCharacterNamesAndUtf8DecodeToCodeUnits) 
   }
 }
 
+TEST(DecodeLiteralTest, WideLiteralsOnLinuxAreUtf32) {
+  TargetGuard guard(TARGET_LINUX_X64);
+  const DecodeCase cases[] = {
+      {"ab", 1, {'a', 'b'}, ""},
+      {"\\U0001F600\\u00e9", 1, {0x1F600, 0xe9}, ""},
+      {"\xf0\x9f\x98\x80", 1, {0x1F600}, ""},
+      {"\\U00010000\\U0010FFFF", 1, {0x10000, 0x10FFFF}, ""},
+      {"\\xffffffff\\x10000\\777", 1, {0xffffffff, 0x10000, 0x1ff}, ""},
+      {"\\x100000000", 1, {0}, "hex escape sequence out of range"},
+      {"\\x1ffffffff", 1, {0xffffffff}, "hex escape sequence out of range"},
+      {"\\u00e9\\x41", 0, {0xc3, 0xa9, 0x41}, ""},
+      {"\\x100", 0, {0x00}, "hex escape sequence out of range"},
+  };
+  for (const DecodeCase &test : cases) {
+    SCOPED_TRACE(std::string(test.wide ? "wide " : "narrow ") + test.spelling);
+    Decoded got = decode(test.spelling, test.wide);
+    EXPECT_EQ(got.units, test.units);
+    EXPECT_EQ(got.error, test.error);
+  }
+}
+
 TEST(DecodeLiteralTest, DecodingAppendsAfterTheUnitsAlreadyThere) {
   char bytes[16];
   int units = 0;
@@ -847,6 +872,28 @@ TEST(DecodeLiteralTest, CharacterConstantValuesFollowGcc) {
     EXPECT_EQ(char_constant_value((const char *)test.bytes.data(), units, test.wide), test.value)
         << "wide " << test.wide << ", " << units << " units";
   }
+}
+
+TEST(DecodeLiteralTest, WideCharacterConstantsOnLinuxAreInts) {
+  TargetGuard guard(TARGET_LINUX_X64);
+  const struct {
+    std::vector<unsigned char> bytes;
+    long long value;
+  } cases[] = {
+      {{}, 0},
+      {{'a', 0, 0, 0}, 97},
+      {{'a', 0, 0, 0, 'b', 0, 0, 0}, 98},
+      {{0x00, 0xf6, 0x01, 0x00}, 0x1F600},
+      {{0xff, 0xff, 0xff, 0x7f}, 2147483647},
+      {{0xff, 0xff, 0xff, 0xff}, -1},
+      {{0x00, 0x00, 0x00, 0x80}, -2147483647LL - 1},
+  };
+  for (const auto &test : cases) {
+    int units = (int)test.bytes.size() / 4;
+    EXPECT_EQ(char_constant_value((const char *)test.bytes.data(), units, 1), test.value)
+        << units << " units";
+  }
+  EXPECT_EQ(char_constant_value("\xff", 1, 0), -1) << "narrow constants do not change";
 }
 
 TEST(LexerTests, NumbersArePreprocessingNumbers) {

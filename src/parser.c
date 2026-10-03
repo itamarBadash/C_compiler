@@ -1,4 +1,5 @@
 #include "parser.h"
+#include "target.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,7 +93,8 @@ static void decode_pieces(parser *p, ast_node *node, const token *pieces, int co
   size_t total = 0;
   for (int i = 0; i < count; i++)
     total += pieces[i].value ? strlen(pieces[i].value) : 0;
-  node->literal.bytes = malloc(2 * total + 2);
+  int unit = node->literal.is_wide ? target_current()->wchar_size : 1;
+  node->literal.bytes = malloc((size_t)unit * (total + 1));
   if (!node->literal.bytes)
     return;
   for (int i = 0; i < count; i++) {
@@ -102,7 +104,7 @@ static void decode_pieces(parser *p, ast_node *node, const token *pieces, int co
     if (error)
       parser_error_at(p, pieces[i], error);
   }
-  memset(node->literal.bytes + node->literal.length * (node->literal.is_wide ? 2 : 1), 0, 2);
+  memset(node->literal.bytes + (size_t)node->literal.length * (size_t)unit, 0, (size_t)unit);
 }
 
 static type_info *clone_type_info(type_info *type) {

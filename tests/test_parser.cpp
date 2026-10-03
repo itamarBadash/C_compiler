@@ -1,3 +1,4 @@
+#include "target_guard.h"
 #include <cstring>
 #include <direct.h>
 #include <fstream>
@@ -1833,6 +1834,29 @@ TEST_F(ParserTest, EveryPieceOfAWideConcatenationIsDecodedWide) {
   ASSERT_EQ(init->literal.length, 3);
   EXPECT_EQ(std::vector<char>(init->literal.bytes, init->literal.bytes + 8),
             std::vector<char>({'\xff', '\xff', 'a', 0, '\xac', 0x20, 0, 0}));
+  free_ast(node);
+}
+
+TEST_F(ParserTest, WideLiteralsOnLinuxHoldThirtyTwoBitUnits) {
+  TargetGuard guard(TARGET_LINUX_X64);
+  std::vector<char> stale(4 * (20 + 1), '\xaa');
+  char *recycled = (char *)malloc(stale.size());
+  ASSERT_NE(recycled, nullptr);
+  memcpy(recycled, stale.data(), stale.size());
+  free(recycled);
+  setup_parser("int *s = L\"\\U0001F600\" L\"\\xffffffff\"; int c = L'\\u20ac';");
+  ast_node *node = parse_program(&p);
+  EXPECT_EQ(p.had_error, 0) << "\\xffffffff fits a 32-bit unit";
+  ast_node *s = node->program.declarations[0]->var_decl.init_value;
+  ASSERT_EQ(s->literal.length, 2) << "one unit per character, no surrogate pair";
+  EXPECT_EQ(
+      std::vector<char>(s->literal.bytes, s->literal.bytes + 12),
+      std::vector<char>({0x00, '\xf6', 0x01, 0x00, '\xff', '\xff', '\xff', '\xff', 0, 0, 0, 0}))
+      << "the terminator is a whole 4-byte unit";
+  ast_node *c = node->program.declarations[1]->var_decl.init_value;
+  ASSERT_EQ(c->literal.length, 1);
+  EXPECT_EQ(std::vector<char>(c->literal.bytes, c->literal.bytes + 8),
+            std::vector<char>({'\xac', 0x20, 0, 0, 0, 0, 0, 0}));
   free_ast(node);
 }
 
