@@ -59,6 +59,7 @@ typedef struct source_file {
   token pending;
   int has_pending;
   cond *conds_at_entry;
+  int search_index;
   struct source_file *next;
 } source_file;
 
@@ -71,6 +72,11 @@ typedef struct pp {
   cond *conds;
   const char **include_dirs;
   int include_dir_count;
+  const char **system_dirs;
+  int system_dir_count;
+  int pack;
+  int *pack_stack;
+  int pack_depth;
 } pp;
 
 typedef struct eval {
@@ -103,7 +109,7 @@ static void free_macro(macro *m);
 static char *pp_read_file(const char *path);
 static int file_exists(const char *path);
 static char *join_path(const char *dir, const char *name);
-static int source_push(pp *p, const char *text, const char *filename);
+static int source_push(pp *p, const char *text, const char *filename, int system_header);
 static void source_pop(pp *p);
 
 static int pp_init(pp *p, const char *source, const char *filename);
@@ -153,7 +159,7 @@ static void resolve_defined(pp *p, token *toks, int count, token **out, int *out
 static int eval_condition(pp *p, int line, int column);
 
 static char *token_spelling(token t);
-static token stringize(token *toks, int n);
+static token stringize(token hash, token *toks, int n);
 static int paste_tokens(token lhs, token rhs, token *out);
 
 static void report_arguments(pp *p, macro *m, token name, const char *problem);
@@ -177,10 +183,13 @@ static void do_elif(pp *p, int line, int column);
 static void do_else(pp *p, int line, int column);
 static void do_endif(pp *p, int line, int column);
 static void do_line(pp *p, int line, int column);
+static void do_pragma(pp *p, int line, int column);
+static void do_pragma_operator(pp *p, token text, int line, int column);
 static void do_error(pp *p, int line, int column);
 static char *read_header_name(pp *p, int *is_system, int line, int column);
-static char *resolve_include(pp *p, const char *name, int is_system);
-static void do_include(pp *p, int line, int column);
+static char *resolve_include(pp *p, const char *name, int is_system, int next, int *system_header,
+                             int *found_at);
+static void do_include(pp *p, int line, int column, int next);
 static void handle_directive(pp *p, int line, int column);
 
 static int is_name(token t) {
@@ -346,7 +355,7 @@ static char *join_path(const char *dir, const char *name) {
   return out;
 }
 
-static int source_push(pp *p, const char *text, const char *filename) {
+static int source_push(pp *p, const char *text, const char *filename, int system_header) {
   if (p == NULL || text == NULL)
     return 0;
   char *spliced = pp_splice_lines(text);
@@ -361,9 +370,11 @@ static int source_push(pp *p, const char *text, const char *filename) {
   sf->filename = filename ? strdup(filename) : NULL;
   sf->has_pending = 0;
   sf->conds_at_entry = p->conds;
+  sf->search_index = -2;
   sf->next = p->sources;
   lexer_init(&sf->lex, sf->spliced);
   sf->lex.file = filename ? intern_file_name(filename) : NULL;
+  sf->lex.system_header = system_header;
   p->sources = sf;
   return 1;
 }
@@ -384,11 +395,11 @@ static void source_pop(pp *p) {
 
 static int pp_init(pp *p, const char *source, const char *filename) {
   *p = (pp){0};
-  if (!source_push(p, source, filename)) {
+  if (!source_push(p, source, filename, 0)) {
     return 0;
   }
   install_predefined_macros(p);
-  return 1;
+  return source_push(p, target_current()->predefines, "<built-in>", 1);
 }
 
 static void pp_destroy(pp *p) {
@@ -410,6 +421,7 @@ static void pp_destroy(pp *p) {
     p->macros = m->next;
     free_macro(m);
   }
+  free(p->pack_stack);
 }
 
 static void pop_exhausted(pp *p) {
@@ -424,7 +436,7 @@ static void pop_exhausted(pp *p) {
 
 static token pp_next(pp *p) {
   if (p == NULL || p->sources == NULL) {
-    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0};
+    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0, 0, 0};
     return t;
   }
   if (p->sources->has_pending) {
@@ -434,7 +446,7 @@ static token pp_next(pp *p) {
   pop_exhausted(p);
   if (p->stack != NULL) {
     if (p->stack->pos >= p->stack->count) {
-      token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0};
+      token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0, 0, 0};
       return t;
     }
     return clone_token(p->stack->tokens[p->stack->pos++]);
@@ -573,8 +585,14 @@ static void install_predefined_macros(pp *p) {
   predefine(p, "__STDC__", "1");
   predefine(p, "__STDC_VERSION__", "199901L");
   predefine(p, "__STDC_HOSTED__", "1");
-  for (const char *const *name = target_current()->macros; *name; name++)
-    predefine(p, *name, "1");
+  predefine(p, "__GNUC__", "4");
+  predefine(p, "__GNUC_MINOR__", "2");
+  predefine(p, "__GNUC_PATCHLEVEL__", "1");
+  predefine(p, "__GNUC_STDC_INLINE__", "1");
+  predefine(p, "__STRICT_ANSI__", "1");
+  predefine(p, "__NO_INLINE__", "1");
+  predefine(p, "__FLT_EVAL_METHOD__", "0");
+  predefine(p, "__USER_LABEL_PREFIX__", "");
   predefine_dynamic(p, "__FILE__", DYNAMIC_FILE);
   predefine_dynamic(p, "__LINE__", DYNAMIC_LINE);
 
@@ -1042,6 +1060,8 @@ static void resolve_defined(pp *p, token *toks, int count, token **out, int *out
     n.file = toks[i].file;
     n.no_expand = 0;
     n.leading_space = toks[i].leading_space;
+    n.system_header = toks[i].system_header;
+    n.pack = 0;
     append_token(out, out_count, n);
     i += consumed;
   }
@@ -1124,16 +1144,19 @@ static char *token_spelling(token t) {
   return out;
 }
 
-static token stringize(token *toks, int n) {
+static token stringize(token hash, token *toks, int n) {
+  token from = n > 0 ? toks[0] : hash;
   token out;
   out.type = TOKEN_STRING;
   out.value = NULL;
-  out.line = (n > 0) ? toks[0].line : 0;
-  out.column = (n > 0) ? toks[0].column : 0;
+  out.line = from.line;
+  out.column = from.column;
   out.at_line_start = 0;
-  out.file = (n > 0) ? toks[0].file : NULL;
+  out.file = from.file;
   out.no_expand = 0;
   out.leading_space = 0;
+  out.system_header = from.system_header;
+  out.pack = 0;
 
   size_t cap = 32;
   size_t len = 0;
@@ -1211,6 +1234,7 @@ static int paste_tokens(token lhs, token rhs, token *out) {
     first.at_line_start = lhs.at_line_start;
     first.file = lhs.file;
     first.leading_space = lhs.leading_space;
+    first.system_header = lhs.system_header;
     *out = first;
     free_token(second);
     free(a);
@@ -1405,14 +1429,14 @@ static void substitute(pp *p, macro *m, arg *args, int arg_count, int leading_sp
     int spaced = m->body[i].leading_space;
     token *piece = &m->body[i];
     int piece_count = 1;
-    token stringized = {TOKEN_EOF, NULL, 0, 0, 0, NULL, 0, 0};
+    token stringized = {TOKEN_EOF, NULL, 0, 0, 0, NULL, 0, 0, 0, 0};
     int hashed = -1;
     if (m->is_function_like && m->body[i].type == TOKEN_HASH && i + 1 < m->body_count &&
         is_name(m->body[i + 1]))
       hashed = param_index(m, m->body[i + 1].value);
     int idx = is_name(m->body[i]) ? param_index(m, m->body[i].value) : -1;
     if (hashed >= 0 && hashed < arg_count) {
-      stringized = stringize(args[hashed].raw, args[hashed].raw_count);
+      stringized = stringize(m->body[i], args[hashed].raw, args[hashed].raw_count);
       piece = &stringized;
       i++;
     } else if (idx >= 0 && idx < arg_count) {
@@ -1454,6 +1478,8 @@ static token make_dynamic_token(pp *p, dynamic_macro kind, token at) {
   out.file = at.file;
   out.no_expand = 0;
   out.leading_space = at.leading_space;
+  out.system_header = at.system_header;
+  out.pack = 0;
 
   if (kind == DYNAMIC_LINE) {
     char buffer[32];
@@ -1503,6 +1529,7 @@ static int try_pragma_operator(pp *p, token t) {
     free_token(t);
     return 1;
   }
+  do_pragma_operator(p, text, t.line, t.column);
   free_token(text);
 
   token close = pp_next(p);
@@ -1995,6 +2022,116 @@ static void do_line(pp *p, int line, int column) {
   pp_unget(p, terminator);
 }
 
+static int is_word(const token *t, const char *word) {
+  return t->type == TOKEN_IDENTIFIER && t->value != NULL && strcmp(t->value, word) == 0;
+}
+
+static int pack_value(const token *t) {
+  if (t->type != TOKEN_NUMBER || t->value == NULL ||
+      classify_number(t->value, NULL) != NUMBER_INTEGER)
+    return 0;
+  unsigned long long n = strtoull(t->value, NULL, 0);
+  return n == 1 || n == 2 || n == 4 || n == 8 || n == 16 ? (int)n : 0;
+}
+
+static void push_pack(pp *p) {
+  int *stack = realloc(p->pack_stack, sizeof(int) * (size_t)(p->pack_depth + 1));
+  if (stack == NULL)
+    return;
+  p->pack_stack = stack;
+  p->pack_stack[p->pack_depth++] = p->pack;
+}
+
+static void apply_pack(pp *p, token *toks, int count, int line, int column) {
+  int bracketed =
+      count >= 2 && toks[0].type == TOKEN_LPAREN && toks[count - 1].type == TOKEN_RPAREN;
+  token *args = toks + 1;
+  int n = count - 2;
+  if (bracketed && n == 0) {
+    p->pack = 0;
+  } else if (bracketed && n == 1 && pack_value(&args[0])) {
+    p->pack = pack_value(&args[0]);
+  } else if (bracketed && n == 1 && is_word(&args[0], "push")) {
+    push_pack(p);
+  } else if (bracketed && n == 3 && is_word(&args[0], "push") && args[1].type == TOKEN_COMMA &&
+             pack_value(&args[2])) {
+    push_pack(p);
+    p->pack = pack_value(&args[2]);
+  } else if (bracketed && n == 1 && is_word(&args[0], "pop")) {
+    if (p->pack_depth == 0)
+      pp_error(p, line, column, "#pragma pack(pop) without a matching push");
+    else
+      p->pack = p->pack_stack[--p->pack_depth];
+  } else {
+    pp_error(p, line, column, "malformed #pragma pack");
+  }
+}
+
+static void do_pragma(pp *p, int line, int column) {
+  token first = pp_next(p);
+  if (first.type == TOKEN_EOF || first.at_line_start || !is_word(&first, "pack")) {
+    pp_unget(p, first);
+    skip_directive_line(p);
+    return;
+  }
+  free_token(first);
+
+  token *raw = NULL;
+  int raw_count = 0;
+  token terminator;
+  for (;;) {
+    token t = pp_next(p);
+    if (t.type == TOKEN_EOF || t.at_line_start) {
+      terminator = t;
+      break;
+    }
+    append_token(&raw, &raw_count, t);
+  }
+  token *expanded = NULL;
+  int expanded_count = 0;
+  expand_token_list(p, raw, raw_count, &expanded, &expanded_count);
+  free_tokens(raw, raw_count);
+  apply_pack(p, expanded, expanded_count, line, column);
+  free_tokens(expanded, expanded_count);
+  pp_unget(p, terminator);
+}
+
+static void do_pragma_operator(pp *p, token text, int line, int column) {
+  const char *s = text.value ? text.value : "";
+  char *plain = malloc(strlen(s) + 1);
+  if (plain == NULL)
+    return;
+  size_t n = 0;
+  for (const char *c = s; *c != '\0'; c++) {
+    if (*c == '\\' && (c[1] == '"' || c[1] == '\\'))
+      c++;
+    plain[n++] = *c;
+  }
+  plain[n] = '\0';
+
+  lexer lex;
+  lexer_init(&lex, plain);
+  token *toks = NULL;
+  int count = 0;
+  for (;;) {
+    token t = lexer_next_token(&lex);
+    if (t.type == TOKEN_EOF) {
+      free_token(t);
+      break;
+    }
+    append_token(&toks, &count, t);
+  }
+  if (count > 0 && is_word(&toks[0], "pack")) {
+    token *expanded = NULL;
+    int expanded_count = 0;
+    expand_token_list(p, toks + 1, count - 1, &expanded, &expanded_count);
+    apply_pack(p, expanded, expanded_count, line, column);
+    free_tokens(expanded, expanded_count);
+  }
+  free_tokens(toks, count);
+  free(plain);
+}
+
 static void do_error(pp *p, int line, int column) {
   char *message = strdup("#error");
   if (message == NULL) {
@@ -2102,8 +2239,16 @@ static char *read_header_name(pp *p, int *is_system, int line, int column) {
   return name;
 }
 
-static char *resolve_include(pp *p, const char *name, int is_system) {
-  if (!is_system && p->sources != NULL && p->sources->filename != NULL) {
+static char *resolve_include(pp *p, const char *name, int is_system, int next, int *system_header,
+                             int *found_at) {
+  *system_header = 0;
+  *found_at = -1;
+  int start = 0;
+  if (next && p->sources != NULL && p->sources->search_index >= -1)
+    start = p->sources->search_index + 1;
+  else
+    next = 0;
+  if (!is_system && !next && p->sources != NULL && p->sources->filename != NULL) {
     const char *base = p->sources->filename;
     const char *slash = NULL;
     for (const char *c = base; *c != '\0'; c++) {
@@ -2120,6 +2265,7 @@ static char *resolve_include(pp *p, const char *name, int is_system) {
         char *candidate = join_path(dir, name);
         free(dir);
         if (candidate != NULL && file_exists(candidate)) {
+          *system_header = p->sources->lex.system_header;
           return candidate;
         }
         free(candidate);
@@ -2127,21 +2273,25 @@ static char *resolve_include(pp *p, const char *name, int is_system) {
     }
   }
 
-  for (int i = 0; i < p->include_dir_count; i++) {
-    char *candidate = join_path(p->include_dirs[i], name);
+  for (int i = start; i < p->include_dir_count + p->system_dir_count; i++) {
+    int in_system = i >= p->include_dir_count;
+    const char *dir = in_system ? p->system_dirs[i - p->include_dir_count] : p->include_dirs[i];
+    char *candidate = join_path(dir, name);
     if (candidate != NULL && file_exists(candidate)) {
+      *system_header = in_system;
+      *found_at = i;
       return candidate;
     }
     free(candidate);
   }
 
-  if (!is_system && file_exists(name)) {
+  if (!is_system && !next && file_exists(name)) {
     return strdup(name);
   }
   return NULL;
 }
 
-static void do_include(pp *p, int line, int column) {
+static void do_include(pp *p, int line, int column, int next) {
   int is_system = 0;
   char *name = read_header_name(p, &is_system, line, column);
   skip_directive_line(p);
@@ -2160,7 +2310,9 @@ static void do_include(pp *p, int line, int column) {
     return;
   }
 
-  char *path = resolve_include(p, name, is_system);
+  int system_header;
+  int found_at;
+  char *path = resolve_include(p, name, is_system, next, &system_header, &found_at);
   if (path == NULL) {
     pp_error(p, line, column, "cannot find the file named by #include");
     free(name);
@@ -2175,9 +2327,10 @@ static void do_include(pp *p, int line, int column) {
     return;
   }
 
-  if (!source_push(p, text, path)) {
+  if (!source_push(p, text, path, system_header))
     pp_error(p, line, column, "out of memory opening an #include");
-  }
+  else
+    p->sources->search_index = found_at;
 
   free(text);
   free(path);
@@ -2218,7 +2371,9 @@ static void handle_directive(pp *p, int line, int column) {
   } else if (!pp_emitting(p)) {
     skip_directive_line(p);
   } else if (strcmp(name, "include") == 0) {
-    do_include(p, d.line, d.column);
+    do_include(p, d.line, d.column, 0);
+  } else if (strcmp(name, "include_next") == 0) {
+    do_include(p, d.line, d.column, 1);
   } else if (strcmp(name, "define") == 0) {
     do_define(p, d.line, d.column);
   } else if (strcmp(name, "undef") == 0) {
@@ -2228,7 +2383,7 @@ static void handle_directive(pp *p, int line, int column) {
   } else if (strcmp(name, "error") == 0) {
     do_error(p, d.line, d.column);
   } else if (strcmp(name, "pragma") == 0) {
-    skip_directive_line(p);
+    do_pragma(p, d.line, d.column);
   } else {
     pp_error(p, d.line, d.column, "invalid preprocessing directive");
     skip_directive_line(p);
@@ -2293,7 +2448,8 @@ char *pp_splice_lines(const char *source) {
 }
 
 int pp_run_ex(token_buf *out, const char *source, const char *filename, const char **include_dirs,
-              int include_dir_count) {
+              int include_dir_count, const char **system_dirs, int system_dir_count) {
+
   if (out == NULL)
     return -1;
   token_buf_init(out);
@@ -2306,6 +2462,8 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
   }
   p.include_dirs = include_dirs;
   p.include_dir_count = include_dir_count;
+  p.system_dirs = system_dirs;
+  p.system_dir_count = system_dir_count;
   while (1) {
     token t = pp_next(&p);
 
@@ -2319,6 +2477,7 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
         source_pop(&p);
         continue;
       }
+      t.pack = p.pack;
       token_buf_push(out, t);
       break;
     }
@@ -2345,6 +2504,7 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
     } else if (t.type == TOKEN_IDENTIFIER && strcmp(t.value, "__VA_ARGS__") == 0) {
       pp_error(&p, t.line, t.column, "__VA_ARGS__ can only appear in a variadic macro");
     }
+    t.pack = p.pack;
     token_buf_push(out, t);
   }
 
@@ -2353,13 +2513,14 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
 }
 
 int pp_run(token_buf *out, const char *source) {
-  return pp_run_ex(out, source, NULL, NULL, 0);
+  return pp_run_ex(out, source, NULL, NULL, 0, NULL, 0);
 }
 
-int pp_run_file(token_buf *out, const char *path, const char **include_dirs,
-                int include_dir_count) {
+int pp_run_file(token_buf *out, const char *path, const char **include_dirs, int include_dir_count,
+                const char **system_dirs, int system_dir_count) {
   char *text = pp_read_file(path);
-  int result = pp_run_ex(out, text, path, include_dirs, include_dir_count);
+  int result =
+      pp_run_ex(out, text, path, include_dirs, include_dir_count, system_dirs, system_dir_count);
   free(text);
   return result;
 }

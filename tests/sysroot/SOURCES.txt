@@ -1,0 +1,13 @@
+Test copies of each target's system headers, used by HeaderTests.
+
+Only the files the 24 C99 headers reach are here: those GCC opened for the
+HeaderTests probes, with lib/include searched first and __GNUC__ set to 4.2.
+
+windows/include  MinGW-w64 11.0 headers, from the CLion 2025.2.1 toolchain
+                 (x86_64-w64-mingw32/include). Licenses: COPYING.MinGW-w64*.txt.
+linux/include    Ubuntu 26.04: libc6-dev 2.43-2ubuntu2 (glibc) and
+                 linux-libc-dev 7.0.0-27.27 (asm-generic/, linux/), from
+                 /usr/include. Licenses: COPYRIGHT.glibc, COPYRIGHT.linux-libc-dev.
+
+The files are unmodified. Search order for the Linux target:
+lib/include, linux/include/x86_64-linux-gnu, linux/include.

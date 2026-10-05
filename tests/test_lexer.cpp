@@ -730,6 +730,46 @@ TEST(LexerTests, EveryC99KeywordIsItsOwnTokenAndNearMissesAreIdentifiers) {
     EXPECT_FALSE(token_is_keyword(type)) << type;
 }
 
+TEST(LexerTests, GccSpellingsAreKeywordsAndKeepTheirSpelling) {
+  const struct {
+    const char *text;
+    token_type type;
+  } keywords[] = {
+      {"__asm", TOKEN_ASM},
+      {"__asm__", TOKEN_ASM},
+      {"__attribute", TOKEN_ATTRIBUTE},
+      {"__attribute__", TOKEN_ATTRIBUTE},
+      {"__const", TOKEN_CONST},
+      {"__const__", TOKEN_CONST},
+      {"__extension__", TOKEN_EXTENSION},
+      {"__inline", TOKEN_INLINE},
+      {"__inline__", TOKEN_INLINE},
+      {"__restrict", TOKEN_RESTRICT},
+      {"__restrict__", TOKEN_RESTRICT},
+      {"__signed", TOKEN_SIGNED},
+      {"__signed__", TOKEN_SIGNED},
+      {"__volatile", TOKEN_VOLATILE},
+      {"__volatile__", TOKEN_VOLATILE},
+  };
+  for (const auto &keyword : keywords) {
+    SCOPED_TRACE(keyword.text);
+    lexer lex;
+    lexer_init(&lex, keyword.text);
+    expect_token(&lex, keyword.type, keyword.text);
+    expect_token(&lex, TOKEN_EOF);
+    EXPECT_TRUE(token_is_keyword(keyword.type));
+  }
+
+  for (const char *text : {"asm", "__asm_", "__attribute_", "__extension", "__extension___",
+                           "__inline_", "__typeof__", "__volatile___", "___asm__"}) {
+    SCOPED_TRACE(text);
+    lexer lex;
+    lexer_init(&lex, text);
+    expect_token(&lex, TOKEN_IDENTIFIER, text);
+    expect_token(&lex, TOKEN_EOF);
+  }
+}
+
 struct Decoded {
   std::vector<unsigned> units;
   std::string error;
@@ -894,6 +934,23 @@ TEST(DecodeLiteralTest, WideCharacterConstantsOnLinuxAreInts) {
         << units << " units";
   }
   EXPECT_EQ(char_constant_value("\xff", 1, 0), -1) << "narrow constants do not change";
+}
+
+TEST(LexerTests, ALexerOnItsOwnIsNotReadingASystemHeader) {
+  lexer lex;
+  lex.system_header = 1;
+  lexer_init(&lex, "int x;");
+  EXPECT_EQ(lex.system_header, 0) << "lexer_init starts every lexer outside system headers";
+  for (int i = 0; i < 3; i++) {
+    token t = lexer_next_token(&lex);
+    EXPECT_EQ(t.system_header, 0) << t.value;
+    free(t.value);
+  }
+  lex.system_header = 1;
+  token t = lexer_next_token(&lex);
+  EXPECT_EQ(t.type, TOKEN_EOF);
+  EXPECT_EQ(t.system_header, 1) << "every token takes the flag from its lexer";
+  free(t.value);
 }
 
 TEST(LexerTests, NumbersArePreprocessingNumbers) {
@@ -1081,5 +1138,50 @@ TEST(LexerTests, EveryTokenRecordsWhetherWhitespacePrecededIt) {
     EXPECT_EQ(t.leading_space, expected[i].leading_space)
         << "a comment and a newline are whitespace, just like a space";
     free(t.value);
+  }
+}
+
+TEST(ClassifyNumberTest, FloatingSuffixesReportSizeAndImaginary) {
+  const struct {
+    const char *suffix;
+    int valid;
+    char size;
+    int is_imaginary;
+  } cases[] = {
+      {"", 1, 0, 0},     {"f", 1, 'f', 0},   {"F", 1, 'f', 0},  {"l", 1, 'l', 0}, {"L", 1, 'l', 0},
+      {"i", 1, 0, 1},    {"I", 1, 0, 1},     {"j", 1, 0, 1},    {"J", 1, 0, 1},   {"iF", 1, 'f', 1},
+      {"Fi", 1, 'f', 1}, {"jL", 1, 'l', 1},  {"lJ", 1, 'l', 1}, {"ii", 0, 0, 1},  {"ij", 0, 0, 1},
+      {"fl", 0, 'f', 0}, {"fif", 0, 'f', 1}, {"x", 0, 0, 0},    {"iq", 0, 0, 1},
+  };
+  for (const auto &test : cases) {
+    char size = 'z';
+    int is_imaginary = -1;
+    EXPECT_EQ(floating_suffix(test.suffix, &size, &is_imaginary), test.valid) << test.suffix;
+    if (test.valid) {
+      EXPECT_EQ(size, test.size) << test.suffix;
+      EXPECT_EQ(is_imaginary, test.is_imaginary) << test.suffix;
+    }
+  }
+}
+
+TEST(ClassifyNumberTest, ImaginaryConstantsAreFloatingConstants) {
+  for (const char *number : {"1.0i", "1.0j", "1.0iF", "1.0Fi", "1e3jL", "0x1p3i", ".5I", "2.f"}) {
+    const char *error = "unset";
+    EXPECT_EQ(classify_number(number, &error), NUMBER_FLOATING) << number;
+    EXPECT_EQ(error, nullptr) << number;
+  }
+  const struct {
+    const char *number;
+    const char *error;
+  } invalid[] = {
+      {"1.0ii", "invalid suffix on a floating constant"},
+      {"1.0fil", "invalid suffix on a floating constant"},
+      {"1i", "invalid suffix on an integer constant"},
+      {"0x1i", "invalid suffix on an integer constant"},
+  };
+  for (const auto &test : invalid) {
+    const char *error = nullptr;
+    EXPECT_EQ(classify_number(test.number, &error), NUMBER_INVALID) << test.number;
+    EXPECT_STREQ(error, test.error) << test.number;
   }
 }

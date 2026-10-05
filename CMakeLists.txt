@@ -85,10 +85,19 @@ target_link_options(PreprocessorTests PRIVATE -Wl,--wrap=free,--wrap=realloc)
 gtest_discover_tests(PreprocessorTests)
 
 add_executable(SemaTests tests/test_sema.cpp src/sema.c src/symbol_table.c src/parser.c src/lexer.c
-        src/ast.c src/token_buf.c src/target.c)
+        src/ast.c src/token_buf.c src/preprocessor.c src/target.c)
 target_link_libraries(SemaTests gtest_main)
 gtest_discover_tests(SemaTests)
 
 add_executable(TargetTests tests/test_target.cpp src/target.c)
 target_link_libraries(TargetTests gtest_main)
 gtest_discover_tests(TargetTests)
+
+add_executable(HeaderTests tests/test_headers.cpp src/preprocessor.c src/lexer.c src/parser.c
+        src/ast.c src/sema.c src/symbol_table.c src/token_buf.c src/target.c)
+target_compile_definitions(HeaderTests PRIVATE
+        LIB_INCLUDE_DIR="${CMAKE_SOURCE_DIR}/lib/include"
+        SYSROOT_DIR="${CMAKE_SOURCE_DIR}/tests/sysroot"
+        HEADER_PROBES_DIR="${CMAKE_SOURCE_DIR}/tests/headers")
+target_link_libraries(HeaderTests gtest_main)
+gtest_discover_tests(HeaderTests)

@@ -34,6 +34,8 @@ typedef struct sema {
   struct switch_context *current_switch;
   int inline_definition;
   int in_sizeof;
+  int variadic;
+  type_info *va_list;
 } sema;
 
 static void resolve(sema *s, ast_node *node);
@@ -340,17 +342,18 @@ static constant evaluate_char_constant(ast_node *node) {
   return constant_of(convert_value((unsigned long long)value, type));
 }
 
-static prim_kind floating_constant_type(const char *text) {
-  char suffix = text[strlen(text) - 1];
-  if (suffix == 'f' || suffix == 'F')
-    return PRIM_FLOAT;
-  if (suffix == 'l' || suffix == 'L')
-    return PRIM_LDOUBLE;
-  return PRIM_DOUBLE;
+static prim_kind floating_constant_type(const char *text, int *is_imaginary) {
+  const char *suffix = text + strlen(text);
+  while (suffix > text && strchr("fFlLiIjJ", suffix[-1]))
+    suffix--;
+  char size;
+  floating_suffix(suffix, &size, is_imaginary);
+  return size == 'f' ? PRIM_FLOAT : size == 'l' ? PRIM_LDOUBLE : PRIM_DOUBLE;
 }
 
 static int floating_constant_overflows(const char *text) {
-  switch (floating_constant_type(text)) {
+  int is_imaginary;
+  switch (floating_constant_type(text, &is_imaginary)) {
   case PRIM_FLOAT:
     return isinf(strtof(text, NULL));
   case PRIM_LDOUBLE:
@@ -361,9 +364,12 @@ static int floating_constant_overflows(const char *text) {
 }
 
 static constant evaluate_floating_cast(ast_node *number, prim_kind target, source_loc loc) {
-  if (floating_constant_overflows(number->tok.value ? number->tok.value : ""))
+  const char *text = number->tok.value ? number->tok.value : "";
+  if (floating_constant_overflows(text))
     return unknown_constant(target);
-  double value = strtod(number->tok.value ? number->tok.value : "", NULL);
+  int is_imaginary;
+  floating_constant_type(text, &is_imaginary);
+  double value = is_imaginary ? 0.0 : strtod(text, NULL);
   if (target == PRIM_BOOL)
     return constant_of(convert_value(value != 0.0, PRIM_BOOL));
   if (!(value < 18446744073709551616.0))
@@ -403,7 +409,9 @@ typedef struct type_layout {
   int alignment;
 } type_layout;
 
-static type_layout layout_of(type_info *type) {
+static type_layout layout_of(type_info *type);
+
+static type_layout natural_layout(type_info *type) {
   type_layout out = {0, 0, 1};
   type_info *t = resolved_type(type);
   if (!t || is_unresolved(t))
@@ -438,6 +446,22 @@ static type_layout layout_of(type_info *type) {
   default:
     return out;
   }
+}
+
+static int typedef_alignment(type_info *type) {
+  for (type_info *t = type; t && t->kind == TYPE_TYPEDEF && t->symbol; t = t->symbol->type) {
+    if (t->symbol->alignment)
+      return t->symbol->alignment;
+  }
+  return 0;
+}
+
+static type_layout layout_of(type_info *type) {
+  type_layout out = natural_layout(type);
+  int aligned = typedef_alignment(type);
+  if (aligned)
+    out.alignment = aligned;
+  return out;
 }
 
 static constant evaluate_sizeof_type(type_info *type) {
@@ -770,6 +794,21 @@ static constant evaluate_unary(sema *s, ast_node *node, int evaluated) {
   return constant_of(convert_value(negated, type));
 }
 
+static constant evaluate_builtin(sema *s, ast_node *node, int evaluated) {
+  builtin_kind kind = node->builtin.kind;
+  if (kind == BUILTIN_CHOOSE_EXPR)
+    return node->builtin.chosen ? evaluate(s, node->builtin.chosen, evaluated)
+                                : unknown_constant(PRIM_INT);
+  if (kind != BUILTIN_OFFSETOF && kind != BUILTIN_TYPES_COMPATIBLE_P)
+    return non_constant();
+  prim_kind type = kind == BUILTIN_OFFSETOF ? target_current()->size_type : PRIM_INT;
+  if (!node->expr_type)
+    return unknown_constant(type);
+  if (!node->builtin.has_value)
+    return non_constant();
+  return constant_of(convert_value((unsigned long long)node->builtin.value, type));
+}
+
 static constant evaluate(sema *s, ast_node *node, int evaluated) {
   if (!node)
     return non_constant();
@@ -799,6 +838,8 @@ static constant evaluate(sema *s, ast_node *node, int evaluated) {
     return evaluate_ternary(s, node, evaluated);
   case AST_NODE_TYPE_CAST:
     return evaluate_cast(s, node, evaluated);
+  case AST_NODE_TYPE_BUILTIN:
+    return evaluate_builtin(s, node, evaluated);
   default:
     return non_constant();
   }
@@ -1323,6 +1364,8 @@ static void resolve_typedef_name(sema *s, type_info *type, source_loc loc) {
     note_previous(sym->loc, sym->name);
   } else {
     type->symbol = sym;
+    if (sym->unsupported_mode)
+      report(s, loc, "use of a name declared with the unsupported mode attribute", type->tag_name);
   }
 }
 
@@ -1385,6 +1428,7 @@ static void check_declarator(sema *s, type_info *type, source_loc loc) {
       type_info *element = resolved_type(t->ptr_to);
       if (is_unknown(element))
         continue;
+      type_layout element_layout = layout_of(t->ptr_to);
       if (element->kind == TYPE_FUNCTION)
         report_at(s, loc, "an array cannot have elements of function type");
       else if (is_incomplete(element))
@@ -1392,6 +1436,8 @@ static void check_declarator(sema *s, type_info *type, source_loc loc) {
       else if ((element->kind == TYPE_STRUCT || element->kind == TYPE_UNION) &&
                element->symbol->has_flexible_member)
         report_at(s, loc, "an array cannot have elements with a flexible array member");
+      else if (element_layout.known && element_layout.size % element_layout.alignment != 0)
+        report_at(s, loc, "alignment of array elements is greater than element size");
     }
   }
 }
@@ -1566,6 +1612,10 @@ static void resolve_var_decl(sema *s, ast_node *decl) {
   linkage_kind linkage = linkage_of(s, name, kind, storage);
   decl->symbol = declare(s, name, kind, decl->var_decl.type, linkage, decl->loc);
   symbol *sym = decl->symbol;
+  if (sym && kind == SYMBOL_TYPEDEF) {
+    sym->alignment = decl->var_decl.specs.aligned;
+    sym->unsupported_mode = decl->var_decl.specs.has_mode;
+  }
   int at_file_scope = s->table->current_scope->kind == SCOPE_FILE;
   int is_object = kind == SYMBOL_VAR && sym && sym->kind == SYMBOL_VAR;
   if (is_object && storage == TOKEN_REGISTER)
@@ -1675,6 +1725,7 @@ static void resolve_member(sema *s, ast_node *member) {
 
 typedef struct record_layout {
   int is_union;
+  int pack;
   long long end;
   long long bit_end;
   long long size;
@@ -1687,6 +1738,17 @@ typedef struct record_layout {
 
 static long long align_to(long long offset, int alignment) {
   return (offset + alignment - 1) / alignment * alignment;
+}
+
+static int capped(record_layout *layout, int alignment) {
+  return layout->pack && layout->pack < alignment ? layout->pack : alignment;
+}
+
+static int member_alignment(record_layout *layout, ast_node *member, int natural) {
+  int alignment = natural;
+  if (member->var_decl.specs.aligned > alignment)
+    alignment = member->var_decl.specs.aligned;
+  return capped(layout, alignment);
 }
 
 static void place(record_layout *layout, ast_node *member, long long size, int alignment) {
@@ -1711,10 +1773,11 @@ static void report_bitfield(sema *s, ast_node *member, const char *problem) {
 
 static void place_microsoft_bitfield(record_layout *layout, ast_node *member, int unit, int bits) {
   if (bits == 0) {
+    int alignment = capped(layout, unit);
     if (layout->unit_size && !layout->is_union) {
-      layout->end = align_to(layout->end, unit);
-      if (unit > layout->alignment)
-        layout->alignment = unit;
+      layout->end = align_to(layout->end, alignment);
+      if (alignment > layout->alignment)
+        layout->alignment = alignment;
     }
     layout->unit_size = 0;
     return;
@@ -1725,7 +1788,8 @@ static void place_microsoft_bitfield(record_layout *layout, ast_node *member, in
     layout->unit_bits += bits;
     return;
   }
-  place(layout, member, unit, unit);
+  long long size = layout->is_union && layout->pack ? (bits + 7) / 8 : unit;
+  place(layout, member, size, capped(layout, unit));
   layout->unit_size = unit;
   layout->unit_offset = member->var_decl.offset;
   layout->unit_bits = bits;
@@ -1734,7 +1798,7 @@ static void place_microsoft_bitfield(record_layout *layout, ast_node *member, in
 static void place_system_v_bitfield(record_layout *layout, ast_node *member, int unit, int bits) {
   int unit_bits = unit * 8;
   long long start = layout->is_union ? 0 : layout->bit_end;
-  if (bits == 0 || start / unit_bits != (start + bits - 1) / unit_bits)
+  if (bits == 0 || (!layout->pack && start / unit_bits != (start + bits - 1) / unit_bits))
     start = align_to(start, unit_bits);
   member->var_decl.offset = start / unit_bits * unit;
   member->var_decl.bit_offset = (int)(start % unit_bits);
@@ -1742,8 +1806,8 @@ static void place_system_v_bitfield(record_layout *layout, ast_node *member, int
   layout->end = (layout->bit_end + 7) / 8;
   if (layout->end > layout->size)
     layout->size = layout->end;
-  if (member->var_decl.var_name && unit > layout->alignment)
-    layout->alignment = unit;
+  if (member->var_decl.var_name && capped(layout, unit) > layout->alignment)
+    layout->alignment = capped(layout, unit);
 }
 
 static int lay_out_bitfield(sema *s, record_layout *layout, ast_node *member) {
@@ -1775,6 +1839,10 @@ static int lay_out_bitfield(sema *s, record_layout *layout, ast_node *member) {
   member->var_decl.bit_width = bits;
   if (bits == 0 && member->var_decl.var_name) {
     report_bitfield(s, member, "zero width");
+    return 0;
+  }
+  if (member->var_decl.specs.aligned) {
+    report_bitfield(s, member, "the aligned attribute is not supported");
     return 0;
   }
   if (target_current()->microsoft_bitfields)
@@ -1833,13 +1901,13 @@ static int lay_out_field(sema *s, record_layout *layout, ast_node *member, int i
     }
     layout->has_flexible_member = 1;
     type_layout flexible = layout_of(element);
-    place(layout, member, 0, flexible.alignment);
+    place(layout, member, 0, member_alignment(layout, member, flexible.alignment));
     return flexible.known;
   }
   type_layout field = layout_of(type);
   if (!field.known)
     return 0;
-  place(layout, member, field.size, field.alignment);
+  place(layout, member, field.size, member_alignment(layout, member, field.alignment));
   return 1;
 }
 
@@ -1868,6 +1936,7 @@ static void lay_out_record(sema *s, ast_node *def) {
   collect_members(def, members);
   record_layout layout = {0};
   layout.is_union = def->struct_def.is_union;
+  layout.pack = def->struct_def.pack;
   layout.alignment = 1;
   int known = 1;
   int named = 0;
@@ -1888,6 +1957,8 @@ static void lay_out_record(sema *s, ast_node *def) {
     if (name)
       named++;
   }
+  if (def->struct_def.aligned > layout.alignment)
+    layout.alignment = def->struct_def.aligned;
   if (named == 0)
     report_at(s, def->loc, "a structure or union needs a named member");
   if (def->symbol) {
@@ -1967,15 +2038,20 @@ static void resolve_function(sema *s, ast_node *fn) {
   name_type->ptr_to->prim = PRIM_CHAR;
   name_type->ptr_to->is_const = 1;
   fn->function_def.name_type = name_type;
-  symbol *func =
-      declare(s, "__func__", SYMBOL_VAR, name_type, LINKAGE_NONE, fn->function_def.body->loc);
-  if (func)
-    func->has_static_storage = 1;
+  static const char *const function_names[] = {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"};
+  for (int i = 0; i < 3; i++) {
+    symbol *func = declare(s, function_names[i], SYMBOL_VAR, name_type, LINKAGE_NONE,
+                           fn->function_def.body->loc);
+    if (func)
+      func->has_static_storage = 1;
+  }
   s->return_type = type->ptr_to;
+  s->variadic = type->is_variadic;
   resolve_items(s, fn->function_def.body);
   resolve_gotos(s);
   free_vm_scopes(s);
   s->inline_definition = 0;
+  s->variadic = 0;
   symbol_table_leave_scope(s->table);
 }
 
@@ -2099,7 +2175,9 @@ static type_info *number_type(sema *s, ast_node *node) {
     return NULL;
   if (floating_constant_overflows(text))
     report_at(s, node->loc, "floating constant is out of range for its type");
-  return arithmetic_type(floating_constant_type(text), 0);
+  int is_imaginary;
+  prim_kind type = floating_constant_type(text, &is_imaginary);
+  return arithmetic_type(type, is_imaginary);
 }
 
 static type_info *string_type(sema *s, ast_node *node) {
@@ -2602,6 +2680,364 @@ static type_info *call_type(sema *s, ast_node *node) {
   return valid ? unqualified(s, fn->ptr_to) : NULL;
 }
 
+static type_info *builtin_type_argument(ast_node *node, int slot) {
+  if (node->builtin.types[slot])
+    return node->builtin.types[slot];
+  ast_node *expr = node->builtin.type_exprs[slot];
+  return expr ? expr->expr_type : NULL;
+}
+
+static int builtin_arity(builtin_kind kind) {
+  switch (kind) {
+  case BUILTIN_OFFSETOF:
+  case BUILTIN_TYPES_COMPATIBLE_P:
+  case BUILTIN_HUGE_VAL:
+  case BUILTIN_HUGE_VALF:
+  case BUILTIN_HUGE_VALL:
+  case BUILTIN_INFF:
+  case BUILTIN_TRAP:
+  case BUILTIN_UNREACHABLE:
+    return 0;
+  case BUILTIN_VA_ARG:
+  case BUILTIN_VA_END:
+  case BUILTIN_NANF:
+  case BUILTIN_SIGNBIT:
+  case BUILTIN_SIGNBITF:
+  case BUILTIN_SIGNBITL:
+  case BUILTIN_LLABS:
+    return 1;
+  case BUILTIN_CHOOSE_EXPR:
+    return 3;
+  default:
+    return 2;
+  }
+}
+
+static int check_va_list(sema *s, ast_node *node, ast_node *arg, int needs_lvalue) {
+  type_info *type = value_type(s, arg);
+  if (!type || !s->va_list)
+    return 0;
+  type_info *expected = unqualified(s, adjusted_parameter_type(s, s->va_list));
+  if (!compatible_types(type, 0, expected, 0)) {
+    report(s, arg->loc, "not a va_list as an argument of", node->tok.value);
+    return 0;
+  }
+  if (needs_lvalue && resolved_type(s->va_list)->kind != TYPE_ARRAY && !arg->is_lvalue) {
+    report(s, arg->loc, "not an lvalue as an argument of", node->tok.value);
+    return 0;
+  }
+  return 1;
+}
+
+static type_info *va_arg_type(sema *s, ast_node *node) {
+  int valid = check_va_list(s, node, node->builtin.args[0], 1);
+  type_info *type = builtin_type_argument(node, 0);
+  type_info *t = resolved_type(type);
+  if (is_unknown(t))
+    return NULL;
+  if (t->kind == TYPE_FUNCTION || t->kind == TYPE_ARRAY || is_incomplete(t)) {
+    report_at(s, node->loc,
+              "the type argument of '__builtin_va_arg' must be a complete object type that is "
+              "not an array");
+    valid = 0;
+  }
+  return valid ? unqualified(s, type) : NULL;
+}
+
+static type_info *offsetof_type(sema *s, ast_node *node) {
+  type_info *t = resolved_type(builtin_type_argument(node, 0));
+  long long offset = 0;
+  int constant_offset = 1;
+  for (int i = 0; i < node->builtin.step_count; i++) {
+    if (is_unknown(t))
+      return NULL;
+    const char *name = node->builtin.steps[i].member;
+    if (name) {
+      if (t->kind != TYPE_STRUCT && t->kind != TYPE_UNION) {
+        report(s, node->loc, "offsetof needs a structure or union to find member", name);
+        return NULL;
+      }
+      if (!t->symbol->is_defined) {
+        report_at(s, node->loc, "member access into an incomplete structure or union");
+        return NULL;
+      }
+      if (!t->symbol->alignment)
+        return NULL;
+      ast_node *member = member_named(t, name);
+      if (!member) {
+        report(s, node->loc, "no member named", name);
+        return NULL;
+      }
+      if (member->var_decl.bitfield_width) {
+        report(s, node->loc, "offsetof cannot name bit-field", name);
+        return NULL;
+      }
+      offset += member->var_decl.offset;
+      t = resolved_type(member->var_decl.type);
+    } else {
+      ast_node *index = node->builtin.steps[i].index;
+      type_info *index_type = value_type(s, index);
+      if (!index_type)
+        return NULL;
+      if (t->kind != TYPE_ARRAY || !is_integer(index_type)) {
+        report_at(s, node->loc, "a subscript in offsetof needs an array and an integer");
+        return NULL;
+      }
+      constant value = evaluate(s, index, 1);
+      type_layout element = layout_of(t->ptr_to);
+      if (value.status == CONST_VALUE && element.known)
+        offset += (long long)value.value.bits * element.size;
+      else
+        constant_offset = 0;
+      t = resolved_type(t->ptr_to);
+    }
+  }
+  node->builtin.value = offset;
+  node->builtin.has_value = constant_offset;
+  return arithmetic_type(target_current()->size_type, 0);
+}
+
+static int compatible_ignoring_qualifiers(type_info *a, type_info *b) {
+  int ignored;
+  type_info *x = strip_typedefs(a, &ignored);
+  type_info *y = strip_typedefs(b, &ignored);
+  if (!is_unknown(x) && !is_unknown(y) && x->kind == TYPE_ARRAY && y->kind == TYPE_ARRAY) {
+    if (x->array_size >= 0 && y->array_size >= 0 && x->array_size != y->array_size)
+      return 0;
+    return compatible_ignoring_qualifiers(x->ptr_to, y->ptr_to);
+  }
+  return compatible_unqualified(a, b);
+}
+
+static type_info *types_compatible_type(ast_node *node) {
+  type_info *a = builtin_type_argument(node, 0);
+  type_info *b = builtin_type_argument(node, 1);
+  if (is_unknown(resolved_type(a)) || is_unknown(resolved_type(b)))
+    return NULL;
+  node->builtin.value = compatible_ignoring_qualifiers(a, b);
+  node->builtin.has_value = 1;
+  return arithmetic_type(PRIM_INT, 0);
+}
+
+static type_info *choose_expr_type(sema *s, ast_node *node) {
+  ast_node **args = node->builtin.args;
+  if (!value_type(s, args[0]))
+    return NULL;
+  constant value = evaluate(s, args[0], 1);
+  report_problem(s, value);
+  if (value.status == CONST_NOT_CONSTANT) {
+    report_at(
+        s, node->loc,
+        "the first argument of '__builtin_choose_expr' must be an integer constant expression");
+    return NULL;
+  }
+  if (value.status != CONST_VALUE)
+    return NULL;
+  node->builtin.chosen = value.value.bits ? args[1] : args[2];
+  node->is_lvalue = node->builtin.chosen->is_lvalue;
+  return node->builtin.chosen->expr_type;
+}
+
+static int floating_arguments(sema *s, ast_node *node) {
+  int real = 1;
+  int floating = 0;
+  for (int i = 0; i < node->builtin.arg_count; i++) {
+    type_info *type = value_type(s, node->builtin.args[i]);
+    if (!type)
+      return 0;
+    real = real && is_real(type);
+    floating = floating || (is_real(type) && !is_integer(type));
+  }
+  if (real && floating)
+    return 1;
+  report(s, node->loc, "non-floating-point arguments in a call to", node->tok.value);
+  return 0;
+}
+
+static int converted_argument(sema *s, ast_node *arg, type_info *parameter) {
+  if (!value_type(s, arg))
+    return 0;
+  const char *problem = conversion_problem(s, parameter, arg);
+  if (problem)
+    report_conversion(s, arg->loc, problem, "argument");
+  return problem == NULL;
+}
+
+static type_info *candidate_function(sema *s, ast_node *arg) {
+  type_info *type = value_type(s, arg);
+  if (!type)
+    return NULL;
+  type_info *fn = is_pointer(type) ? resolved_type(pointee(type)) : NULL;
+  if (!fn || fn->kind != TYPE_FUNCTION || !fn->has_prototype || fn->is_variadic) {
+    report_at(s, arg->loc,
+              "each function given to '__builtin_tgmath' must have a prototype without '...'");
+    return NULL;
+  }
+  return fn;
+}
+
+static int generic_position(type_info **functions, int count, int position) {
+  for (int i = 1; i < count; i++) {
+    if (!compatible_unqualified(functions[0]->param_types[position],
+                                functions[i]->param_types[position]))
+      return 1;
+  }
+  return 0;
+}
+
+static type_info *tgmath_type(sema *s, ast_node *node) {
+  ast_node **args = node->builtin.args;
+  int count = node->builtin.arg_count;
+  type_info *first = count > 0 ? candidate_function(s, args[0]) : NULL;
+  if (!first)
+    return NULL;
+  int parameters = first->param_count;
+  int functions = count - parameters;
+  if (parameters < 1 || functions < 2) {
+    report(s, node->loc, "wrong number of arguments to", node->tok.value);
+    return NULL;
+  }
+  type_info **candidates = (type_info **)malloc(sizeof(type_info *) * (size_t)functions);
+  if (!candidates)
+    return NULL;
+  int valid = 1;
+  for (int i = 0; i < functions && valid; i++) {
+    candidates[i] = candidate_function(s, args[i]);
+    if (!candidates[i]) {
+      valid = 0;
+    } else if (candidates[i]->param_count != parameters) {
+      report_at(s, args[i]->loc,
+                "the functions given to '__builtin_tgmath' must take the same number of "
+                "parameters");
+      valid = 0;
+    }
+  }
+  int generic = -1;
+  for (int j = 0; j < parameters && valid && generic < 0; j++) {
+    if (generic_position(candidates, functions, j))
+      generic = j;
+  }
+  if (valid && generic < 0) {
+    report_at(s, node->loc, "the functions given to '__builtin_tgmath' must differ in type");
+    valid = 0;
+  }
+  prim_kind wanted = PRIM_FLOAT;
+  int complex_wanted = 0;
+  for (int j = 0; j < parameters && valid; j++) {
+    if (!generic_position(candidates, functions, j))
+      continue;
+    type_info *type = value_type(s, args[functions + j]);
+    if (!type) {
+      valid = 0;
+    } else if (!is_arithmetic(type)) {
+      report_at(s, args[functions + j]->loc,
+                "an argument of a type-generic call must have arithmetic type");
+      valid = 0;
+    } else {
+      prim_kind kind = is_integer(type) ? PRIM_DOUBLE : resolved_type(type)->prim;
+      if (kind == PRIM_LDOUBLE || (kind == PRIM_DOUBLE && wanted == PRIM_FLOAT))
+        wanted = kind;
+      complex_wanted = complex_wanted || resolved_type(type)->is_complex;
+    }
+  }
+  int real_candidates = 0;
+  for (int i = 0; i < functions && valid; i++)
+    real_candidates =
+        real_candidates || !resolved_type(candidates[i]->param_types[generic])->is_complex;
+  if (!real_candidates)
+    complex_wanted = 1;
+  int chosen = -1;
+  for (int i = 0; i < functions && valid && chosen < 0; i++) {
+    type_info *t = resolved_type(candidates[i]->param_types[generic]);
+    if (t && t->kind == TYPE_PRIMITIVE && t->prim == wanted && t->is_complex == complex_wanted)
+      chosen = i;
+  }
+  if (valid && chosen < 0) {
+    report_at(s, node->loc, "no matching function for type-generic call");
+    valid = 0;
+  }
+  for (int j = 0; j < parameters && valid; j++) {
+    if (!check_argument(s, candidates[chosen], j, args[functions + j]))
+      valid = 0;
+  }
+  type_info *result = valid ? candidates[chosen]->ptr_to : NULL;
+  free(candidates);
+  if (!result)
+    return NULL;
+  node->builtin.chosen = args[chosen];
+  node->builtin.value = functions;
+  return unqualified(s, result);
+}
+
+static type_info *builtin_type(sema *s, ast_node *node) {
+  builtin_kind kind = node->builtin.kind;
+  ast_node **args = node->builtin.args;
+  type_info *nothing = arithmetic_type(PRIM_VOID, 0);
+  if (kind == BUILTIN_TGMATH)
+    return tgmath_type(s, node);
+  if (node->builtin.arg_count != builtin_arity(kind)) {
+    report(s, node->loc, "wrong number of arguments to", node->tok.value);
+    return NULL;
+  }
+  switch (kind) {
+  case BUILTIN_VA_START:
+    if (!s->variadic) {
+      report(s, node->loc, "a function without '...' cannot call", node->tok.value);
+      return NULL;
+    }
+    return check_va_list(s, node, args[0], 1) ? nothing : NULL;
+  case BUILTIN_VA_END:
+    return check_va_list(s, node, args[0], 1) ? nothing : NULL;
+  case BUILTIN_VA_COPY:
+    return check_va_list(s, node, args[0], 1) && check_va_list(s, node, args[1], 0) ? nothing
+                                                                                    : NULL;
+  case BUILTIN_VA_ARG:
+    return va_arg_type(s, node);
+  case BUILTIN_OFFSETOF:
+    return offsetof_type(s, node);
+  case BUILTIN_TYPES_COMPATIBLE_P:
+    return types_compatible_type(node);
+  case BUILTIN_CHOOSE_EXPR:
+    return choose_expr_type(s, node);
+  case BUILTIN_HUGE_VAL:
+    return arithmetic_type(PRIM_DOUBLE, 0);
+  case BUILTIN_HUGE_VALL:
+    return arithmetic_type(PRIM_LDOUBLE, 0);
+  case BUILTIN_HUGE_VALF:
+  case BUILTIN_INFF:
+    return arithmetic_type(PRIM_FLOAT, 0);
+  case BUILTIN_NANF:
+    return converted_argument(s, args[0],
+                              pointer_to(s, qualified(s, arithmetic_type(PRIM_CHAR, 0), 1)))
+               ? arithmetic_type(PRIM_FLOAT, 0)
+               : NULL;
+  case BUILTIN_LLABS:
+    return converted_argument(s, args[0], arithmetic_type(PRIM_LLONG, 0))
+               ? arithmetic_type(PRIM_LLONG, 0)
+               : NULL;
+  case BUILTIN_TRAP:
+  case BUILTIN_UNREACHABLE:
+    return nothing;
+  default:
+    return floating_arguments(s, node) ? arithmetic_type(PRIM_INT, 0) : NULL;
+  }
+}
+
+static void resolve_builtin(sema *s, ast_node *node) {
+  for (int i = 0; i < 2; i++) {
+    resolve(s, node->builtin.definitions[i]);
+    if (node->builtin.types[i])
+      resolve_type(s, node->builtin.types[i], node->loc);
+    s->in_sizeof++;
+    resolve(s, node->builtin.type_exprs[i]);
+    s->in_sizeof--;
+  }
+  for (int i = 0; i < node->builtin.arg_count; i++)
+    resolve(s, node->builtin.args[i]);
+  for (int i = 0; i < node->builtin.step_count; i++)
+    resolve(s, node->builtin.steps[i].index);
+}
+
 typedef enum {
   NOT_CONSTANT,
   ARITHMETIC_CONSTANT,
@@ -2610,6 +3046,26 @@ typedef enum {
 } constant_class;
 
 static int is_static_object(sema *s, ast_node *expr);
+static constant_class classify_constant(sema *s, ast_node *expr);
+
+static constant_class builtin_constant_class(sema *s, ast_node *expr) {
+  switch (expr->builtin.kind) {
+  case BUILTIN_HUGE_VAL:
+  case BUILTIN_HUGE_VALF:
+  case BUILTIN_HUGE_VALL:
+  case BUILTIN_INFF:
+    return ARITHMETIC_CONSTANT;
+  case BUILTIN_NANF:
+    return expr->builtin.args[0]->type == AST_NODE_TYPE_STRING ? ARITHMETIC_CONSTANT : NOT_CONSTANT;
+  case BUILTIN_OFFSETOF:
+  case BUILTIN_TYPES_COMPATIBLE_P:
+    return expr->builtin.has_value ? ARITHMETIC_CONSTANT : NOT_CONSTANT;
+  case BUILTIN_CHOOSE_EXPR:
+    return classify_constant(s, expr->builtin.chosen);
+  default:
+    return NOT_CONSTANT;
+  }
+}
 
 static constant_class classify_constant(sema *s, ast_node *expr) {
   if (!expr || !expr->expr_type)
@@ -2691,6 +3147,8 @@ static constant_class classify_constant(sema *s, ast_node *expr) {
   case AST_NODE_TYPE_ARRAY_SUBSCRIPT:
   case AST_NODE_TYPE_COMPOUND_LITERAL:
     return type->kind == TYPE_ARRAY && is_static_object(s, expr) ? ADDRESS_CONSTANT : NOT_CONSTANT;
+  case AST_NODE_TYPE_BUILTIN:
+    return builtin_constant_class(s, expr);
   default:
     return NOT_CONSTANT;
   }
@@ -3050,6 +3508,9 @@ static void type_expression(sema *s, ast_node *node) {
   case AST_NODE_TYPE_FUNCTION_CALL:
     node->expr_type = call_type(s, node);
     break;
+  case AST_NODE_TYPE_BUILTIN:
+    node->expr_type = builtin_type(s, node);
+    break;
   default:
     break;
   }
@@ -3187,6 +3648,15 @@ static void resolve_return(sema *s, ast_node *node) {
   const char *problem = conversion_problem(s, unqualified(s, expected), value);
   if (problem)
     report_conversion(s, value->loc, problem, "return");
+}
+
+static void resolve_asm(sema *s, ast_node *node) {
+  for (int i = 0; i < node->asm_stmt.operand_count; i++) {
+    ast_node *operand = node->asm_stmt.operands[i];
+    resolve(s, operand);
+    if (i < node->asm_stmt.output_count && operand->expr_type && !is_modifiable_lvalue(operand))
+      report_at(s, operand->loc, "an asm output must be a modifiable lvalue");
+  }
 }
 
 static void resolve(sema *s, ast_node *node) {
@@ -3340,6 +3810,12 @@ static void resolve(sema *s, ast_node *node) {
       resolve(s, node->init_list.items[i].value);
     }
     break;
+  case AST_NODE_TYPE_ASM:
+    resolve_asm(s, node);
+    break;
+  case AST_NODE_TYPE_BUILTIN:
+    resolve_builtin(s, node);
+    break;
   default:
     break;
   }
@@ -3351,6 +3827,9 @@ int sema_check(symbol_table *table, ast_node *program) {
     return -1;
   sema s = {.table = table, .program = program};
   symbol_table_enter_scope(table, SCOPE_FILE);
+  resolve(&s, program->program.builtins);
+  symbol *va_list = symbol_table_lookup_ordinary(table, "__builtin_va_list");
+  s.va_list = va_list ? va_list->type : NULL;
   for (int i = 0; i < program->program.count; i++)
     resolve(&s, program->program.declarations[i]);
   check_end_of_file(&s, program);

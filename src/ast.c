@@ -131,6 +131,7 @@ void free_ast(ast_node *node) {
     for (int i = 0; i < node->program.derived_count; i++)
       free(node->program.derived_types[i]);
     free(node->program.derived_types);
+    free_ast(node->program.builtins);
     break;
 
   case AST_NODE_TYPE_STRING:
@@ -237,6 +238,35 @@ void free_ast(ast_node *node) {
     if (node->label_stmt.label_name)
       free(node->label_stmt.label_name);
     free_ast(node->label_stmt.statement);
+    break;
+
+  case AST_NODE_TYPE_ASM:
+    free_ast(node->asm_stmt.template_text);
+    for (int i = 0; i < node->asm_stmt.operand_count; i++) {
+      free_ast(node->asm_stmt.constraints[i]);
+      free_ast(node->asm_stmt.operands[i]);
+    }
+    free(node->asm_stmt.constraints);
+    free(node->asm_stmt.operands);
+    for (int i = 0; i < node->asm_stmt.clobber_count; i++)
+      free_ast(node->asm_stmt.clobbers[i]);
+    free(node->asm_stmt.clobbers);
+    break;
+
+  case AST_NODE_TYPE_BUILTIN:
+    for (int i = 0; i < node->builtin.arg_count; i++)
+      free_ast(node->builtin.args[i]);
+    free(node->builtin.args);
+    for (int i = 0; i < 2; i++) {
+      free_type_info(node->builtin.types[i]);
+      free_ast(node->builtin.type_exprs[i]);
+      free_ast(node->builtin.definitions[i]);
+    }
+    for (int i = 0; i < node->builtin.step_count; i++) {
+      free(node->builtin.steps[i].member);
+      free_ast(node->builtin.steps[i].index);
+    }
+    free(node->builtin.steps);
     break;
 
   case AST_NODE_TYPE_EMPTY:
