@@ -1,14 +1,56 @@
 #include "target.h"
-#include <stddef.h>
 
-static const char *const windows_macros[] = {
-    "_WIN32",     "_WIN64",    "__WIN32",     "__WIN32__",   "__WIN64",    "__WIN64__",
-    "__WINNT",    "__WINNT__", "__MINGW32__", "__MINGW64__", "__MSVCRT__", "__x86_64",
-    "__x86_64__", "__amd64",   "__amd64__",   NULL};
+static const char windows_predefines[] = "#define _WIN32 1\n"
+                                         "#define _WIN64 1\n"
+                                         "#define __WIN32 1\n"
+                                         "#define __WIN32__ 1\n"
+                                         "#define __WIN64 1\n"
+                                         "#define __WIN64__ 1\n"
+                                         "#define __WINNT 1\n"
+                                         "#define __WINNT__ 1\n"
+                                         "#define __MINGW32__ 1\n"
+                                         "#define __MINGW64__ 1\n"
+                                         "#define __MSVCRT__ 1\n"
+                                         "#define __SEH__ 1\n"
+                                         "#define __x86_64 1\n"
+                                         "#define __x86_64__ 1\n"
+                                         "#define __amd64 1\n"
+                                         "#define __amd64__ 1\n"
+                                         "#define __SIZE_TYPE__ long long unsigned int\n"
+                                         "#define __PTRDIFF_TYPE__ long long int\n"
+                                         "#define __WCHAR_TYPE__ short unsigned int\n"
+                                         "#define __WINT_TYPE__ short unsigned int\n"
+                                         "#define __cdecl __attribute__((__cdecl__))\n"
+                                         "#define __stdcall __attribute__((__stdcall__))\n"
+                                         "#define __fastcall __attribute__((__fastcall__))\n"
+                                         "#define __thiscall __attribute__((__thiscall__))\n"
+                                         "#define __declspec(x) __attribute__((x))\n";
 
-static const char *const linux_macros[] = {
-    "__linux",  "__linux__", "__gnu_linux__", "__unix",  "__unix__",  "__ELF__", "_LP64",
-    "__LP64__", "__x86_64",  "__x86_64__",    "__amd64", "__amd64__", NULL};
+static const char linux_predefines[] = "#define __linux 1\n"
+                                       "#define __linux__ 1\n"
+                                       "#define __gnu_linux__ 1\n"
+                                       "#define __unix 1\n"
+                                       "#define __unix__ 1\n"
+                                       "#define __ELF__ 1\n"
+                                       "#define _LP64 1\n"
+                                       "#define __LP64__ 1\n"
+                                       "#define __x86_64 1\n"
+                                       "#define __x86_64__ 1\n"
+                                       "#define __amd64 1\n"
+                                       "#define __amd64__ 1\n"
+                                       "#define __SIZE_TYPE__ long unsigned int\n"
+                                       "#define __PTRDIFF_TYPE__ long int\n"
+                                       "#define __WCHAR_TYPE__ int\n"
+                                       "#define __WINT_TYPE__ unsigned int\n";
+
+static const char windows_builtins[] = "typedef char *__builtin_va_list;\n";
+
+static const char linux_builtins[] = "typedef struct __va_list_tag {\n"
+                                     "  unsigned int gp_offset;\n"
+                                     "  unsigned int fp_offset;\n"
+                                     "  void *overflow_arg_area;\n"
+                                     "  void *reg_save_area;\n"
+                                     "} __builtin_va_list[1];\n";
 
 static const target targets[] = {
     [TARGET_WINDOWS_X64] = {.long_size = 4,
@@ -17,14 +59,16 @@ static const target targets[] = {
                             .size_type = PRIM_ULLONG,
                             .ptrdiff_type = PRIM_LLONG,
                             .microsoft_bitfields = 1,
-                            .macros = windows_macros},
+                            .predefines = windows_predefines,
+                            .builtin_declarations = windows_builtins},
     [TARGET_LINUX_X64] = {.long_size = 8,
                           .wchar_size = 4,
                           .wchar_type = PRIM_INT,
                           .size_type = PRIM_ULONG,
                           .ptrdiff_type = PRIM_LONG,
                           .microsoft_bitfields = 0,
-                          .macros = linux_macros},
+                          .predefines = linux_predefines,
+                          .builtin_declarations = linux_builtins},
 };
 
 static target_kind selected = TARGET_WINDOWS_X64;

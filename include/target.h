@@ -11,7 +11,8 @@ typedef struct target {
   prim_kind size_type;
   prim_kind ptrdiff_type;
   int microsoft_bitfields;
-  const char *const *macros;
+  const char *predefines;
+  const char *builtin_declarations;
 } target;
 
 void target_select(target_kind kind);

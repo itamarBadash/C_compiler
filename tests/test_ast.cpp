@@ -365,6 +365,38 @@ TEST(AstTests, FreeReleasesTheDefinitionsATypeNameOrParameterListOwns) {
     EXPECT_EQ(entry.second, 1);
 }
 
+TEST(AstTests, FreeAstReleasesEveryPartOfAnAsmStatement) {
+  lexer lex;
+  lexer_init(&lex, "void f(int a) { __asm__(\"t\" : \"=r\"(a) : \"r\"(a) : \"cc\", \"memory\"); }");
+  parser p;
+  parser_init(&p, &lex);
+  ast_node *program = parse_program(&p);
+  ASSERT_EQ(p.had_error, 0);
+  parser_destroy(&p);
+  ast_node *node = program->program.declarations[0]->function_def.body->block.statements[0];
+  ASSERT_EQ(node->type, AST_NODE_TYPE_ASM);
+  ASSERT_EQ(node->asm_stmt.operand_count, 2);
+  ASSERT_EQ(node->asm_stmt.clobber_count, 2);
+
+  std::map<void *, int> frees;
+  frees[node] = 0;
+  frees[node->asm_stmt.template_text] = 0;
+  frees[node->asm_stmt.constraints] = 0;
+  frees[node->asm_stmt.operands] = 0;
+  frees[node->asm_stmt.clobbers] = 0;
+  for (int i = 0; i < 2; i++) {
+    frees[node->asm_stmt.constraints[i]] = 0;
+    frees[node->asm_stmt.operands[i]] = 0;
+    frees[node->asm_stmt.clobbers[i]] = 0;
+  }
+  {
+    TrackFrees track(frees);
+    free_ast(program);
+  }
+  for (const auto &entry : frees)
+    EXPECT_EQ(entry.second, 1);
+}
+
 TEST(AstTests, FreeAstReleasesEachDerivedTypeButNothingItPointsTo) {
   ast_node *program = create_ast_node(AST_NODE_TYPE_PROGRAM);
   type_info *borrowed = create_type_info(TYPE_PRIMITIVE);
@@ -412,4 +444,46 @@ TEST(AstTests, FreeAstReleasesTheFunctionNameType) {
   }
   EXPECT_EQ(frees[array], 1);
   EXPECT_EQ(frees[element], 1);
+}
+
+TEST(AstTests, FreeAstReleasesEveryPartOfABuiltin) {
+  lexer lex;
+  lexer_init(&lex, "unsigned long long off = __builtin_offsetof(struct N { int a[2]; }, a[1]);\n"
+                   "int tc = __builtin_types_compatible_p(__typeof__(off), int);\n"
+                   "int ce = __builtin_choose_expr(1, 2, 3);\n");
+  parser p;
+  parser_init(&p, &lex);
+  ast_node *program = parse_program(&p);
+  ASSERT_EQ(p.had_error, 0);
+  parser_destroy(&p);
+  ASSERT_EQ(program->program.count, 3);
+  ast_node *off = program->program.declarations[0]->var_decl.init_value;
+  ast_node *tc = program->program.declarations[1]->var_decl.init_value;
+  ast_node *ce = program->program.declarations[2]->var_decl.init_value;
+  ASSERT_EQ(off->type, AST_NODE_TYPE_BUILTIN);
+  ASSERT_EQ(tc->type, AST_NODE_TYPE_BUILTIN);
+  ASSERT_EQ(ce->type, AST_NODE_TYPE_BUILTIN);
+  ASSERT_EQ(off->builtin.step_count, 2);
+  ASSERT_EQ(ce->builtin.arg_count, 3);
+
+  std::map<void *, int> frees;
+  frees[off] = 0;
+  frees[off->tok.value] = 0;
+  frees[off->builtin.types[0]] = 0;
+  frees[off->builtin.definitions[0]] = 0;
+  frees[off->builtin.steps] = 0;
+  frees[off->builtin.steps[0].member] = 0;
+  frees[off->builtin.steps[1].index] = 0;
+  frees[tc->builtin.type_exprs[0]] = 0;
+  frees[tc->builtin.types[1]] = 0;
+  frees[ce->builtin.args] = 0;
+  for (int i = 0; i < 3; i++)
+    frees[ce->builtin.args[i]] = 0;
+  frees[program->program.builtins] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(program);
+  }
+  for (const auto &entry : frees)
+    EXPECT_EQ(entry.second, 1);
 }

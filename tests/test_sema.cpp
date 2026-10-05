@@ -7,6 +7,7 @@
 
 extern "C" {
 #include "parser.h"
+#include "preprocessor.h"
 #include "sema.h"
 }
 
@@ -168,6 +169,25 @@ static void check(Checked &c, const char *source) {
   c.program = parse_program(&p);
   c.parse_errors = p.had_error;
   parser_destroy(&p);
+  c.table = symbol_table_create();
+  testing::internal::CaptureStderr();
+  c.errors = sema_check(c.table, c.program);
+  c.diagnostics = testing::internal::GetCapturedStderr();
+  collect(c.program, c.nodes);
+}
+
+static void check_preprocessed(Checked &c, const char *source) {
+  token_buf tb;
+  testing::internal::CaptureStderr();
+  int pp_errors = pp_run(&tb, source);
+  std::string pp_diagnostics = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(pp_errors, 0) << pp_diagnostics;
+  parser p;
+  parser_init_from_buf(&p, &tb);
+  c.program = parse_program(&p);
+  c.parse_errors = p.had_error;
+  parser_destroy(&p);
+  token_buf_free(&tb);
   c.table = symbol_table_create();
   testing::internal::CaptureStderr();
   c.errors = sema_check(c.table, c.program);
@@ -1543,6 +1563,41 @@ TEST(TargetTypeTest, AWideStringInitializesAnArrayOfTheTargetsWcharT) {
   }
 }
 
+TEST(AsmTest, OperandsAreCheckedLikeAnyExpression) {
+  const char *src = "const int k = 1;\n"
+                    "void f(int code) {\n"
+                    "  int out;\n"
+                    "  __asm__(\"\" : \"=r\"(out) : \"r\"(code), \"r\"(1), \"r\"(k));\n"
+                    "  __asm__(\"\" : \"=r\"(code + 1));\n"
+                    "  __asm__(\"\" : \"=m\"(k));\n"
+                    "  __asm__(\"\" : : \"r\"(missing));\n"
+                    "  __asm__(\"\" : \"=r\"(gone));\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  const std::string output = "an asm output must be a modifiable lvalue";
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "+ 1", 1, output) + error_at(src, "k));", 2, output) +
+                error_at(src, "missing", 1, "use of undeclared identifier 'missing'") +
+                error_at(src, "gone", 1, "use of undeclared identifier 'gone'"))
+      << "an input need not be modifiable, and an untyped output is reported once";
+  std::vector<ast_node *> defs = nodes_of(c, AST_NODE_TYPE_FUNCTION_DEF);
+  ASSERT_EQ(defs.size(), 1u);
+  ast_node *first = defs[0]->function_def.body->block.statements[1];
+  ASSERT_EQ(first->type, AST_NODE_TYPE_ASM);
+  ASSERT_EQ(first->asm_stmt.operand_count, 4);
+  for (int i = 0; i < 4; i++) {
+    SCOPED_TRACE(i);
+    EXPECT_NE(first->asm_stmt.operands[i]->expr_type, nullptr) << "every operand is typed";
+  }
+  EXPECT_EQ(first->asm_stmt.operands[0]->symbol,
+            defs[0]->function_def.body->block.statements[0]->symbol)
+      << "out resolves to the local";
+  EXPECT_EQ(first->asm_stmt.operands[1]->symbol, defs[0]->function_def.param_symbols[0])
+      << "code resolves to the parameter";
+}
+
 TEST(TargetTypeTest, ALongBitFieldIsAsWideAsTheTargetsLong) {
   const char *src = "struct S { long x : 40; };\n";
   {
@@ -2742,11 +2797,14 @@ struct RecordLayout {
   std::vector<MemberAt> members;
 };
 
-static void expect_layouts(const std::vector<RecordLayout> &cases) {
+static void expect_layouts(const std::vector<RecordLayout> &cases, bool preprocessed = false) {
   for (const RecordLayout &test : cases) {
     SCOPED_TRACE(test.source);
     Checked c;
-    check(c, test.source);
+    if (preprocessed)
+      check_preprocessed(c, test.source);
+    else
+      check(c, test.source);
     ASSERT_EQ(c.parse_errors, 0);
     ASSERT_EQ(c.errors, 0) << c.diagnostics;
     symbol *record = record_symbol(c, "R");
@@ -3062,13 +3120,16 @@ struct TypeCase {
   const char *type;
 };
 
-static void expect_types(const std::vector<TypeCase> &cases) {
+static void expect_types(const std::vector<TypeCase> &cases, bool preprocessed = false) {
   for (const TypeCase &test : cases) {
     std::string source =
         std::string(test.declarations) + "void probe(void) { " + test.expression + "; }\n";
     SCOPED_TRACE(source);
     Checked c;
-    check(c, source.c_str());
+    if (preprocessed)
+      check_preprocessed(c, source.c_str());
+    else
+      check(c, source.c_str());
     ASSERT_EQ(c.parse_errors, 0);
     EXPECT_EQ(c.errors, 0) << c.diagnostics;
     ast_node *expression = probe_expression(c);
@@ -4624,4 +4685,712 @@ TEST(ConstantExpressionTest, AConstantOutOfRangeIsStillReportedOnlyOnce) {
   check(c, src);
   ASSERT_EQ(c.parse_errors, 0);
   EXPECT_EQ(c.errors, 2) << c.diagnostics;
+}
+
+TEST(AlignmentTest, AnAlignedTypedefReplacesTheAlignmentAndKeepsTheSize) {
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    expect_layouts({
+        {"typedef int AI __attribute__((aligned(16)));\nstruct R { char c; AI m; };\n",
+         32,
+         16,
+         {{"c", 0, 0, 0}, {"m", 16, 0, 0}}},
+        {"typedef int AI2 __attribute__((aligned(2)));\nstruct R { char c; AI2 m; };\n",
+         6,
+         2,
+         {{"c", 0, 0, 0}, {"m", 2, 0, 0}}},
+        {"typedef int AI __attribute__((aligned(16)));\n"
+         "typedef AI AI8 __attribute__((aligned(8)));\nstruct R { char c; AI8 m; };\n",
+         16,
+         8,
+         {{"c", 0, 0, 0}, {"m", 8, 0, 0}}},
+        {"typedef int AI __attribute__((aligned(16)));\ntypedef AI B;\n"
+         "struct R { char c; B m; };\n",
+         32,
+         16,
+         {{"c", 0, 0, 0}, {"m", 16, 0, 0}}},
+        {"typedef __attribute__((aligned(16))) struct F { unsigned long long p[2]; } FT;\n"
+         "typedef FT JB[16];\nstruct R { char c; JB m; };\n",
+         272,
+         16,
+         {{"c", 0, 0, 0}, {"m", 16, 0, 0}}},
+        {"typedef __attribute__((aligned(16))) struct F { unsigned long long p[2]; } FT;\n"
+         "struct R { char c; struct F m; };\n",
+         24,
+         8,
+         {{"c", 0, 0, 0}, {"m", 8, 0, 0}}},
+    });
+    expect_values("typedef int AI __attribute__((aligned(16)));\n", {{"sizeof(AI)", 4}});
+  }
+}
+
+TEST(AlignmentTest, AMemberAlignedAttributeOnlyRaises) {
+  expect_layouts({
+      {"struct R { char c; int m __attribute__((aligned(16))); };\n",
+       32,
+       16,
+       {{"c", 0, 0, 0}, {"m", 16, 0, 0}}},
+      {"struct R { char c; int m __attribute__((aligned(2))); };\n",
+       8,
+       4,
+       {{"c", 0, 0, 0}, {"m", 4, 0, 0}}},
+      {"struct R { char c; int m[] __attribute__((aligned(8))); };\n",
+       8,
+       8,
+       {{"c", 0, 0, 0}, {"m", 8, 0, 0}}},
+  });
+}
+
+TEST(AlignmentTest, ARecordAlignedAttributeOnlyRaisesTheRecord) {
+  expect_layouts({
+      {"struct R { int x; } __attribute__((aligned(16)));\n", 16, 16, {{"x", 0, 0, 0}}},
+      {"struct __attribute__((aligned(8))) R { char x; };\n", 8, 8, {{"x", 0, 0, 0}}},
+      {"struct R { double d; } __attribute__((aligned(4)));\n", 8, 8, {{"d", 0, 0, 0}}},
+  });
+}
+
+TEST(AlignmentTest, PackCapsEveryMemberButNotTheRecordsOwnAttribute) {
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    expect_layouts(
+        {
+            {"#pragma pack(1)\nstruct R { char c; int i; };\n",
+             5,
+             1,
+             {{"c", 0, 0, 0}, {"i", 1, 0, 0}}},
+            {"#pragma pack(2)\nstruct R { char c; double d; };\n",
+             10,
+             2,
+             {{"c", 0, 0, 0}, {"d", 2, 0, 0}}},
+            {"#pragma pack(16)\nstruct R { char c; long double d; };\n",
+             32,
+             16,
+             {{"c", 0, 0, 0}, {"d", 16, 0, 0}}},
+            {"#pragma pack(8)\nstruct R { char c; long double d; };\n",
+             24,
+             8,
+             {{"c", 0, 0, 0}, {"d", 8, 0, 0}}},
+            {"#pragma pack(2)\nstruct R { char c; int m __attribute__((aligned(16))); };\n",
+             6,
+             2,
+             {{"c", 0, 0, 0}, {"m", 2, 0, 0}}},
+            {"typedef int AI __attribute__((aligned(16)));\n#pragma pack(2)\n"
+             "struct R { char c; AI m; };\n",
+             6,
+             2,
+             {{"c", 0, 0, 0}, {"m", 2, 0, 0}}},
+            {"#pragma pack(2)\nstruct R { char c; int m[] __attribute__((aligned(8))); };\n",
+             2,
+             2,
+             {{"c", 0, 0, 0}, {"m", 2, 0, 0}}},
+            {"#pragma pack(2)\nstruct R { int x; } __attribute__((aligned(16)));\n",
+             16,
+             16,
+             {{"x", 0, 0, 0}}},
+        },
+        true);
+  }
+}
+
+TEST(AlignmentTest, ThePackInForceAtTheClosingBraceCounts) {
+  expect_layouts({{"#pragma pack(1)\nstruct R { char c;\n#pragma pack()\nint i; };\n",
+                   8,
+                   4,
+                   {{"c", 0, 0, 0}, {"i", 4, 0, 0}}}},
+                 true);
+}
+
+TEST(AlignmentTest, MicrosoftBitFieldsUnderPack) {
+  TargetGuard guard(TARGET_WINDOWS_X64);
+  expect_layouts(
+      {
+          {"#pragma pack(1)\nstruct R { char a; int b : 4; };\n",
+           5,
+           1,
+           {{"a", 0, 0, 0}, {"b", 1, 0, 4}}},
+          {"#pragma pack(2)\nstruct R { char c; int b : 30; };\n",
+           6,
+           2,
+           {{"c", 0, 0, 0}, {"b", 2, 0, 30}}},
+          {"#pragma pack(2)\nstruct R { char c; int a : 3; int : 0; char d; };\n",
+           8,
+           2,
+           {{"c", 0, 0, 0}, {"a", 2, 0, 3}, {"d", 6, 0, 0}}},
+          {"#pragma pack(1)\nunion R { int a : 3; char c; };\n",
+           1,
+           1,
+           {{"a", 0, 0, 3}, {"c", 0, 0, 0}}},
+          {"#pragma pack(1)\nunion R { int a : 9; };\n", 2, 1, {{"a", 0, 0, 9}}},
+          {"#pragma pack(2)\nstruct R { char c; int : 0; char d; };\n",
+           2,
+           1,
+           {{"c", 0, 0, 0}, {"d", 1, 0, 0}}},
+          {"#pragma pack(1)\nstruct R { char c; int b : 30; };\n",
+           5,
+           1,
+           {{"c", 0, 0, 0}, {"b", 1, 0, 30}}},
+          {"#pragma pack(4)\nstruct R { char c; long long b : 40; };\n",
+           12,
+           4,
+           {{"c", 0, 0, 0}, {"b", 4, 0, 40}}},
+          {"#pragma pack(1)\nstruct R { char c; short a : 3; short b : 3; };\n",
+           3,
+           1,
+           {{"c", 0, 0, 0}, {"a", 1, 0, 3}, {"b", 1, 3, 3}}},
+      },
+      true);
+}
+
+TEST(AlignmentTest, SystemVBitFieldsUnderPack) {
+  TargetGuard guard(TARGET_LINUX_X64);
+  expect_layouts(
+      {
+          {"#pragma pack(1)\nstruct R { char a; int b : 4; };\n",
+           2,
+           1,
+           {{"a", 0, 0, 0}, {"b", 0, 8, 4}}},
+          {"#pragma pack(2)\nstruct R { char c; int b : 30; };\n",
+           6,
+           2,
+           {{"c", 0, 0, 0}, {"b", 0, 8, 30}}},
+          {"#pragma pack(2)\nstruct R { char c; int a : 3; int : 0; char d; };\n",
+           6,
+           2,
+           {{"c", 0, 0, 0}, {"a", 0, 8, 3}, {"d", 4, 0, 0}}},
+          {"#pragma pack(1)\nunion R { int a : 3; char c; };\n",
+           1,
+           1,
+           {{"a", 0, 0, 3}, {"c", 0, 0, 0}}},
+          {"#pragma pack(1)\nunion R { int a : 9; };\n", 2, 1, {{"a", 0, 0, 9}}},
+          {"#pragma pack(2)\nstruct R { char c; int : 0; char d; };\n",
+           5,
+           1,
+           {{"c", 0, 0, 0}, {"d", 4, 0, 0}}},
+          {"#pragma pack(1)\nstruct R { char c; int b : 30; };\n",
+           5,
+           1,
+           {{"c", 0, 0, 0}, {"b", 0, 8, 30}}},
+          {"#pragma pack(4)\nstruct R { char c; long long b : 40; };\n",
+           8,
+           4,
+           {{"c", 0, 0, 0}, {"b", 0, 8, 40}}},
+          {"#pragma pack(1)\nstruct R { char c; short a : 3; short b : 3; };\n",
+           2,
+           1,
+           {{"c", 0, 0, 0}, {"a", 0, 8, 3}, {"b", 0, 11, 3}}},
+      },
+      true);
+}
+
+TEST(AlignmentTest, ArrayElementsCannotBeOverAligned) {
+  const char *src =
+      "typedef int AI __attribute__((aligned(16)));\n"
+      "typedef __attribute__((aligned(16))) struct F { unsigned long long p[2]; } FT;\n"
+      "AI bad[2];\n"
+      "FT good[2];\n"
+      "typedef AI AIs[1];\n"
+      "struct W { AI m[4]; };\n"
+      "int plain[3];\n"
+      "AI single;\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 3) << c.diagnostics;
+  std::string message = "alignment of array elements is greater than element size";
+  EXPECT_EQ(c.diagnostics, error_at(src, "bad", 1, message) + error_at(src, "AIs", 1, message) +
+                               error_at(src, "m[4]", 1, message));
+}
+
+TEST(AlignmentTest, ABitFieldCannotBeAligned) {
+  const char *src = "struct R { int a : 3 __attribute__((aligned(8))); int b; };\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 1) << c.diagnostics;
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "a :", 1, "the aligned attribute is not supported for bit-field 'a'"));
+  symbol *r = record_symbol(c, "R");
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->alignment, 0) << "a record with a bad bit-field has no layout";
+}
+
+TEST(ModeTest, ANameDeclaredWithModeCannotBeUsed) {
+  const char *src = "typedef int T __attribute__((mode(TI)));\n"
+                    "typedef int U __attribute__((mode(DI)));\n"
+                    "T x;\n"
+                    "int y = sizeof(T);\n"
+                    "typedef T T2;\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 3) << c.diagnostics;
+  std::string message = "use of a name declared with the unsupported mode attribute 'T'";
+  EXPECT_EQ(c.diagnostics, error_at(src, "x;", 1, message) + error_at(src, "(T)", 1, message) +
+                               error_at(src, "T2", 1, message))
+      << "declaring U is fine; only a use is an error, reported where the declaration or type "
+         "name is, like every other typedef-name problem";
+}
+
+static const char *builtin_declarations = "typedef __builtin_va_list va_list;\n"
+                                          "va_list ap;\n"
+                                          "struct S { char c; int a[2]; };\n";
+
+TEST(BuiltinTest, EachBuiltinHasItsResultType) {
+  const char *d = builtin_declarations;
+  expect_types({
+      {d, "__builtin_va_arg(ap, int)", "int"},
+      {d, "__builtin_va_arg(ap, const double)", "double"},
+      {d, "__builtin_va_end(ap)", "void"},
+      {d, "__builtin_va_copy(ap, ap)", "void"},
+      {d, "__builtin_offsetof(struct S, a[1])", "unsigned long long"},
+      {d, "__builtin_types_compatible_p(int, long)", "int"},
+      {d, "__builtin_choose_expr(1, 1.0f, \"x\")", "float"},
+      {d, "__builtin_choose_expr(0, 1.0f, \"x\")", "char[2]"},
+      {d, "__builtin_huge_val()", "double"},
+      {d, "__builtin_huge_valf()", "float"},
+      {d, "__builtin_huge_vall()", "long double"},
+      {d, "__builtin_inff()", "float"},
+      {d, "__builtin_nanf(\"\")", "float"},
+      {d, "__builtin_isgreater(1.0, 2)", "int"},
+      {d, "__builtin_isgreaterequal(1.0f, 2.0)", "int"},
+      {d, "__builtin_isless(1.0L, 2)", "int"},
+      {d, "__builtin_islessequal(1, 2.0)", "int"},
+      {d, "__builtin_islessgreater(1.0, 2.0)", "int"},
+      {d, "__builtin_isunordered(1.0, 2.0)", "int"},
+      {d, "__builtin_signbit(1.0)", "int"},
+      {d, "__builtin_signbitf(1.0f)", "int"},
+      {d, "__builtin_signbitl(1.0L)", "int"},
+      {d, "__builtin_llabs(1)", "long long"},
+      {d, "__builtin_trap()", "void"},
+      {d, "__builtin_unreachable()", "void"},
+      {"", "1.0iF", "float _Complex"},
+      {"", "1.0fi", "float _Complex"},
+      {"", "1.0i", "double _Complex"},
+      {"", "1.0Lj", "long double _Complex"},
+      {"", "0x1p3jL", "long double _Complex"},
+  });
+  TargetGuard guard(TARGET_LINUX_X64);
+  expect_types({{d, "__builtin_offsetof(struct S, a[1])", "unsigned long"}});
+}
+
+TEST(BuiltinTest, VaListHasEachTargetsShape) {
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    bool on_linux = kind == TARGET_LINUX_X64;
+    SCOPED_TRACE(on_linux ? "linux" : "windows");
+    expect_values("struct W { char c; __builtin_va_list v; };\n",
+                  {
+                      {"sizeof(__builtin_va_list)", on_linux ? 24 : 8},
+                      {"sizeof(struct W)", on_linux ? 32 : 16},
+                  });
+    const char *src = "typedef __builtin_va_list va_list;\n"
+                      "int sum(int n, ...) {\n"
+                      "  va_list ap, aq;\n"
+                      "  __builtin_va_start(ap, n);\n"
+                      "  __builtin_va_copy(aq, ap);\n"
+                      "  int s = __builtin_va_arg(ap, int) + __builtin_va_arg(aq, int);\n"
+                      "  __builtin_va_end(aq);\n"
+                      "  __builtin_va_end(ap);\n"
+                      "  return s;\n"
+                      "}\n"
+                      "int vsum(va_list ap) { return __builtin_va_arg(ap, int); }\n"
+                      "void copy_param(va_list s) { va_list d; __builtin_va_copy(d, s); }\n";
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.parse_errors, 0);
+    EXPECT_EQ(c.errors, 0) << c.diagnostics;
+  }
+}
+
+TEST(BuiltinTest, VaListIsAnLvalueOnlyWhereItIsNotAnArray) {
+  const char *src = "void f(int n, ...) {\n"
+                    "  __builtin_va_list ap;\n"
+                    "  __builtin_va_start(ap, n);\n"
+                    "  __builtin_va_end((0, ap));\n"
+                    "}\n";
+  {
+    Checked c;
+    check(c, src);
+    EXPECT_EQ(c.diagnostics,
+              error_at(src, ", ap))", 1, "not an lvalue as an argument of '__builtin_va_end'"))
+        << "on Windows va_list is a char *, so va_end needs its address";
+  }
+  TargetGuard guard(TARGET_LINUX_X64);
+  Checked c;
+  check(c, src);
+  EXPECT_EQ(c.errors, 0) << "on Linux the array decays to a pointer, which is enough\n"
+                         << c.diagnostics;
+}
+
+TEST(BuiltinTest, VaMisuseIsReported) {
+  const char *src = "typedef __builtin_va_list va_list;\n"
+                    "int variadic(int n, ...) { return n; }\n"
+                    "va_list g;\n"
+                    "int y = sizeof(__builtin_va_start(g, y), 1);\n"
+                    "void fixed(int n) { va_list ap; __builtin_va_start(ap, n); }\n"
+                    "int x;\n"
+                    "void bad(int n, ...) {\n"
+                    "  va_list ap;\n"
+                    "  __builtin_va_start(x, n);\n"
+                    "  __builtin_va_start((char *)ap, n);\n"
+                    "  __builtin_va_end(1);\n"
+                    "  __builtin_va_copy(ap, 2);\n"
+                    "  __builtin_va_arg(ap, void);\n"
+                    "  __builtin_va_arg(ap, int[2]);\n"
+                    "  __builtin_va_arg(ap, int(void));\n"
+                    "  __builtin_va_start(ap);\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  std::string type_problem =
+      "the type argument of '__builtin_va_arg' must be a complete object type that is not an array";
+  EXPECT_EQ(
+      c.diagnostics,
+      error_at(src, "__builtin_va_start(g", 1,
+               "a function without '...' cannot call '__builtin_va_start'") +
+          error_at(src, "__builtin_va_start(ap, n)", 1,
+                   "a function without '...' cannot call '__builtin_va_start'") +
+          error_at(src, "x, n", 1, "not a va_list as an argument of '__builtin_va_start'") +
+          error_at(src, "(char *)ap", 1, "not an lvalue as an argument of '__builtin_va_start'") +
+          error_at(src, "1);\n  __builtin_va_copy", 1,
+                   "not a va_list as an argument of '__builtin_va_end'") +
+          error_at(src, "2);", 1, "not a va_list as an argument of '__builtin_va_copy'") +
+          error_at(src, "__builtin_va_arg(ap, void)", 1, type_problem) +
+          error_at(src, "__builtin_va_arg(ap, int[2])", 1, type_problem) +
+          error_at(src, "__builtin_va_arg(ap, int(void))", 1, type_problem) +
+          error_at(src, "__builtin_va_start(ap);", 1,
+                   "wrong number of arguments to '__builtin_va_start'"));
+}
+
+TEST(BuiltinTest, OffsetofComputesTheConstantOffset) {
+  expect_values("struct S { char c; int a[4]; struct In { char x; double d; } in[3]; short s;\n"
+                "           long double ld; };\n"
+                "union U { char c; double d; int a[5]; };\n"
+                "typedef struct S T;\n",
+                {
+                    {"__builtin_offsetof(struct S, c)", 0},
+                    {"__builtin_offsetof(struct S, a)", 4},
+                    {"__builtin_offsetof(struct S, a[3])", 16},
+                    {"__builtin_offsetof(struct S, in)", 24},
+                    {"__builtin_offsetof(struct S, in[2])", 56},
+                    {"__builtin_offsetof(struct S, in[1].d)", 48},
+                    {"__builtin_offsetof(struct S, s)", 72},
+                    {"__builtin_offsetof(struct S, ld)", 80},
+                    {"__builtin_offsetof(union U, a[4])", 16},
+                    {"__builtin_offsetof(T, in[2].x)", 56},
+                    {"__builtin_offsetof(struct S, a[1 + 1])", 12},
+                });
+  const char *src = "struct S { int a[4]; };\n"
+                    "unsigned long long at(int n) { return __builtin_offsetof(struct S, a[n]); }\n"
+                    "void f(int n) { enum { E = __builtin_offsetof(struct S, a[n]) }; }\n";
+  Checked c;
+  check(c, src);
+  EXPECT_EQ(c.diagnostics, error_at(src, "__builtin_offsetof(struct S, a[n]) }", 1,
+                                    "enumerator value is not an integer constant expression 'E'"))
+      << "a variable index is allowed, but the result is not a constant";
+}
+
+TEST(BuiltinTest, OffsetofMisuseIsReported) {
+  const char *src = "struct S { int a[2]; int bf : 3; int *p; struct In { int x; } in; };\n"
+                    "struct Inc;\n"
+                    "int e1 = __builtin_offsetof(int, a);\n"
+                    "int e2 = __builtin_offsetof(struct S, zz);\n"
+                    "int e3 = __builtin_offsetof(struct S, bf);\n"
+                    "int e4 = __builtin_offsetof(struct Inc, a);\n"
+                    "int e5 = __builtin_offsetof(struct S, p[1]);\n"
+                    "int e6 = __builtin_offsetof(struct S, a[1.0]);\n"
+                    "int e7 = __builtin_offsetof(struct S, in.x.y);\n"
+                    "enum { E = __builtin_offsetof(struct Missing, a) };\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  std::string subscript = "a subscript in offsetof needs an array and an integer";
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "__builtin_offsetof(int", 1,
+                     "offsetof needs a structure or union to find member 'a'") +
+                error_at(src, "__builtin_offsetof(struct S, zz", 1, "no member named 'zz'") +
+                error_at(src, "__builtin_offsetof(struct S, bf", 1,
+                         "offsetof cannot name bit-field 'bf'") +
+                error_at(src, "__builtin_offsetof(struct Inc", 1,
+                         "member access into an incomplete structure or union") +
+                error_at(src, "__builtin_offsetof(struct S, p", 1, subscript) +
+                error_at(src, "__builtin_offsetof(struct S, a[1.0", 1, subscript) +
+                error_at(src, "__builtin_offsetof(struct S, in", 1,
+                         "offsetof needs a structure or union to find member 'y'") +
+                error_at(src, "__builtin_offsetof(struct Missing", 1,
+                         "member access into an incomplete structure or union"))
+      << "one error each: a failed offsetof is not also 'not constant'";
+}
+
+TEST(BuiltinTest, TypesCompatibleFollowsGcc) {
+  expect_values("enum E { EA };\nstruct S { int x; };\ntypedef struct S T;\nint arr[3];\n",
+                {
+                    {"__builtin_types_compatible_p(int, const int)", 1},
+                    {"__builtin_types_compatible_p(int, long)", 0},
+                    {"__builtin_types_compatible_p(char *, const char *)", 0},
+                    {"__builtin_types_compatible_p(int * const, int *)", 1},
+                    {"__builtin_types_compatible_p(const int[3], int[3])", 1},
+                    {"__builtin_types_compatible_p(const int[2][3], int[][3])", 1},
+                    {"__builtin_types_compatible_p(int * const[3], int *[3])", 1},
+                    {"__builtin_types_compatible_p(const int *[3], int *[3])", 0},
+                    {"__builtin_types_compatible_p(int[3], int[4])", 0},
+                    {"__builtin_types_compatible_p(enum E, unsigned int)", 1},
+                    {"__builtin_types_compatible_p(enum E, int)", 0},
+                    {"__builtin_types_compatible_p(int (*)(void), int (*)())", 1},
+                    {"__builtin_types_compatible_p(struct S, T)", 1},
+                    {"__builtin_types_compatible_p(__typeof__(1.0f), float)", 1},
+                    {"__builtin_types_compatible_p(__typeof__(1.0f), double)", 0},
+                    {"__builtin_types_compatible_p(__typeof__((char)1), char)", 1},
+                    {"__builtin_types_compatible_p(__typeof__(arr), int[3])", 1},
+                    {"__builtin_types_compatible_p(__typeof__(1.0iF), float _Complex)", 1},
+                });
+}
+
+TEST(BuiltinTest, ChooseExprTakesTheChosenBranch) {
+  expect_values("int g;\n", {
+                                {"__builtin_choose_expr(1, 3, 4.5)", 3},
+                                {"__builtin_choose_expr(0, 4.5, 7)", 7},
+                                {"__builtin_choose_expr(1, 5, g)", 5},
+                                {"sizeof(__builtin_choose_expr(0, 1, 2.0))", 8},
+                                {"sizeof(__builtin_choose_expr(1, (char)1, 2.0))", 1},
+                            });
+  const char *src = "int a, b;\n"
+                    "void f(int n) {\n"
+                    "  __builtin_choose_expr(1, a, b) = 3;\n"
+                    "  __builtin_choose_expr(1, 1, a) = 3;\n"
+                    "  int x = __builtin_choose_expr(n, 1, 2);\n"
+                    "  int y = __builtin_choose_expr(1.0, 1, 2);\n"
+                    "  int z = __builtin_choose_expr(1, 1);\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  std::string not_constant =
+      "the first argument of '__builtin_choose_expr' must be an integer constant expression";
+  EXPECT_EQ(c.diagnostics, error_at(src, "= 3", 2, "not a modifiable lvalue on the left of '='") +
+                               error_at(src, "__builtin_choose_expr(n", 1, not_constant) +
+                               error_at(src, "__builtin_choose_expr(1.0", 1, not_constant) +
+                               error_at(src, "__builtin_choose_expr(1, 1)", 1,
+                                        "wrong number of arguments to '__builtin_choose_expr'"))
+      << "the chosen branch decides lvalue-ness: a can be assigned, 1 cannot";
+}
+
+TEST(BuiltinTest, FloatingBuiltinsCheckTheirArguments) {
+  const char *src = "void f(double d, int *p, double _Complex z, long double ld, const char *s) {\n"
+                    "  int ok = __builtin_isgreater(1, d) + __builtin_signbitf(ld);\n"
+                    "  long long fine = __builtin_llabs(1.5);\n"
+                    "  float n = __builtin_nanf(s);\n"
+                    "  int e1 = __builtin_isgreater(1, 2);\n"
+                    "  int e2 = __builtin_isless(p, d);\n"
+                    "  int e3 = __builtin_isunordered(z, d);\n"
+                    "  int e4 = __builtin_signbit(1);\n"
+                    "  long long e5 = __builtin_llabs(p);\n"
+                    "  float e6 = __builtin_nanf(1);\n"
+                    "  float e7 = __builtin_nanf(L\"\");\n"
+                    "  double e8 = __builtin_huge_val(1);\n"
+                    "  __builtin_trap(1);\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(
+      c.diagnostics,
+      error_at(src, "__builtin_isgreater(1, 2", 1,
+               "non-floating-point arguments in a call to '__builtin_isgreater'") +
+          error_at(src, "__builtin_isless", 1,
+                   "non-floating-point arguments in a call to '__builtin_isless'") +
+          error_at(src, "__builtin_isunordered", 1,
+                   "non-floating-point arguments in a call to '__builtin_isunordered'") +
+          error_at(src, "__builtin_signbit(", 1,
+                   "non-floating-point arguments in a call to '__builtin_signbit'") +
+          error_at(src, "p);", 1, "incompatible types in argument") +
+          error_at(src, "1);\n  float e7", 1, "incompatible types in argument") +
+          error_at(src, "L\"\"", 1, "incompatible types in argument") +
+          error_at(src, "__builtin_huge_val(1", 1,
+                   "wrong number of arguments to '__builtin_huge_val'") +
+          error_at(src, "__builtin_trap(1", 1, "wrong number of arguments to '__builtin_trap'"));
+}
+
+TEST(BuiltinTest, ConstantBuiltinsCanInitializeStaticObjects) {
+  const char *src = "struct S { int a[4]; };\n"
+                    "double h = __builtin_huge_val();\n"
+                    "float hf = __builtin_huge_valf();\n"
+                    "long double hl = __builtin_huge_vall();\n"
+                    "float i = __builtin_inff();\n"
+                    "float n = __builtin_nanf(\"\");\n"
+                    "unsigned long long o = __builtin_offsetof(struct S, a[2]);\n"
+                    "int t = __builtin_types_compatible_p(int, int);\n"
+                    "double c = __builtin_choose_expr(1, __builtin_huge_val(), 0);\n"
+                    "float _Complex z = 1.0iF;\n"
+                    "const char *str;\n"
+                    "int k;\n"
+                    "float bad1 = __builtin_nanf(str);\n"
+                    "int bad2 = __builtin_isgreater(1.0, 2.0);\n"
+                    "unsigned long long bad3 = __builtin_offsetof(struct S, a[k]);\n"
+                    "double bad4 = __builtin_choose_expr(0, 1, k);\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  std::string message = "an initializer for an object with static storage must be constant";
+  EXPECT_EQ(c.diagnostics, error_at(src, "__builtin_nanf(str", 1, message) +
+                               error_at(src, "__builtin_isgreater", 1, message) +
+                               error_at(src, "__builtin_offsetof(struct S, a[k", 1, message) +
+                               error_at(src, "__builtin_choose_expr(0", 1, message));
+}
+
+TEST(BuiltinTest, AnImaginaryConstantHasNoRealPart) {
+  expect_values("", {
+                        {"(int)1.0i", 0},
+                        {"(int)2.5", 2},
+                        {"sizeof(1.0fi)", 8},
+                        {"sizeof(1.0iL)", 32},
+                    });
+}
+
+TEST(BuiltinTest, PrettyFunctionAndFunctionNameTheFunction) {
+  const char *src = "void ff(void) {\n"
+                    "  int y[sizeof(__PRETTY_FUNCTION__) == 3 ? 1 : -1];\n"
+                    "  int z[sizeof(__FUNCTION__) == 3 ? 1 : -1];\n"
+                    "  const char *p = __func__;\n"
+                    "}\n"
+                    "const char *outside = __PRETTY_FUNCTION__;\n";
+  Checked c;
+  check(c, src);
+  EXPECT_EQ(c.diagnostics, error_at(src, "__PRETTY_FUNCTION__;", 1,
+                                    "use of undeclared identifier '__PRETTY_FUNCTION__'"))
+      << "like __func__, only inside a function";
+}
+
+TEST(BuiltinTest, ATypeofOperandIsNotAUse) {
+  const char *src = "static int helper(void);\n"
+                    "int t[__builtin_types_compatible_p(__typeof__(helper()), int) ? 1 : -1];\n";
+  Checked c;
+  check(c, src);
+  EXPECT_EQ(c.errors, 0) << "a static function named only inside __typeof__ is never called\n"
+                         << c.diagnostics;
+}
+
+static const char *tgmath_declarations =
+    "float sf(float); double sd(double); long double sl(long double);\n"
+    "float _Complex csf(float _Complex); double _Complex csd(double _Complex);\n"
+    "long double _Complex csl(long double _Complex);\n"
+    "float af(float _Complex); double ad(double _Complex); long double al(long double _Complex);\n"
+    "int ef(float); int ed(double); int el(long double);\n"
+    "float lf(float, int); double ld(double, int); long double ll(long double, int);\n"
+    "float nf(float, long double); double nd(double, long double);\n"
+    "long double nl(long double, long double);\n"
+    "float pf(float, float); double pd(double, double); long double pl(long double, long double);\n"
+    "float _Complex cpf(float _Complex, float _Complex);\n"
+    "double _Complex cpd(double _Complex, double _Complex);\n"
+    "long double _Complex cpl(long double _Complex, long double _Complex);\n"
+    "float gf(int, float); double gd(int, double); long double gl(int, long double);\n"
+    "float _Complex kf(float _Complex); double _Complex kd(double _Complex);\n"
+    "long double _Complex kl(long double _Complex);\n"
+    "const float qf(float); const double qd(double); const long double ql(long double);\n"
+    "float vf; double vd; long double vl; int vi; char vc; float _Complex vcf;\n"
+    "double _Complex vcd; long double _Complex vcl;\n"
+    "#define SQRT(x) __builtin_tgmath(sf, sd, sl, csf, csd, csl, x)\n"
+    "#define FABS(x) __builtin_tgmath(sf, sd, sl, af, ad, al, x)\n"
+    "#define ILOGB(x) __builtin_tgmath(ef, ed, el, x)\n"
+    "#define LDEXP(x, n) __builtin_tgmath(lf, ld, ll, x, n)\n"
+    "#define NEXTTOWARD(x, y) __builtin_tgmath(nf, nd, nl, x, y)\n"
+    "#define POW(x, y) __builtin_tgmath(pf, pd, pl, cpf, cpd, cpl, x, y)\n"
+    "#define LATE(n, x) __builtin_tgmath(gf, gd, gl, n, x)\n"
+    "#define CONJ(x) __builtin_tgmath(kf, kd, kl, x)\n"
+    "#define QUAL(x) __builtin_tgmath(qf, qd, ql, x)\n";
+
+TEST(TgmathTest, TheArgumentTypesPickTheFunction) {
+  std::vector<TypeCase> cases = {
+      {"", "SQRT(vf)", "float"},
+      {"", "SQRT(vd)", "double"},
+      {"", "SQRT(vl)", "long double"},
+      {"", "SQRT(vi)", "double"},
+      {"", "SQRT(vc)", "double"},
+      {"", "SQRT(vcf)", "float _Complex"},
+      {"", "SQRT(vcd)", "double _Complex"},
+      {"", "SQRT(vcl)", "long double _Complex"},
+      {"", "POW(vf, vf)", "float"},
+      {"", "POW(vf, vd)", "double"},
+      {"", "POW(vf, vi)", "double"},
+      {"", "POW(vf, vl)", "long double"},
+      {"", "POW(vl, vi)", "long double"},
+      {"", "POW(vcf, vf)", "float _Complex"},
+      {"", "POW(vf, vcd)", "double _Complex"},
+      {"", "FABS(vf)", "float"},
+      {"", "FABS(vcf)", "float"},
+      {"", "FABS(vcl)", "long double"},
+      {"", "ILOGB(vf)", "int"},
+      {"", "ILOGB(vl)", "int"},
+      {"", "LDEXP(vf, vi)", "float"},
+      {"", "LDEXP(vf, vl)", "float"},
+      {"", "LDEXP(vi, vi)", "double"},
+      {"", "NEXTTOWARD(vf, vl)", "float"},
+      {"", "NEXTTOWARD(vi, vl)", "double"},
+      {"", "LATE(vl, vf)", "float"},
+      {"", "LATE(vi, vd)", "double"},
+      {"", "CONJ(vd)", "double _Complex"},
+      {"", "CONJ(vf)", "float _Complex"},
+      {"", "CONJ(vi)", "double _Complex"},
+      {"", "CONJ(vcl)", "long double _Complex"},
+      {"", "QUAL(vd)", "double"},
+  };
+  for (TypeCase &test : cases)
+    test.declarations = tgmath_declarations;
+  expect_types(cases, true);
+}
+
+TEST(TgmathTest, TheChosenFunctionIsRecorded) {
+  std::string src = std::string(tgmath_declarations) + "void g(void) { double r = POW(vf, vi); }\n";
+  Checked c;
+  check_preprocessed(c, src.c_str());
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  std::vector<ast_node *> r = declarations(c, "r");
+  ASSERT_EQ(r.size(), 1u);
+  ast_node *call = r[0]->var_decl.init_value;
+  ASSERT_EQ(call->type, AST_NODE_TYPE_BUILTIN);
+  ASSERT_NE(call->builtin.chosen, nullptr);
+  EXPECT_STREQ(call->builtin.chosen->tok.value, "pd");
+  EXPECT_EQ(call->builtin.value, 6) << "six of the eight arguments are functions";
+}
+
+TEST(TgmathTest, MisuseIsReported) {
+  std::string src =
+      std::string(tgmath_declarations) +
+      "int old(); int va(double, ...); float rf(float, int *); double rd(double, int *);\n"
+      "long double rl(long double, int *); int *vp;\n"
+      "void f(void) {\n"
+      "  __builtin_tgmath(sf, sd, sl, vcf);\n"
+      "  __builtin_tgmath(sf, sd, sl, vp);\n"
+      "  __builtin_tgmath(old, sd, 1.0);\n"
+      "  __builtin_tgmath(sd, va, 1.0);\n"
+      "  __builtin_tgmath(sf, pd, 1.0);\n"
+      "  __builtin_tgmath(sd, sd, 1.0);\n"
+      "  __builtin_tgmath(sd, 1.0);\n"
+      "  __builtin_tgmath(rf, rd, rl, vf, vd);\n"
+      "  __builtin_tgmath(vd, sd, 1.0);\n"
+      "}\n";
+  const char *s = src.c_str();
+  Checked c;
+  check_preprocessed(c, s);
+  ASSERT_EQ(c.parse_errors, 0);
+  std::string prototype =
+      "each function given to '__builtin_tgmath' must have a prototype without '...'";
+  EXPECT_EQ(
+      c.diagnostics,
+      error_at(s, "__builtin_tgmath(sf, sd, sl, vcf)", 1,
+               "no matching function for type-generic call") +
+          error_at(s, "vp);", 1, "an argument of a type-generic call must have arithmetic type") +
+          error_at(s, "old, sd", 1, prototype) + error_at(s, "va, 1.0", 1, prototype) +
+          error_at(s, "pd, 1.0", 1,
+                   "the functions given to '__builtin_tgmath' must take the same number of "
+                   "parameters") +
+          error_at(s, "__builtin_tgmath(sd, sd", 1,
+                   "the functions given to '__builtin_tgmath' must differ in type") +
+          error_at(s, "__builtin_tgmath(sd, 1.0)", 1,
+                   "wrong number of arguments to '__builtin_tgmath'") +
+          error_at(s, "vd);\n  __builtin_tgmath(vd", 1, "incompatible types in argument") +
+          error_at(s, "vd, sd", 1, prototype));
 }

@@ -30,7 +30,7 @@ void token_buf_push(token_buf *tb, token t) {
 
 token token_buf_next(token_buf *tb) {
   if (tb == NULL || tb->pos >= tb->count) {
-    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0};
+    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0, 0, 0};
     if (tb != NULL && tb->count > 0) {
       t.line = tb->tokens[tb->count - 1].line;
       t.column = tb->tokens[tb->count - 1].column;

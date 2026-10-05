@@ -15,6 +15,21 @@ static const keyword keywords[] = {
     {"_Bool", TOKEN_BOOL},
     {"_Complex", TOKEN_COMPLEX},
     {"_Imaginary", TOKEN_IMAGINARY},
+    {"__asm", TOKEN_ASM},
+    {"__asm__", TOKEN_ASM},
+    {"__attribute", TOKEN_ATTRIBUTE},
+    {"__attribute__", TOKEN_ATTRIBUTE},
+    {"__const", TOKEN_CONST},
+    {"__const__", TOKEN_CONST},
+    {"__extension__", TOKEN_EXTENSION},
+    {"__inline", TOKEN_INLINE},
+    {"__inline__", TOKEN_INLINE},
+    {"__restrict", TOKEN_RESTRICT},
+    {"__restrict__", TOKEN_RESTRICT},
+    {"__signed", TOKEN_SIGNED},
+    {"__signed__", TOKEN_SIGNED},
+    {"__volatile", TOKEN_VOLATILE},
+    {"__volatile__", TOKEN_VOLATILE},
     {"auto", TOKEN_AUTO},
     {"break", TOKEN_BREAK},
     {"case", TOKEN_CASE},
@@ -283,6 +298,20 @@ int integer_suffix(const char *suffix, int *is_unsigned, int *long_count) {
   return *s == '\0';
 }
 
+int floating_suffix(const char *suffix, char *size, int *is_imaginary) {
+  *size = 0;
+  *is_imaginary = 0;
+  for (const char *s = suffix; *s != '\0'; s++) {
+    if (!*size && (*s == 'f' || *s == 'F' || *s == 'l' || *s == 'L'))
+      *size = *s == 'f' || *s == 'F' ? 'f' : 'l';
+    else if (!*is_imaginary && (*s == 'i' || *s == 'I' || *s == 'j' || *s == 'J'))
+      *is_imaginary = 1;
+    else
+      return 0;
+  }
+  return 1;
+}
+
 int add_overflows(long long a, long long b) {
   return (b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b);
 }
@@ -359,9 +388,9 @@ number_kind classify_number(const char *spelling, const char **error) {
   } else if (hex) {
     return invalid_number(error, "hexadecimal floating constant requires an exponent");
   }
-  if (*s == 'f' || *s == 'F' || *s == 'l' || *s == 'L')
-    s++;
-  if (*s != '\0')
+  char size;
+  int is_imaginary;
+  if (!floating_suffix(s, &size, &is_imaginary))
     return invalid_number(error, "invalid suffix on a floating constant");
   return NUMBER_FLOATING;
 }
@@ -380,6 +409,7 @@ void lexer_init(lexer *lex, const char *source) {
   lex->file = NULL;
   lex->line_offset = 0;
   lex->vertical_spaces = 0;
+  lex->system_header = 0;
 }
 
 static void lexer_error(lexer *lex, int line, int column, const char *message) {
@@ -457,6 +487,8 @@ static token lexer_make_token(lexer *lex, token_type type, const char *value) {
   tok.file = lex->file;
   tok.no_expand = 0;
   tok.leading_space = 0;
+  tok.system_header = lex->system_header;
+  tok.pack = 0;
   if (value) {
     tok.value = strdup(value);
   } else {
@@ -574,7 +606,7 @@ static token lexer_collect_identifier(lexer *lex) {
 
 token lexer_next_token(lexer *lex) {
   if (!lex || !lex->source) {
-    token tok = {TOKEN_UNKNOWN, NULL, 0, 0, 0, NULL, 0, 0};
+    token tok = {TOKEN_UNKNOWN, NULL, 0, 0, 0, NULL, 0, 0, 0, 0};
     return tok;
   }
 

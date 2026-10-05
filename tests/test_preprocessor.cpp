@@ -325,16 +325,22 @@ TEST_F(PreprocessorTest, PushTakesOwnershipRatherThanCopying) {
 
 extern "C" {
 int tb_free_calls = 0;
+int tb_free_pointer_calls = 0;
 int tb_realloc_calls = 0;
 int tb_realloc_allow = -1;
+int tb_realloc_fail_at = -1;
 void __real_free(void *p);
 void *__real_realloc(void *p, size_t n);
 void __wrap_free(void *p) {
   tb_free_calls++;
+  if (p != NULL)
+    tb_free_pointer_calls++;
   __real_free(p);
 }
 void *__wrap_realloc(void *p, size_t n) {
   tb_realloc_calls++;
+  if (tb_realloc_fail_at >= 0 && tb_realloc_fail_at-- == 0)
+    return NULL;
   if (tb_realloc_allow >= 0) {
     if (tb_realloc_allow == 0)
       return NULL;
@@ -1964,12 +1970,18 @@ TEST_F(PreprocessorTest, SkippedGroupsDoNoExpansionWork) {
     src += "M ";
   src += "\n#endif\nint ok;";
 
+  token_buf empty;
+  tb_realloc_calls = 0;
+  pp_run(&empty, "");
+  int fixed_cost = tb_realloc_calls;
+  token_buf_free(&empty);
+
   tb_realloc_calls = 0;
   run(src.c_str());
 
   std::vector<std::string> expected = {"int", "ok", ";"};
   EXPECT_EQ(spellings(), expected);
-  EXPECT_LT(tb_realloc_calls, 50)
+  EXPECT_LT(tb_realloc_calls - fixed_cost, 50)
       << "the emitting check must come before try_expand: expanding 500 "
          "macros and throwing the result away produces the right tokens but "
          "does thousands of allocations of pointless work";
@@ -2469,7 +2481,7 @@ protected:
 
   void run(const char *source) {
     static const char *dirs[] = {"pp_test_inc"};
-    rc = pp_run_ex(&tb, source, "pp_test_src/main.c", dirs, 1);
+    rc = pp_run_ex(&tb, source, "pp_test_src/main.c", dirs, 1, nullptr, 0);
     initialised = true;
   }
 
@@ -2606,7 +2618,7 @@ TEST_F(IncludeTest, CyclicIncludesStopAtTheDepthCap) {
 
 TEST_F(IncludeTest, PpRunFileReadsFromDisk) {
   static const char *dirs[] = {"pp_test_inc"};
-  rc = pp_run_file(&tb, "pp_test_src/standalone.c", dirs, 1);
+  rc = pp_run_file(&tb, "pp_test_src/standalone.c", dirs, 1, nullptr, 0);
   initialised = true;
   std::vector<std::string> expected = {"int", "from_src_dir", ";", "int", "tail", ";"};
   EXPECT_EQ(spellings(), expected);
@@ -2614,7 +2626,7 @@ TEST_F(IncludeTest, PpRunFileReadsFromDisk) {
 }
 
 TEST_F(IncludeTest, PpRunFileOnAMissingPathFails) {
-  rc = pp_run_file(&tb, "pp_test_src/does_not_exist.c", nullptr, 0);
+  rc = pp_run_file(&tb, "pp_test_src/does_not_exist.c", nullptr, 0, nullptr, 0);
   initialised = true;
   EXPECT_EQ(rc, -1);
 }
@@ -2629,6 +2641,159 @@ TEST_F(IncludeTest, ManyIncludesDoNotLeak) {
   EXPECT_EQ(rc, 0);
 }
 
+class SystemHeaderTest : public ::testing::Test {
+protected:
+  token_buf tb;
+  bool initialised = false;
+  int rc = 0;
+
+  static void write_file(const char *path, const char *text) {
+    std::ofstream f(path, std::ios::binary);
+    f << text;
+  }
+
+  void SetUp() override {
+    _mkdir("pp_sys_user");
+    _mkdir("pp_sys_sys");
+    _mkdir("pp_sys_src");
+    write_file("pp_sys_sys/sys.h", "int from_sys;\n");
+    write_file("pp_sys_user/user.h", "int from_user;\n");
+    write_file("pp_sys_user/both.h", "int both_from_user;\n");
+    write_file("pp_sys_sys/both.h", "int both_from_sys;\n");
+    write_file("pp_sys_sys/outer.h", "#include \"inner.h\"\nint sys_outer;\n");
+    write_file("pp_sys_sys/inner.h", "int sys_inner;\n");
+    write_file("pp_sys_user/u_outer.h", "#include \"u_inner.h\"\nint user_outer;\n");
+    write_file("pp_sys_user/u_inner.h", "int user_inner;\n");
+    write_file("pp_sys_src/local.h", "int local;\n");
+    write_file("pp_sys_sys/macros.h", "#define WRAP(x) [ x sys_body ]\n"
+                                      "#define STR(x) #x\n"
+                                      "#define GLUE(b) sys_ ## b\n"
+                                      "#define HERE __LINE__\n");
+  }
+
+  void TearDown() override {
+    if (initialised)
+      token_buf_free(&tb);
+    for (const char *f :
+         {"pp_sys_sys/sys.h", "pp_sys_user/user.h", "pp_sys_user/both.h", "pp_sys_sys/both.h",
+          "pp_sys_sys/outer.h", "pp_sys_sys/inner.h", "pp_sys_user/u_outer.h",
+          "pp_sys_user/u_inner.h", "pp_sys_src/local.h", "pp_sys_sys/macros.h"})
+      remove(f);
+    _rmdir("pp_sys_user");
+    _rmdir("pp_sys_sys");
+    _rmdir("pp_sys_src");
+  }
+
+  void run(const char *source) {
+    static const char *user_dirs[] = {"pp_sys_user"};
+    static const char *system_dirs[] = {"pp_sys_sys"};
+    rc = pp_run_ex(&tb, source, "pp_sys_src/main.c", user_dirs, 1, system_dirs, 1);
+    initialised = true;
+  }
+
+  std::map<std::string, int> flags() {
+    std::map<std::string, int> out;
+    for (int i = 0; i < tb.count; i++) {
+      if (tb.tokens[i].type != TOKEN_EOF && tb.tokens[i].value != nullptr)
+        out[tb.tokens[i].value] = tb.tokens[i].system_header;
+    }
+    return out;
+  }
+};
+
+TEST_F(SystemHeaderTest, AFileFromASystemFolderIsASystemHeader) {
+  run("#include <sys.h>\n#include <user.h>\nint main_token;\n");
+  EXPECT_EQ(rc, 0);
+  std::map<std::string, int> f = flags();
+  EXPECT_EQ(f["from_sys"], 1);
+  EXPECT_EQ(f["from_user"], 0)
+      << "<user.h> found in the programmer's folder is not a system header";
+  EXPECT_EQ(f["main_token"], 0);
+  EXPECT_EQ(f["int"], 0) << "the last int comes from the main file";
+}
+
+TEST_F(SystemHeaderTest, TheProgrammersFolderIsSearchedBeforeTheSystemFolders) {
+  run("#include <both.h>\n");
+  EXPECT_EQ(rc, 0);
+  std::map<std::string, int> f = flags();
+  EXPECT_EQ(f.count("both_from_user"), 1u);
+  EXPECT_EQ(f.count("both_from_sys"), 0u);
+  EXPECT_EQ(f["both_from_user"], 0);
+}
+
+TEST_F(SystemHeaderTest, AQuotedIncludeIsWhateverItsIncluderIs) {
+  run("#include <outer.h>\n#include <u_outer.h>\n#include \"local.h\"\n");
+  EXPECT_EQ(rc, 0);
+  std::map<std::string, int> f = flags();
+  EXPECT_EQ(f["sys_inner"], 1) << "found next to a system header";
+  EXPECT_EQ(f["sys_outer"], 1);
+  EXPECT_EQ(f["user_inner"], 0) << "found next to a programmer's header";
+  EXPECT_EQ(f["user_outer"], 0);
+  EXPECT_EQ(f["local"], 0) << "found next to the main file";
+}
+
+TEST_F(SystemHeaderTest, MacroExpansionKeepsEachTokensOrigin) {
+  run("#include <macros.h>\n"
+      "WRAP(user_arg)\n"
+      "GLUE(name)\n"
+      "STR(user_word)\n"
+      "HERE\n"
+      "__LINE__\n");
+  EXPECT_EQ(rc, 0);
+  ASSERT_GE(tb.count, 9);
+  const token *t = tb.tokens;
+  EXPECT_STREQ(t[0].value, "[");
+  EXPECT_EQ(t[0].system_header, 1) << "the macro's own tokens come from the system header";
+  EXPECT_STREQ(t[1].value, "user_arg");
+  EXPECT_EQ(t[1].system_header, 0) << "an argument comes from where it was written";
+  EXPECT_EQ(t[2].system_header, 1);
+  EXPECT_STREQ(t[4].value, "sys_name");
+  EXPECT_EQ(t[4].system_header, 1) << "## keeps its left piece's origin";
+  EXPECT_STREQ(t[5].value, "user_word");
+  EXPECT_EQ(t[5].type, TOKEN_STRING);
+  EXPECT_EQ(t[5].system_header, 0) << "# keeps its argument's origin";
+  EXPECT_STREQ(t[6].value, "5") << "__LINE__ reports where HERE was used";
+  EXPECT_EQ(t[6].system_header, 1) << "__LINE__ written in the system header";
+  EXPECT_STREQ(t[7].value, "6");
+  EXPECT_EQ(t[7].system_header, 0) << "__LINE__ written in the main file";
+}
+
+TEST_F(SystemHeaderTest, StringizingNothingKeepsThePlaceOfItsHash) {
+  run("#include <macros.h>\nconst char *s = STR();\n");
+  EXPECT_EQ(rc, 0);
+  const token *empty = nullptr;
+  for (int i = 0; i < tb.count; i++) {
+    if (tb.tokens[i].type == TOKEN_STRING)
+      empty = &tb.tokens[i];
+  }
+  ASSERT_NE(empty, nullptr);
+  EXPECT_STREQ(empty->value, "");
+  EXPECT_EQ(empty->system_header, 1) << "the string was made by the # in the system header";
+  EXPECT_EQ(empty->line, 2) << "the # is on line 2 of macros.h";
+  ASSERT_NE(empty->file, nullptr);
+  EXPECT_NE(std::string(empty->file).find("macros.h"), std::string::npos);
+}
+
+TEST_F(SystemHeaderTest, AFileRunHasTheSameTwoFolderLists) {
+  write_file("pp_sys_src/file.c", "#include <sys.h>\n#include <user.h>\n");
+  static const char *user_dirs[] = {"pp_sys_user"};
+  static const char *system_dirs[] = {"pp_sys_sys"};
+  rc = pp_run_file(&tb, "pp_sys_src/file.c", user_dirs, 1, system_dirs, 1);
+  initialised = true;
+  remove("pp_sys_src/file.c");
+  EXPECT_EQ(rc, 0);
+  std::map<std::string, int> f = flags();
+  EXPECT_EQ(f["from_sys"], 1);
+  EXPECT_EQ(f["from_user"], 0);
+}
+
+TEST_F(SystemHeaderTest, TheMainFileAndItsOwnHeadersAreNeverSystemHeaders) {
+  run("int a;\n#include \"local.h\"\n");
+  EXPECT_EQ(rc, 0);
+  for (int i = 0; i < tb.count; i++)
+    EXPECT_EQ(tb.tokens[i].system_header, 0) << (tb.tokens[i].value ? tb.tokens[i].value : "eof");
+}
+
 class PredefinedTest : public ::testing::Test {
 protected:
   token_buf tb;
@@ -2636,7 +2801,7 @@ protected:
   int rc = 0;
 
   void run(const char *source, const char *filename = "demo.c") {
-    rc = pp_run_ex(&tb, source, filename, nullptr, 0);
+    rc = pp_run_ex(&tb, source, filename, nullptr, 0, nullptr, 0);
     initialised = true;
   }
 
@@ -2735,6 +2900,89 @@ TEST_F(PredefinedTest, ASystemNameMayBeUndefined) {
   run("#undef _WIN32\n#ifdef _WIN32\nA\n#else\nB\n#endif\n");
   EXPECT_EQ(rc, 0);
   std::vector<std::string> expected = {"B"};
+  EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(PredefinedTest, BothTargetsClaimToBeGcc42) {
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    const struct {
+      const char *name;
+      const char *value;
+    } rows[] = {{"__GNUC__", "4"},
+                {"__GNUC_MINOR__", "2"},
+                {"__GNUC_PATCHLEVEL__", "1"},
+                {"__GNUC_STDC_INLINE__", "1"},
+                {"__STRICT_ANSI__", "1"},
+                {"__NO_INLINE__", "1"},
+                {"__FLT_EVAL_METHOD__", "0"}};
+    for (const auto &row : rows)
+      EXPECT_EQ(expand(row.name), std::vector<std::string>({row.value})) << row.name;
+    EXPECT_EQ(expand("a __USER_LABEL_PREFIX__ b"), std::vector<std::string>({"a", "b"}))
+        << "symbol names get no prefix";
+    for (const char *name : {"__SIZEOF_INT128__", "__has_builtin", "__has_attribute",
+                             "__OPTIMIZE__", "__STDC_IEC_559__"})
+      EXPECT_EQ(expand(name), std::vector<std::string>({name})) << name << " stays undefined";
+  }
+}
+
+TEST_F(PredefinedTest, EachTargetNamesItsTypesTheWayGccSpellsThem) {
+  const struct {
+    const char *name;
+    std::vector<std::string> windows;
+    std::vector<std::string> linux_value;
+  } rows[] = {
+      {"__SIZE_TYPE__", {"long", "long", "unsigned", "int"}, {"long", "unsigned", "int"}},
+      {"__PTRDIFF_TYPE__", {"long", "long", "int"}, {"long", "int"}},
+      {"__WCHAR_TYPE__", {"short", "unsigned", "int"}, {"int"}},
+      {"__WINT_TYPE__", {"short", "unsigned", "int"}, {"unsigned", "int"}},
+  };
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    for (const auto &row : rows)
+      EXPECT_EQ(expand(row.name), kind == TARGET_LINUX_X64 ? row.linux_value : row.windows)
+          << row.name;
+  }
+}
+
+TEST_F(PredefinedTest, WindowsSpellsItsCallingConventionsAsAttributes) {
+  {
+    TargetGuard guard(TARGET_WINDOWS_X64);
+    EXPECT_EQ(expand("__declspec(dllimport) int x;"),
+              std::vector<std::string>(
+                  {"__attribute__", "(", "(", "dllimport", ")", ")", "int", "x", ";"}));
+    EXPECT_EQ(expand("__cdecl"),
+              std::vector<std::string>({"__attribute__", "(", "(", "__cdecl__", ")", ")"}));
+    EXPECT_EQ(expand("__stdcall __fastcall __thiscall").size(), 18u);
+    EXPECT_EQ(expand("__SEH__"), std::vector<std::string>({"1"}));
+  }
+  TargetGuard guard(TARGET_LINUX_X64);
+  for (const char *name : {"__declspec", "__cdecl", "__stdcall", "__SEH__"})
+    EXPECT_EQ(expand(name), std::vector<std::string>({name})) << name;
+}
+
+TEST_F(PredefinedTest, TheBuiltInTextIsReadBeforeTheMainFile) {
+  run("#ifdef _WIN32\nA\n#endif\n#if __GNUC__ == 4\nB\n#endif\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"A", "B"};
+  EXPECT_EQ(spellings(), expected);
+  for (int i = 0; i < tb.count; i++)
+    EXPECT_EQ(tb.tokens[i].system_header, 0) << "the main file is never a system header";
+}
+
+TEST_F(PredefinedTest, MacrosFromTheBuiltInTextComeFromTheCompiler) {
+  run("__declspec(dllimport)");
+  EXPECT_EQ(rc, 0);
+  ASSERT_EQ(spellings().size(), 6u);
+  EXPECT_EQ(tb.tokens[0].system_header, 1) << "__attribute__ comes from <built-in>";
+  EXPECT_EQ(tb.tokens[3].system_header, 0) << "dllimport was written by the programmer";
+}
+
+TEST_F(PredefinedTest, TheGccMacrosMayBeUndefined) {
+  run("#undef __GNUC__\n#undef __declspec\n#ifndef __GNUC__\nA\n#endif\n__declspec\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> expected = {"A", "__declspec"};
   EXPECT_EQ(spellings(), expected);
 }
 
@@ -3445,13 +3693,13 @@ TEST_F(PreprocessorTest, LineRejectsASuffixedNumber) {
 TEST_F(PreprocessorTest, TheFileNameFormOfLineCostsTheExpectedAllocations) {
   token_buf plain;
   tb_free_calls = 0;
-  pp_run_ex(&plain, "#line 1\nint x;", "demo.c", nullptr, 0);
+  pp_run_ex(&plain, "#line 1\nint x;", "demo.c", nullptr, 0, nullptr, 0);
   int without_name = tb_free_calls;
   token_buf_free(&plain);
 
   token_buf named;
   tb_free_calls = 0;
-  pp_run_ex(&named, "#line 1 \"gen.c\"\nint x;", "demo.c", nullptr, 0);
+  pp_run_ex(&named, "#line 1 \"gen.c\"\nint x;", "demo.c", nullptr, 0, nullptr, 0);
   int with_name = tb_free_calls;
   token_buf_free(&named);
 
@@ -3528,13 +3776,13 @@ TEST_F(IncludeTest, PresumedNamesDoNotLeakAcrossManyFrames) {
 
   token_buf a;
   tb_free_calls = 0;
-  pp_run_ex(&a, one.c_str(), "pp_test_src/main.c", dirs, 1);
+  pp_run_ex(&a, one.c_str(), "pp_test_src/main.c", dirs, 1, nullptr, 0);
   int frees_one = tb_free_calls;
   token_buf_free(&a);
 
   token_buf b;
   tb_free_calls = 0;
-  pp_run_ex(&b, many.c_str(), "pp_test_src/main.c", dirs, 1);
+  pp_run_ex(&b, many.c_str(), "pp_test_src/main.c", dirs, 1, nullptr, 0);
   int frees_many = tb_free_calls;
   token_buf_free(&b);
 
@@ -4023,4 +4271,319 @@ TEST_F(IncludeTest, AnIncludedFileCannotContinueTheIncludersConditional) {
   EXPECT_EQ(rc, 1);
   EXPECT_EQ(diagnostics, "pp_test_inc/elses.h:1:2: error: #else without #if\n");
   remove("pp_test_inc/elses.h");
+}
+
+class PragmaPackTest : public PreprocessorTest {
+protected:
+  std::string diagnostics;
+
+  void run_captured(const char *source) {
+    StderrCapture capture;
+    run(source);
+    diagnostics = capture.finish();
+  }
+
+  int pack_of(const char *name) {
+    for (int i = 0; i < tb.count; i++) {
+      if (tb.tokens[i].value != nullptr && std::strcmp(tb.tokens[i].value, name) == 0)
+        return tb.tokens[i].pack;
+    }
+    ADD_FAILURE() << "no token named " << name;
+    return -1;
+  }
+};
+
+TEST_F(PragmaPackTest, EveryTokenCarriesThePackInForceWhenItLeaves) {
+  run_captured("int a;\n#pragma pack(1)\nint b;\n#pragma pack(2)\nint c;\n#pragma pack(4)\nint d;\n"
+               "#pragma pack(8)\nint e;\n#pragma pack(16)\nint f;\n#pragma pack()\nint g;\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  EXPECT_EQ(pack_of("a"), 0) << "no pack is in force until a pragma sets one";
+  EXPECT_EQ(pack_of("b"), 1);
+  EXPECT_EQ(pack_of("c"), 2);
+  EXPECT_EQ(pack_of("d"), 4);
+  EXPECT_EQ(pack_of("e"), 8);
+  EXPECT_EQ(pack_of("f"), 16);
+  EXPECT_EQ(pack_of("g"), 0) << "pack() goes back to no pack";
+}
+
+TEST_F(PragmaPackTest, TheEndOfFileTokenIsStampedToo) {
+  run_captured("int a;\n#pragma pack(4)\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  ASSERT_GT(tb.count, 0);
+  ASSERT_EQ(tb.tokens[tb.count - 1].type, TOKEN_EOF);
+  EXPECT_EQ(tb.tokens[tb.count - 1].pack, 4);
+}
+
+TEST_F(PragmaPackTest, PushSavesAndPopRestoresInOrder) {
+  run_captured(
+      "#pragma pack(2)\nint a;\n#pragma pack(push, 1)\nint b;\n#pragma pack(push)\nint c;\n"
+      "#pragma pack(8)\nint d;\n#pragma pack(pop)\nint e;\n#pragma pack(pop)\nint f;\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  EXPECT_EQ(pack_of("a"), 2);
+  EXPECT_EQ(pack_of("b"), 1) << "push, n saves the old value and sets n";
+  EXPECT_EQ(pack_of("c"), 1) << "push alone saves without changing";
+  EXPECT_EQ(pack_of("d"), 8);
+  EXPECT_EQ(pack_of("e"), 1) << "the newest save comes back first";
+  EXPECT_EQ(pack_of("f"), 2);
+}
+
+TEST_F(PragmaPackTest, PopWithNothingSavedIsDiagnosedAndChangesNothing) {
+  run_captured(
+      "#pragma pack(4)\n#pragma pack(push)\n#pragma pack(pop)\n#pragma pack(pop)\nint x;\n");
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics, "<source>:4:2: error: #pragma pack(pop) without a matching push\n");
+  EXPECT_EQ(pack_of("x"), 4);
+}
+
+TEST_F(PragmaPackTest, AMalformedPackIsDiagnosedAndChangesNothing) {
+  const char *const cases[] = {"(3)",          "(0)",       "(32)",         "(0x3)",    "(2.0)",
+                               "(push 2)",     "(push, 3)", "(push, 1, 2)", "(pop, 1)", "(other)",
+                               "(1) extra",    "(2",        " push",        " 2",       "",
+                               "(push, push)", "(,)",       "(010.)",       "(2x)",     "(08)"};
+  for (const char *args : cases) {
+    SCOPED_TRACE(args);
+    std::string source = std::string("#pragma pack(2)\n#pragma pack") + args + "\nint x;\n";
+    run_captured(source.c_str());
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(diagnostics, "<source>:2:2: error: malformed #pragma pack\n");
+    EXPECT_EQ(pack_of("x"), 2);
+    std::vector<std::string> expected = {"int", "x", ";"};
+    EXPECT_EQ(spellings(), expected) << "the whole pragma line is consumed";
+    token_buf_free(&tb);
+    initialised = false;
+  }
+}
+
+TEST_F(PragmaPackTest, ThePackArgumentsAreMacroExpanded) {
+  run_captured("#define P 2\n#define SAVE_FOUR push, 4\n#pragma pack(push, P)\nint a;\n"
+               "#pragma pack(SAVE_FOUR)\nint b;\n#pragma pack(pop)\n#pragma pack(pop)\nint c;\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  EXPECT_EQ(pack_of("a"), 2);
+  EXPECT_EQ(pack_of("b"), 4);
+  EXPECT_EQ(pack_of("c"), 0);
+}
+
+TEST_F(PragmaPackTest, ThePragmaOperatorPacksToo) {
+  run_captured("_Pragma(\"pack(push, 1)\") int a; _Pragma(\"pack(pop)\") int b;\n"
+               "#define PACKED(decl) _Pragma(\"pack(push, 2)\") decl _Pragma(\"pack(pop)\")\n"
+               "PACKED(int c;) int d;\n"
+               "_Pragma(\"pack(5)\") int e;\n");
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics, "<source>:4:1: error: malformed #pragma pack\n");
+  EXPECT_EQ(pack_of("a"), 1);
+  EXPECT_EQ(pack_of("b"), 0);
+  EXPECT_EQ(pack_of("c"), 2) << "a _Pragma from a macro takes effect where the macro expands";
+  EXPECT_EQ(pack_of("d"), 0);
+  EXPECT_EQ(pack_of("e"), 0);
+}
+
+TEST_F(PragmaPackTest, PackInsideASkippedGroupDoesNothing) {
+  run_captured("#if 0\n#pragma pack(1)\n#pragma pack(pop)\n#pragma pack(3)\n#endif\nint x;\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  EXPECT_EQ(pack_of("x"), 0);
+}
+
+TEST_F(PragmaPackTest, OtherPragmasStaySilent) {
+  run_captured("#pragma STDC FP_CONTRACT ON\n#pragma packed(1)\n#pragma weird (stuff\n#pragma\n"
+               "pack(1);\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"pack", "(", "1", ")", ";"};
+  EXPECT_EQ(spellings(), expected)
+      << "an empty #pragma ends at its own line; the next line is ordinary code";
+  EXPECT_EQ(pack_of("pack"), 0);
+}
+
+TEST_F(PragmaPackTest, TheSavedValuesAreReleased) {
+  std::string pushes;
+  std::string others;
+  for (int i = 0; i < 3; i++) {
+    pushes += "#pragma pack(push, 1)\n";
+    others += "#pragma pack(other, 1)\n";
+  }
+  StderrCapture capture;
+  token_buf a;
+  tb_free_pointer_calls = 0;
+  pp_run(&a, pushes.c_str());
+  int frees_with_pile = tb_free_pointer_calls;
+  token_buf_free(&a);
+  token_buf b;
+  tb_free_pointer_calls = 0;
+  pp_run(&b, others.c_str());
+  int frees_without_pile = tb_free_pointer_calls;
+  token_buf_free(&b);
+  capture.finish();
+  EXPECT_EQ(frees_with_pile, frees_without_pile + 1)
+      << "the same tokens are freed either way; the pile adds one block, however often it grew";
+}
+
+TEST_F(PragmaPackTest, APushThatCannotGrowIsReportedAtThePop) {
+  const char *source = "#pragma pack(push, 1)\n#pragma pack(pop)\nint x;\n";
+  token_buf probe;
+  tb_realloc_calls = 0;
+  pp_run(&probe, source);
+  int reallocs = tb_realloc_calls;
+  token_buf_free(&probe);
+
+  bool reported = false;
+  for (int k = 0; k < reallocs; k++) {
+    StderrCapture capture;
+    token_buf out;
+    tb_realloc_fail_at = k;
+    pp_run(&out, source);
+    tb_realloc_fail_at = -1;
+    std::string diagnostics = capture.finish();
+    if (diagnostics.find("#pragma pack(pop) without a matching push") != std::string::npos)
+      reported = true;
+    token_buf_free(&out);
+  }
+  EXPECT_TRUE(reported) << "when the save fails, the pop must say so instead of reading it";
+}
+
+TEST_F(PragmaPackTest, TheValueIsReadLikeAnIntegerConstant) {
+  run_captured("#pragma pack(02)\nint a;\n#pragma pack(010)\nint b;\n#pragma pack(0x4)\nint c;\n"
+               "#pragma pack(1u)\nint d;\n#pragma pack(16LL)\nint e;\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  EXPECT_EQ(pack_of("a"), 2);
+  EXPECT_EQ(pack_of("b"), 8) << "a leading 0 means octal, as in GCC";
+  EXPECT_EQ(pack_of("c"), 4);
+  EXPECT_EQ(pack_of("d"), 1);
+  EXPECT_EQ(pack_of("e"), 16);
+}
+
+class IncludeNextTest : public ::testing::Test {
+protected:
+  token_buf tb;
+  bool initialised = false;
+  int rc = 0;
+  std::string diagnostics;
+
+  static void write_file(const char *path, const char *text) {
+    std::ofstream f(path, std::ios::binary);
+    f << text;
+  }
+
+  static const std::vector<const char *> &files() {
+    static const std::vector<const char *> all = {
+        "pp_next_a/x.h",       "pp_next_b/x.h",           "pp_next_c/x.h",
+        "pp_next_src/local.h", "pp_next_a/local.h",       "pp_next_src/self.h",
+        "pp_next_a/self.h",    "pp_next_c/last.h",        "pp_next_a/q.h",
+        "pp_next_b/q.h",       "pp_next_a/skip.h",        "pp_next_a/m.h",
+        "pp_next_b/m.h",       "pp_next_c/quoted_last.h", "pp_next_src/beside_cwd.h"};
+    return all;
+  }
+
+  void SetUp() override {
+    for (const char *dir : {"pp_next_a", "pp_next_b", "pp_next_c", "pp_next_src"})
+      _mkdir(dir);
+    write_file("pp_next_a/x.h", "int a_x;\n#include_next <x.h>\n");
+    write_file("pp_next_b/x.h", "int b_x;\n#include_next <x.h>\n");
+    write_file("pp_next_c/x.h", "int c_x;\n");
+    write_file("pp_next_src/local.h", "int local;\n#include_next <local.h>\n");
+    write_file("pp_next_a/local.h", "int a_local;\n");
+    write_file("pp_next_src/self.h", "int self;\n#include_next \"self.h\"\n");
+    write_file("pp_next_a/self.h", "int a_self;\n");
+    write_file("pp_next_c/last.h", "#include_next <last.h>\n");
+    write_file("pp_next_a/q.h", "#include_next \"q.h\"\n");
+    write_file("pp_next_b/q.h", "int b_q;\n");
+    write_file("pp_next_a/skip.h", "#if 0\n#include_next <nothing.h>\n#endif\nint a_skip;\n");
+    write_file("pp_next_a/m.h", "#define NEXT <m.h>\n#include_next NEXT\n");
+    write_file("pp_next_b/m.h", "int b_m;\n");
+    write_file("pp_next_c/quoted_last.h", "#include_next \"pp_next_src/beside_cwd.h\"\n");
+    write_file("pp_next_src/beside_cwd.h", "int found_by_path;\n");
+  }
+
+  void TearDown() override {
+    if (initialised)
+      token_buf_free(&tb);
+    for (const char *f : files())
+      remove(f);
+    for (const char *dir : {"pp_next_a", "pp_next_b", "pp_next_c", "pp_next_src"})
+      _rmdir(dir);
+  }
+
+  void run(const char *source) {
+    static const char *user_dirs[] = {"pp_next_a", "pp_next_b"};
+    static const char *system_dirs[] = {"pp_next_c"};
+    StderrCapture capture;
+    rc = pp_run_ex(&tb, source, "pp_next_src/main.c", user_dirs, 2, system_dirs, 1);
+    diagnostics = capture.finish();
+    initialised = true;
+  }
+
+  std::vector<std::string> spellings() {
+    std::vector<std::string> out;
+    for (int i = 0; i < tb.count; i++) {
+      if (tb.tokens[i].type == TOKEN_IDENTIFIER)
+        out.push_back(tb.tokens[i].value);
+    }
+    return out;
+  }
+
+  int system_header_of(const char *name) {
+    for (int i = 0; i < tb.count; i++) {
+      if (tb.tokens[i].value != nullptr && std::strcmp(tb.tokens[i].value, name) == 0)
+        return tb.tokens[i].system_header;
+    }
+    return -1;
+  }
+};
+
+TEST_F(IncludeNextTest, AHeaderFromASearchFolderContinuesInTheNextFolder) {
+  run("#include <x.h>\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"a_x", "b_x", "c_x"};
+  EXPECT_EQ(spellings(), expected);
+  EXPECT_EQ(system_header_of("b_x"), 0);
+  EXPECT_EQ(system_header_of("c_x"), 1) << "moving into a system folder makes a system header";
+}
+
+TEST_F(IncludeNextTest, AHeaderFoundBesideItsIncluderSearchesEveryFolderButItsOwn) {
+  run("#include \"local.h\"\n#include \"self.h\"\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"local", "a_local", "self", "a_self"};
+  EXPECT_EQ(spellings(), expected) << "it never finds itself again";
+}
+
+TEST_F(IncludeNextTest, InTheMainFileItWorksLikeInclude) {
+  run("#include_next <x.h>\n#include_next \"local.h\"\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"a_x", "b_x", "c_x", "local", "a_local"};
+  EXPECT_EQ(spellings(), expected) << "the quoted form still looks beside the main file first";
+}
+
+TEST_F(IncludeNextTest, PastTheLastFolderNothingIsFound) {
+  run("#include <last.h>\n");
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics, "pp_next_c/last.h:1:2: error: cannot find the file named by #include\n");
+}
+
+TEST_F(IncludeNextTest, TheQuotedFormAlsoSkipsTheFilesOwnFolder) {
+  run("#include <q.h>\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"b_q"};
+  EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(IncludeNextTest, InsideASkippedGroupItDoesNothing) {
+  run("#include <skip.h>\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"a_skip"};
+  EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(IncludeNextTest, TheHeaderNameCanComeFromAMacro) {
+  run("#include <m.h>\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"b_m"};
+  EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(IncludeNextTest, PastTheLastFolderTheNameAsWrittenIsNotTried) {
+  run("#include \"pp_next_src/beside_cwd.h\"\n#include <quoted_last.h>\n");
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics,
+            "pp_next_c/quoted_last.h:1:2: error: cannot find the file named by #include\n")
+      << "plain #include finds the path as written, #include_next only searches folders";
+  std::vector<std::string> expected = {"found_by_path"};
+  EXPECT_EQ(spellings(), expected);
 }

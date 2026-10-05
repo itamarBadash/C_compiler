@@ -2013,6 +2013,17 @@ static bool same_type(const type_info *a, const type_info *b, const std::string 
 
 static bool same_ast(const ast_node *a, const ast_node *b, const std::string &at, std::string &why);
 
+static bool same_ast_compares_locations = true;
+
+struct ShapeOnly {
+  ShapeOnly() {
+    same_ast_compares_locations = false;
+  }
+  ~ShapeOnly() {
+    same_ast_compares_locations = true;
+  }
+};
+
 static bool same_list(ast_node **a, ast_node **b, int n, const std::string &at, std::string &why) {
   for (int i = 0; i < n; i++) {
     if (!same_ast(a[i], b[i], at + "[" + std::to_string(i) + "]", why))
@@ -2029,7 +2040,7 @@ static bool same_ast(const ast_node *a, const ast_node *b, const std::string &at
     return differ(why, at, "node types differ");
   if (a->tok.type != b->tok.type || !same_str(a->tok.value, b->tok.value))
     return differ(why, at, "node tokens differ");
-  if (a->loc.line != b->loc.line || a->loc.column != b->loc.column)
+  if (same_ast_compares_locations && (a->loc.line != b->loc.line || a->loc.column != b->loc.column))
     return differ(why, at, "node locations differ");
 
   switch (a->type) {
@@ -2106,6 +2117,13 @@ static bool same_ast(const ast_node *a, const ast_node *b, const std::string &at
         memcmp(a->literal.bytes, b->literal.bytes, a->literal.length) != 0)
       return differ(why, at, "string literals differ");
     return true;
+  case AST_NODE_TYPE_STRUCT_DEF:
+    if (!same_str(a->struct_def.tag_name, b->struct_def.tag_name) ||
+        a->struct_def.is_union != b->struct_def.is_union ||
+        a->struct_def.member_count != b->struct_def.member_count)
+      return differ(why, at, "records differ");
+    return same_list(a->struct_def.members, b->struct_def.members, a->struct_def.member_count,
+                     at + "/members", why);
   case AST_NODE_TYPE_NUMBER:
   case AST_NODE_TYPE_IDENTIFIER:
     return true;
@@ -2215,7 +2233,8 @@ TEST_F(BridgeTest, AnIncludedHeaderParsesAsPartOfTheSameTranslationUnit) {
     f << "int from_header;\n";
   }
   static const char *dirs[] = {"bridge_test_inc"};
-  int rc = pp_run_ex(&tb, "#include \"decls.h\"\nint from_source;\n", "bridge_main.c", dirs, 1);
+  int rc = pp_run_ex(&tb, "#include \"decls.h\"\nint from_source;\n", "bridge_main.c", dirs, 1,
+                     nullptr, 0);
   remove("bridge_test_inc/decls.h");
   _rmdir("bridge_test_inc");
   EXPECT_EQ(rc, 0);
@@ -4377,7 +4396,8 @@ TEST(KnrDefinitionTest, IdentifierListsAndParameterNamesAreChecked) {
 
 TEST(SourceLocationTest, NodesAndErrorsNameTheFileTheTokensCameFrom) {
   token_buf tb;
-  pp_run_ex(&tb, "int a = 08;\n#line 30 \"gen.c\"\nint b = 09;\n", "main.c", nullptr, 0);
+  pp_run_ex(&tb, "int a = 08;\n#line 30 \"gen.c\"\nint b = 09;\n", "main.c", nullptr, 0, nullptr,
+            0);
   parser p;
   parser_init_from_buf(&p, &tb);
   testing::internal::CaptureStderr();
@@ -4484,4 +4504,520 @@ TEST(ParameterTest, RegisterOnAParameterIsRecorded) {
   EXPECT_EQ(top_var_type(program, 2)->param_register, nullptr)
       << "the array is allocated only when some parameter is a register";
   free_ast(program);
+}
+
+static ast_node *parse_preprocessed(const std::string &source, int *errors) {
+  token_buf tb;
+  EXPECT_EQ(pp_run(&tb, source.c_str()), 0) << source;
+  parser p;
+  parser_init_from_buf(&p, &tb);
+  ast_node *program = parse_program(&p);
+  *errors = p.had_error;
+  parser_destroy(&p);
+  token_buf_free(&tb);
+  return program;
+}
+
+static const char *const gnu_syntax_body =
+    "A int A * A first A, second L A;\n"
+    "static A INL int A twice(int (A *g)(int), A int y) { E int z = E y; E z++; return g(z); }\n"
+    "E typedef long long A wide;\n"
+    "E struct S { E unsigned u : 3 A; int (A *cb)(void) A; C int k; };\n"
+    "extern int renamed(const char *R fmt, ...) L A;\n"
+    "SG char sc; V int vv;\n";
+
+TEST(GnuSyntaxTest, AttributesExtensionsAndSpellingsBuildTheSameTreeAsPlainC) {
+  std::string gnu = "#define A __attribute__((__unused__, format(printf, 1, 2), __const__, ))\n"
+                    "#define L __asm__(\"\" \"renamed_in_asm\")\n"
+                    "#define E __extension__\n"
+                    "#define INL __inline__\n"
+                    "#define C __const\n"
+                    "#define R __restrict__\n"
+                    "#define SG __signed__\n"
+                    "#define V __volatile__\n";
+  std::string plain = "#define A\n"
+                      "#define L\n"
+                      "#define E\n"
+                      "#define INL inline\n"
+                      "#define C const\n"
+                      "#define R restrict\n"
+                      "#define SG signed\n"
+                      "#define V volatile\n";
+  int gnu_errors = -1;
+  int plain_errors = -1;
+  ast_node *with = parse_preprocessed(gnu + gnu_syntax_body, &gnu_errors);
+  ast_node *without = parse_preprocessed(plain + gnu_syntax_body, &plain_errors);
+  EXPECT_EQ(gnu_errors, 0);
+  EXPECT_EQ(plain_errors, 0);
+  ASSERT_NE(with, nullptr);
+  ASSERT_NE(without, nullptr);
+  EXPECT_EQ(with->program.count, 7);
+  std::string why;
+  {
+    ShapeOnly shape;
+    EXPECT_TRUE(same_ast(with, without, "program", why)) << why;
+  }
+  free_ast(with);
+  free_ast(without);
+}
+
+TEST(GnuSyntaxTest, AnAttributeAfterAParenthesisIsLookedPast) {
+  int errors = -1;
+  ast_node *program = parse_source("void f(int (__attribute__((cdecl)) *)(int));\n"
+                                   "void h(int (__attribute__((unused)) int));\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  type_info *f = top_var_type(program, 0);
+  ASSERT_NE(f, nullptr);
+  ASSERT_EQ(f->param_count, 1);
+  type_info *pointer = f->param_types[0];
+  ASSERT_EQ(pointer->kind, TYPE_POINTER) << "(attribute *) is a declarator";
+  ASSERT_EQ(pointer->ptr_to->kind, TYPE_FUNCTION);
+  EXPECT_EQ(pointer->ptr_to->param_count, 1);
+  type_info *h = top_var_type(program, 1);
+  ASSERT_NE(h, nullptr);
+  ASSERT_EQ(h->param_count, 1);
+  ASSERT_EQ(h->param_types[0]->kind, TYPE_FUNCTION) << "(attribute int) is a parameter list";
+  ASSERT_EQ(h->param_types[0]->param_count, 1);
+  EXPECT_EQ(h->param_types[0]->param_types[0]->prim, PRIM_INT);
+  free_ast(program);
+}
+
+TEST(GnuSyntaxTest, MalformedGnuSyntaxIsReported) {
+  expect_diagnosed({
+      {"int __attribute__(x) y;", "expected '((' after __attribute__"},
+      {"int __attribute__((x(1 y;", "expected ')' after the attribute's arguments"},
+      {"int __attribute__((x) y;", "expected '))' to close __attribute__"},
+      {"int f(void) __asm__(f);", "expected a string in parentheses after __asm__"},
+      {"int f(void) __asm__(\"a\";", "expected ')' after the __asm__ name"},
+      {"void f(void) __attribute__((x)) {}", "expected ';' after declaration"},
+      {"void f(void) { __asm__ x; }", "expected '(' and an assembly string after __asm__"},
+      {"void f(int a) { __asm__(\"\" : \"r\" a); }",
+       "expected '(' and an operand after an asm constraint"},
+      {"void f(int a) { __asm__(\"\" : \"=r\"(a; }", "expected ')' after an asm operand"},
+      {"void f(void) { __asm__(\"\" }", "expected ')' to close the __asm__ statement"},
+      {"void f(void) { __asm__(\"\") }", "expected ';' after the __asm__ statement"},
+      {"__extension__", "expected a declaration at file scope"},
+  });
+}
+
+TEST(GnuSyntaxTest, AnAsmStatementKeepsItsTextOperandsAndClobbers) {
+  int errors = -1;
+  ast_node *program = parse_source(
+      "void f(int code) {\n"
+      "  int out, o2;\n"
+      "  __asm__ __volatile__(\"mov %2, %0\" \"\\n\" : \"=r\"(out), \"=m\"(o2) : \"r\"(code) : "
+      "\"memory\", \"cc\");\n"
+      "  __asm__(\"int {$}3\" :);\n"
+      "  __asm__(\"int {$}0x29\" : : \"c\"(code));\n"
+      "  __asm__(\"nop\");\n"
+      "  __asm__(\"\" ::: \"memory\");\n"
+      "}\n",
+      &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *full = function_body_statement(program, 0, 1);
+  ASSERT_NE(full, nullptr);
+  ASSERT_EQ(full->type, AST_NODE_TYPE_ASM);
+  EXPECT_EQ(full->asm_stmt.is_volatile, 1);
+  ASSERT_NE(full->asm_stmt.template_text, nullptr);
+  EXPECT_EQ(std::string(full->asm_stmt.template_text->literal.bytes,
+                        full->asm_stmt.template_text->literal.length),
+            "mov %2, %0\n")
+      << "the template's pieces are joined";
+  ASSERT_EQ(full->asm_stmt.operand_count, 3);
+  EXPECT_EQ(full->asm_stmt.output_count, 2) << "outputs come first, as GCC numbers them";
+  const char *constraints[] = {"=r", "=m", "r"};
+  const char *names[] = {"out", "o2", "code"};
+  for (int i = 0; i < 3; i++) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(std::string(full->asm_stmt.constraints[i]->literal.bytes,
+                          full->asm_stmt.constraints[i]->literal.length),
+              constraints[i]);
+    ASSERT_EQ(full->asm_stmt.operands[i]->type, AST_NODE_TYPE_IDENTIFIER);
+    EXPECT_STREQ(full->asm_stmt.operands[i]->tok.value, names[i]);
+  }
+  ASSERT_EQ(full->asm_stmt.clobber_count, 2);
+  EXPECT_EQ(std::string(full->asm_stmt.clobbers[1]->literal.bytes,
+                        full->asm_stmt.clobbers[1]->literal.length),
+            "cc");
+  const struct {
+    int statement;
+    int is_volatile;
+    int operands;
+    int outputs;
+    int clobbers;
+  } rows[] = {{2, 0, 0, 0, 0}, {3, 0, 1, 0, 0}, {4, 0, 0, 0, 0}, {5, 0, 0, 0, 1}};
+  for (const auto &row : rows) {
+    SCOPED_TRACE(row.statement);
+    ast_node *node = function_body_statement(program, 0, row.statement);
+    ASSERT_NE(node, nullptr);
+    ASSERT_EQ(node->type, AST_NODE_TYPE_ASM);
+    EXPECT_EQ(node->asm_stmt.is_volatile, row.is_volatile);
+    EXPECT_EQ(node->asm_stmt.operand_count, row.operands);
+    EXPECT_EQ(node->asm_stmt.output_count, row.outputs);
+    EXPECT_EQ(node->asm_stmt.clobber_count, row.clobbers);
+  }
+  free_ast(program);
+}
+
+TEST(GnuSyntaxTest, ALoneSemicolonIsForgivenOnlyInASystemHeader) {
+  _mkdir("parse_sys_dir");
+  {
+    std::ofstream f("parse_sys_dir/stray.h", std::ios::binary);
+    f << "int before;\n;\nint after;\n";
+  }
+  static const char *dirs[] = {"parse_sys_dir"};
+  for (int as_system = 0; as_system <= 1; as_system++) {
+    SCOPED_TRACE(as_system ? "system folder" : "programmer's folder");
+    token_buf tb;
+    pp_run_ex(&tb, "#include <stray.h>\nint main_decl;\n", "main.c", as_system ? nullptr : dirs,
+              as_system ? 0 : 1, as_system ? dirs : nullptr, as_system ? 1 : 0);
+    parser p;
+    parser_init_from_buf(&p, &tb);
+    testing::internal::CaptureStderr();
+    ast_node *program = parse_program(&p);
+    std::string diagnostics = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(p.had_error, as_system ? 0 : 1) << diagnostics;
+    EXPECT_EQ(program->program.count, 3) << "the declarations around the ';' survive";
+    parser_destroy(&p);
+    free_ast(program);
+  }
+  remove("parse_sys_dir/stray.h");
+  _rmdir("parse_sys_dir");
+  int errors = -1;
+  testing::internal::CaptureStderr();
+  ast_node *program = parse_preprocessed("int a;\n;\nint b;\n", &errors);
+  testing::internal::GetCapturedStderr();
+  EXPECT_EQ(errors, 1) << "in the main file a lone ';' stays a syntax error";
+  free_ast(program);
+}
+
+TEST(GnuSyntaxTest, ExtensionMayPrecedeAnyDeclarationStatementOrExpression) {
+  int errors = -1;
+  ast_node *program = parse_source("__extension__ __extension__ int a;\n"
+                                   "struct S { __extension__ int m; };\n"
+                                   "int f(void) {\n"
+                                   "  __extension__ int b = __extension__ (int)1;\n"
+                                   "  __extension__ b++;\n"
+                                   "  return __extension__ b;\n"
+                                   "}\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  ASSERT_EQ(program->program.count, 3);
+  ast_node *b = function_body_statement(program, 2, 0);
+  ASSERT_NE(b, nullptr);
+  ASSERT_EQ(b->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_NE(b->var_decl.init_value, nullptr);
+  EXPECT_EQ(b->var_decl.init_value->type, AST_NODE_TYPE_CAST)
+      << "__extension__ leaves the expression it marks unchanged";
+  ast_node *increment = function_body_statement(program, 2, 1);
+  ASSERT_NE(increment, nullptr);
+  EXPECT_EQ(increment->type, AST_NODE_TYPE_UNARY_OP);
+  free_ast(program);
+}
+
+static const ast_node *declared_named(const ast_node *program, const char *name) {
+  std::vector<const ast_node *> all;
+  gather_nodes(program, all);
+  for (const ast_node *n : all) {
+    if (n->type == AST_NODE_TYPE_VAR_DECL && n->var_decl.var_name != nullptr &&
+        std::strcmp(n->var_decl.var_name, name) == 0)
+      return n;
+  }
+  return nullptr;
+}
+
+static const ast_node *record_named(const ast_node *program, const char *tag) {
+  std::vector<const ast_node *> all;
+  gather_nodes(program, all);
+  for (const ast_node *n : all) {
+    if (n->type == AST_NODE_TYPE_STRUCT_DEF && n->struct_def.tag_name != nullptr &&
+        std::strcmp(n->struct_def.tag_name, tag) == 0)
+      return n;
+  }
+  return nullptr;
+}
+
+TEST(AttributeTest, AlignedIsRecordedOnTheThingItNames) {
+  int errors = -1;
+  ast_node *program = parse_source(
+      "typedef int A __attribute__((aligned(16))), B;\n"
+      "__attribute__((__aligned__(8))) typedef int C, D;\n"
+      "typedef int E __attribute__((aligned(4), aligned(32), aligned(2)));\n"
+      "typedef int F __attribute__((aligned));\n"
+      "typedef int G __attribute__((aligned(16u))) __attribute__((aligned(0x8)));\n"
+      "typedef int H __attribute__((aligned(268435456)));\n"
+      "typedef int N1 __attribute__((__aligned(8))), N2 __attribute__((alignedx(8))),\n"
+      "    N3 __attribute__((__alignedx__(8))), N4 __attribute__((_aligned_(8)));\n"
+      "struct __attribute__((aligned(8))) S1 { int x; };\n"
+      "struct S2 { int x; } __attribute__((aligned(4)));\n"
+      "struct __attribute__((aligned(2))) S3 { int x; } __attribute__((aligned(8)));\n"
+      "typedef __attribute__((aligned(16))) struct S4 { int x; } T4;\n"
+      "struct S5 { int m __attribute__((aligned(16))); int n; };\n"
+      "struct S6 { int x; };\n",
+      &errors);
+  EXPECT_EQ(errors, 0);
+  struct Expected {
+    const char *name;
+    int aligned;
+  };
+  for (Expected e : std::vector<Expected>{{"A", 16},
+                                          {"B", 0},
+                                          {"C", 8},
+                                          {"D", 8},
+                                          {"E", 32},
+                                          {"F", 16},
+                                          {"G", 16},
+                                          {"H", 268435456},
+                                          {"N1", 0},
+                                          {"N2", 0},
+                                          {"N3", 0},
+                                          {"N4", 0},
+                                          {"T4", 16},
+                                          {"m", 16},
+                                          {"n", 0}}) {
+    SCOPED_TRACE(e.name);
+    const ast_node *decl = declared_named(program, e.name);
+    ASSERT_NE(decl, nullptr);
+    EXPECT_EQ(decl->var_decl.specs.aligned, e.aligned);
+  }
+  for (Expected e : std::vector<Expected>{{"S1", 8}, {"S2", 4}, {"S3", 8}, {"S4", 0}, {"S6", 0}}) {
+    SCOPED_TRACE(e.name);
+    const ast_node *def = record_named(program, e.name);
+    ASSERT_NE(def, nullptr);
+    EXPECT_EQ(def->struct_def.aligned, e.aligned);
+  }
+  free_ast(program);
+}
+
+TEST(AttributeTest, ModeIsRecordedOnATypedef) {
+  int errors = -1;
+  ast_node *program = parse_source("typedef int T __attribute__((mode(DI)));\n"
+                                   "__attribute__((__mode__(SI))) typedef int U;\n"
+                                   "typedef int V;\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  for (const char *name : {"T", "U", "V"}) {
+    SCOPED_TRACE(name);
+    const ast_node *decl = declared_named(program, name);
+    ASSERT_NE(decl, nullptr);
+    EXPECT_EQ(decl->var_decl.specs.has_mode, std::strcmp(name, "V") != 0);
+  }
+  free_ast(program);
+}
+
+TEST(AttributeTest, AlignedModeAndPackedAreRejectedWhereTheyCannotBeHonoured) {
+  const char *mode = "the mode attribute is only supported on a typedef";
+  const char *here = "this attribute is not supported here";
+  const char *constant = "the aligned attribute needs an integer constant";
+  const char *power = "the aligned attribute needs a power of two";
+  const char *packed = "the packed attribute is not supported";
+  expect_diagnosed({
+      {"int v __attribute__((mode(DI)));", mode},
+      {"__attribute__((mode(DI))) int h(void) { return 0; }", mode},
+      {"void f(int x __attribute__((mode(DI))));", mode},
+      {"void g(__attribute__((mode(DI))) int y);", mode},
+      {"struct S { int m __attribute__((mode(DI))); };", mode},
+      {"int k(a) int a __attribute__((mode(DI))); { return a; }", mode},
+      {"long z = sizeof(int __attribute__((mode(DI))));", here},
+      {"int *__attribute__((aligned(8))) p;", here},
+      {"int (__attribute__((aligned(8))) *q);", here},
+      {"long w = sizeof(int __attribute__((aligned(8))));", here},
+      {"int x __attribute__((packed));", packed},
+      {"struct __attribute__((__packed__)) P { char c; };", packed},
+      {"int y __attribute__((aligned(1.5)));", constant},
+      {"int y __attribute__((aligned(sizeof(int))));", constant},
+      {"int y __attribute__((aligned(2 + 2)));", constant},
+      {"int y __attribute__((aligned(08)));", constant},
+      {"int y __attribute__((aligned(3)));", power},
+      {"int y __attribute__((aligned(0)));", power},
+      {"int y __attribute__((aligned(536870912)));", power},
+  });
+  expect_clean({
+      "typedef int T __attribute__((mode(DI)));",
+      "int k __attribute__((aligned(268435456)));",
+      "void f(int x __attribute__((unused)), char *y __attribute__((unused)));",
+      "void g(int a __attribute__((aligned(8)))) {}",
+  });
+}
+
+TEST(AttributeTest, ARecordTakesThePackStampedOnItsClosingBrace) {
+  token_buf tb;
+  ASSERT_EQ(pp_run(&tb, "struct S { char c; } s;\nstruct T { char c; };\n"), 0);
+  int closing = 0;
+  for (int i = 0; i < tb.count; i++) {
+    token *t = &tb.tokens[i];
+    if (t->type == TOKEN_LBRACE)
+      t->pack = 1;
+    else if (t->type == TOKEN_RBRACE)
+      t->pack = closing++ == 0 ? 4 : 2;
+    else if (t->type == TOKEN_IDENTIFIER && std::strcmp(t->value, "s") == 0)
+      t->pack = 8;
+  }
+  parser p;
+  parser_init_from_buf(&p, &tb);
+  ast_node *program = parse_program(&p);
+  EXPECT_EQ(p.had_error, 0);
+  parser_destroy(&p);
+  token_buf_free(&tb);
+  const ast_node *s = record_named(program, "S");
+  const ast_node *t = record_named(program, "T");
+  ASSERT_NE(s, nullptr);
+  ASSERT_NE(t, nullptr);
+  EXPECT_EQ(s->struct_def.pack, 4) << "not the '{' (1) and not the token after the '}' (8)";
+  EXPECT_EQ(t->struct_def.pack, 2);
+  free_ast(program);
+}
+
+static const ast_node *initializer_of(const ast_node *program, const char *name) {
+  const ast_node *decl = declared_named(program, name);
+  return decl != nullptr ? decl->var_decl.init_value : nullptr;
+}
+
+TEST(BuiltinTest, EachArgumentShapeIsParsed) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("void *ap;\n"
+                   "struct S { int a[4]; struct In { char x; double d; } in[3]; };\n"
+                   "int va = __builtin_va_arg(ap, int);\n"
+                   "unsigned long off = __builtin_offsetof(struct S, in[1].d);\n"
+                   "int tc = __builtin_types_compatible_p(__typeof__(va + 1), const int);\n"
+                   "unsigned long def = __builtin_offsetof(struct N { int a; char b; }, b);\n"
+                   "float hf = __builtin_huge_valf();\n"
+                   "int ce = __builtin_choose_expr(1, 2, 3);\n"
+                   "int ty = __builtin_types_compatible_p(__typeof(va), int);\n",
+                   &errors);
+  EXPECT_EQ(errors, 0);
+
+  const ast_node *va = initializer_of(program, "va");
+  ASSERT_NE(va, nullptr);
+  ASSERT_EQ(va->type, AST_NODE_TYPE_BUILTIN);
+  EXPECT_EQ(va->builtin.kind, BUILTIN_VA_ARG);
+  EXPECT_STREQ(va->tok.value, "__builtin_va_arg");
+  ASSERT_EQ(va->builtin.arg_count, 1);
+  EXPECT_EQ(va->builtin.args[0]->type, AST_NODE_TYPE_IDENTIFIER);
+  ASSERT_NE(va->builtin.types[0], nullptr);
+  EXPECT_EQ(va->builtin.types[0]->prim, PRIM_INT);
+
+  const ast_node *off = initializer_of(program, "off");
+  ASSERT_NE(off, nullptr);
+  ASSERT_EQ(off->type, AST_NODE_TYPE_BUILTIN);
+  EXPECT_EQ(off->builtin.kind, BUILTIN_OFFSETOF);
+  ASSERT_NE(off->builtin.types[0], nullptr);
+  EXPECT_EQ(off->builtin.types[0]->kind, TYPE_STRUCT);
+  ASSERT_EQ(off->builtin.step_count, 3) << "in, [1], d";
+  EXPECT_STREQ(off->builtin.steps[0].member, "in");
+  EXPECT_EQ(off->builtin.steps[0].index, nullptr);
+  EXPECT_EQ(off->builtin.steps[1].member, nullptr);
+  ASSERT_NE(off->builtin.steps[1].index, nullptr);
+  EXPECT_STREQ(off->builtin.steps[1].index->tok.value, "1");
+  EXPECT_STREQ(off->builtin.steps[2].member, "d");
+
+  const ast_node *tc = initializer_of(program, "tc");
+  ASSERT_NE(tc, nullptr);
+  ASSERT_EQ(tc->type, AST_NODE_TYPE_BUILTIN);
+  EXPECT_EQ(tc->builtin.kind, BUILTIN_TYPES_COMPATIBLE_P);
+  EXPECT_EQ(tc->builtin.types[0], nullptr) << "a __typeof__ slot holds an expression";
+  ASSERT_NE(tc->builtin.type_exprs[0], nullptr);
+  EXPECT_EQ(tc->builtin.type_exprs[0]->type, AST_NODE_TYPE_BINARY_OP);
+  ASSERT_NE(tc->builtin.types[1], nullptr);
+  EXPECT_TRUE(tc->builtin.types[1]->is_const);
+
+  const ast_node *def = initializer_of(program, "def");
+  ASSERT_NE(def, nullptr);
+  ASSERT_NE(def->builtin.definitions[0], nullptr);
+  EXPECT_EQ(def->builtin.definitions[0]->type, AST_NODE_TYPE_STRUCT_DEF);
+  EXPECT_STREQ(def->builtin.definitions[0]->struct_def.tag_name, "N");
+
+  const ast_node *hf = initializer_of(program, "hf");
+  ASSERT_NE(hf, nullptr);
+  ASSERT_EQ(hf->type, AST_NODE_TYPE_BUILTIN);
+  EXPECT_EQ(hf->builtin.kind, BUILTIN_HUGE_VALF) << "not the shorter __builtin_huge_val";
+  EXPECT_EQ(hf->builtin.arg_count, 0);
+
+  const ast_node *ce = initializer_of(program, "ce");
+  ASSERT_NE(ce, nullptr);
+  EXPECT_EQ(ce->builtin.kind, BUILTIN_CHOOSE_EXPR);
+  EXPECT_EQ(ce->builtin.arg_count, 3);
+
+  const ast_node *ty = initializer_of(program, "ty");
+  ASSERT_NE(ty, nullptr);
+  EXPECT_NE(ty->builtin.type_exprs[0], nullptr) << "__typeof is the other spelling";
+  free_ast(program);
+}
+
+TEST(BuiltinTest, OnlyAKnownNameFollowedByAParenthesisIsABuiltin) {
+  int errors = -1;
+  ast_node *program = parse_source("int __builtin_trap;\n"
+                                   "int plain = __builtin_trap;\n"
+                                   "int other = __builtin_frobnicate(1);\n"
+                                   "int prefix = __builtin_huge_valx();\n",
+                                   &errors);
+  EXPECT_EQ(errors, 0);
+  const ast_node *plain = initializer_of(program, "plain");
+  ASSERT_NE(plain, nullptr);
+  EXPECT_EQ(plain->type, AST_NODE_TYPE_IDENTIFIER);
+  const ast_node *other = initializer_of(program, "other");
+  ASSERT_NE(other, nullptr);
+  EXPECT_EQ(other->type, AST_NODE_TYPE_FUNCTION_CALL) << "an unknown builtin is an ordinary call";
+  const ast_node *prefix = initializer_of(program, "prefix");
+  ASSERT_NE(prefix, nullptr);
+  EXPECT_EQ(prefix->type, AST_NODE_TYPE_FUNCTION_CALL);
+  free_ast(program);
+}
+
+TEST(BuiltinTest, MalformedBuiltinsAreReported) {
+  expect_diagnosed({
+      {"void *ap; int x = __builtin_va_arg(ap int);", "expected ',' between the arguments"},
+      {"int x = __builtin_offsetof(1, a);", "expected a type name"},
+      {"struct S { int a[2]; }; int x = __builtin_offsetof(struct S, );", "expected a member name"},
+      {"struct S { int a[2]; }; int x = __builtin_offsetof(struct S, a.);",
+       "expected a member name"},
+      {"struct S { int a[2]; }; int x = __builtin_offsetof(struct S, a[1);",
+       "expected ']' after the subscript"},
+      {"int x = __builtin_types_compatible_p(__typeof__ 1, int);", "expected '(' after __typeof__"},
+      {"int x = __builtin_types_compatible_p(__typeof__(1;", "expected ')' after the __typeof__"},
+      {"int x = __builtin_types_compatible_p(int; int);", "expected ',' between the arguments"},
+      {"int x = __builtin_huge_val(1;", "expected ')' after the arguments"},
+      {"int x = __builtin_choose_expr(1, 2 3);", "expected ')' after the arguments"},
+  });
+}
+
+TEST(BuiltinTest, TheTargetsDeclarationsAreReadFirstAndKeptApart) {
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    bool on_linux = kind == TARGET_LINUX_X64;
+    SCOPED_TRACE(on_linux ? "linux" : "windows");
+    int errors = -1;
+    ast_node *program = parse_source("__builtin_va_list ap;\nint after;\n", &errors);
+    EXPECT_EQ(errors, 0) << "__builtin_va_list is a typedef name before the first line";
+    ASSERT_EQ(program->program.count, 2) << "the user's tokens are parsed after the target's";
+    const ast_node *ap = declared_named(program, "ap");
+    ASSERT_NE(ap, nullptr);
+    EXPECT_EQ(ap->var_decl.type->kind, TYPE_TYPEDEF);
+    ast_node *builtins = program->program.builtins;
+    ASSERT_NE(builtins, nullptr);
+    ASSERT_EQ(builtins->type, AST_NODE_TYPE_DECL_GROUP);
+    const ast_node *list = declared_named(builtins, "__builtin_va_list");
+    ASSERT_NE(list, nullptr);
+    EXPECT_EQ(list->var_decl.specs.storage_class, TOKEN_TYPEDEF);
+    if (on_linux) {
+      ASSERT_EQ(list->var_decl.type->kind, TYPE_ARRAY);
+      ASSERT_NE(list->var_decl.type->ptr_to, nullptr);
+      EXPECT_EQ(list->var_decl.type->ptr_to->kind, TYPE_STRUCT);
+      EXPECT_STREQ(list->var_decl.type->ptr_to->tag_name, "__va_list_tag");
+      EXPECT_NE(record_named(builtins, "__va_list_tag"), nullptr);
+    } else {
+      ASSERT_EQ(list->var_decl.type->kind, TYPE_POINTER);
+      EXPECT_EQ(list->var_decl.type->ptr_to->prim, PRIM_CHAR);
+      EXPECT_EQ(record_named(builtins, "__va_list_tag"), nullptr);
+    }
+    for (int i = 0; i < program->program.count; i++) {
+      const ast_node *decl = program->program.declarations[i];
+      EXPECT_FALSE(decl->type == AST_NODE_TYPE_VAR_DECL && decl->var_decl.var_name &&
+                   std::strcmp(decl->var_decl.var_name, "__builtin_va_list") == 0)
+          << "the target's declarations are not the user's";
+    }
+    free_ast(program);
+  }
 }

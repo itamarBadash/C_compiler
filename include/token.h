@@ -50,6 +50,9 @@ typedef enum token_type {
   TOKEN_COMPLEX,
   TOKEN_IMAGINARY,
   TOKEN_BOOL,
+  TOKEN_ATTRIBUTE,
+  TOKEN_EXTENSION,
+  TOKEN_ASM,
 
   // Keywords - composite types
   TOKEN_STRUCT,
@@ -134,5 +137,7 @@ typedef struct token {
   const char *file;
   int no_expand;
   int leading_space;
+  int system_header;
+  int pack;
 } token;
 #endif //_TOKEN_H_

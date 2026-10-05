@@ -35,6 +35,7 @@ typedef struct symbol {
   int has_static_storage;
   int external_declaration;
   int is_used;
+  int unsupported_mode;
   source_loc loc;
   struct symbol *next;
   struct symbol *all_next;

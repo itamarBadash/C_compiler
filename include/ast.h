@@ -35,7 +35,9 @@ typedef enum ast_node_type {
   AST_NODE_TYPE_INIT_LIST,
   AST_NODE_TYPE_GOTO,
   AST_NODE_TYPE_LABEL,
-  AST_NODE_TYPE_COMPOUND_LITERAL
+  AST_NODE_TYPE_COMPOUND_LITERAL,
+  AST_NODE_TYPE_ASM,
+  AST_NODE_TYPE_BUILTIN
 } ast_node_type;
 
 typedef enum type_kind {
@@ -102,6 +104,8 @@ typedef struct type_info {
 typedef struct decl_specs {
   token_type storage_class;
   int is_inline;
+  int aligned;
+  int has_mode;
 } decl_specs;
 
 typedef struct source_loc {
@@ -109,6 +113,34 @@ typedef struct source_loc {
   int column;
   const char *file;
 } source_loc;
+
+typedef enum builtin_kind {
+  BUILTIN_VA_START,
+  BUILTIN_VA_ARG,
+  BUILTIN_VA_END,
+  BUILTIN_VA_COPY,
+  BUILTIN_OFFSETOF,
+  BUILTIN_TYPES_COMPATIBLE_P,
+  BUILTIN_CHOOSE_EXPR,
+  BUILTIN_HUGE_VAL,
+  BUILTIN_HUGE_VALF,
+  BUILTIN_HUGE_VALL,
+  BUILTIN_INFF,
+  BUILTIN_NANF,
+  BUILTIN_ISGREATER,
+  BUILTIN_ISGREATEREQUAL,
+  BUILTIN_ISLESS,
+  BUILTIN_ISLESSEQUAL,
+  BUILTIN_ISLESSGREATER,
+  BUILTIN_ISUNORDERED,
+  BUILTIN_SIGNBIT,
+  BUILTIN_SIGNBITF,
+  BUILTIN_SIGNBITL,
+  BUILTIN_LLABS,
+  BUILTIN_TRAP,
+  BUILTIN_UNREACHABLE,
+  BUILTIN_TGMATH
+} builtin_kind;
 
 typedef struct ast_node {
   ast_node_type type;
@@ -129,6 +161,7 @@ typedef struct ast_node {
       int count;
       struct type_info **derived_types;
       int derived_count;
+      struct ast_node *builtins;
     } program;
 
     struct {
@@ -244,6 +277,8 @@ typedef struct ast_node {
       int member_count;
       int is_forward;
       int is_union;
+      int aligned;
+      int pack;
     } struct_def;
 
     struct {
@@ -283,6 +318,34 @@ typedef struct ast_node {
       char *label_name;
       struct ast_node *statement;
     } label_stmt;
+
+    struct {
+      struct ast_node *template_text;
+      int is_volatile;
+      struct ast_node **constraints;
+      struct ast_node **operands;
+      int output_count;
+      int operand_count;
+      struct ast_node **clobbers;
+      int clobber_count;
+    } asm_stmt;
+
+    struct {
+      builtin_kind kind;
+      struct ast_node **args;
+      int arg_count;
+      struct type_info *types[2];
+      struct ast_node *type_exprs[2];
+      struct ast_node *definitions[2];
+      struct {
+        char *member;
+        struct ast_node *index;
+      } *steps;
+      int step_count;
+      long long value;
+      int has_value;
+      struct ast_node *chosen;
+    } builtin;
   };
 } ast_node;
 
