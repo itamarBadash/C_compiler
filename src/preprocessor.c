@@ -1096,6 +1096,7 @@ static int eval_condition(pp *p, int line, int column) {
   token *expanded = NULL;
   int expanded_count = 0;
   expand_token_list(p, resolved, resolved_count, &expanded, &expanded_count);
+  free_tokens(resolved, resolved_count);
 
   eval e;
   e.p = p;

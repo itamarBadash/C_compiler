@@ -26,14 +26,20 @@ protected:
   lexer lex;
   parser p;
 
+  bool ready = false;
+
   void setup_parser(const char *source) {
+    if (ready)
+      parser_destroy(&p);
     lexer_init(&lex, source);
     parser_init(&p, &lex);
+    ready = true;
   }
 
   void TearDown() override {
     std::cout << "Entering TearDown\n" << std::flush;
-    parser_destroy(&p);
+    if (ready)
+      parser_destroy(&p);
     std::cout << "Leaving TearDown\n" << std::flush;
   }
 
@@ -5020,4 +5026,36 @@ TEST(BuiltinTest, TheTargetsDeclarationsAreReadFirstAndKeptApart) {
     }
     free_ast(program);
   }
+}
+
+TEST_F(ParserTest, AnAsmLabelAndTheRecordedAttributesStayOnTheDeclaration) {
+  setup_parser("int f(void) __asm__(\"a\" \"b\");\n"
+               "__attribute__((__dllimport__)) int v __attribute__((returns_twice, gnu_inline));\n"
+               "int w;\n"
+               "__attribute__((dllimport, __returns_twice__)) int x(void) __asm__(\"ex\");\n");
+  ast_node *program = parse_program(&p);
+  ASSERT_NE(program, nullptr);
+  EXPECT_EQ(p.had_error, 0);
+  ASSERT_EQ(program->program.count, 4);
+  ast_node *f = program->program.declarations[0];
+  ast_node *v = program->program.declarations[1];
+  ast_node *w = program->program.declarations[2];
+  ast_node *x = program->program.declarations[3];
+  ASSERT_EQ(f->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(v->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(w->type, AST_NODE_TYPE_VAR_DECL);
+  ASSERT_EQ(x->type, AST_NODE_TYPE_VAR_DECL);
+  EXPECT_STREQ(f->var_decl.asm_label, "ab") << "the label's strings are glued together";
+  EXPECT_EQ(v->var_decl.asm_label, nullptr);
+  EXPECT_EQ(v->var_decl.specs.dllimport, 1);
+  EXPECT_EQ(v->var_decl.specs.returns_twice, 1);
+  EXPECT_EQ(v->var_decl.specs.gnu_inline, 1);
+  EXPECT_EQ(w->var_decl.specs.dllimport, 0);
+  EXPECT_EQ(w->var_decl.specs.returns_twice, 0);
+  EXPECT_EQ(w->var_decl.specs.gnu_inline, 0);
+  EXPECT_STREQ(x->var_decl.asm_label, "ex");
+  EXPECT_EQ(x->var_decl.specs.dllimport, 1);
+  EXPECT_EQ(x->var_decl.specs.returns_twice, 1);
+  EXPECT_EQ(x->var_decl.specs.gnu_inline, 0);
+  free_ast(program);
 }

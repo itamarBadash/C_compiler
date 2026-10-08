@@ -287,6 +287,11 @@ static int parse_attribute(parser *p, token name, decl_specs *into) {
     parser_error_at(p, name, "this attribute is not supported here");
   else if (mode)
     into->has_mode = 1;
+  if (into) {
+    into->gnu_inline |= attribute_is(name, "gnu_inline");
+    into->dllimport |= attribute_is(name, "dllimport");
+    into->returns_twice |= attribute_is(name, "returns_twice");
+  }
   if (aligned && p->current_token.type == TOKEN_LPAREN)
     return parse_alignment(p, into);
   if (aligned) {
@@ -340,22 +345,34 @@ static void parse_attributes(parser *p, decl_specs *into) {
   }
 }
 
-static void parse_asm_label(parser *p) {
+static char *parse_asm_label(parser *p) {
   if (p->current_token.type != TOKEN_ASM)
-    return;
+    return NULL;
   parser_advance(p);
   if (p->current_token.type != TOKEN_LPAREN || p->next_token.type != TOKEN_STRING) {
     parser_error(p, "expected a string in parentheses after __asm__");
-    return;
+    return NULL;
   }
   parser_advance(p);
-  while (p->current_token.type == TOKEN_STRING)
+  char *label = NULL;
+  size_t length = 0;
+  while (p->current_token.type == TOKEN_STRING) {
+    const char *text = p->current_token.value ? p->current_token.value : "";
+    char *grown = (char *)realloc(label, length + strlen(text) + 1);
+    if (grown) {
+      strcpy(grown + length, text);
+      length += strlen(text);
+      label = grown;
+    }
     parser_advance(p);
+  }
   if (p->current_token.type != TOKEN_RPAREN) {
     parser_error(p, "expected ')' after the __asm__ name");
-    return;
+    free(label);
+    return NULL;
   }
   parser_advance(p);
+  return label;
 }
 
 static token token_after_attributes(parser *p) {
@@ -1216,7 +1233,7 @@ static ast_node *parse_declaration(parser *p, declaration_context context) {
     }
 
     decl_specs declared = specs;
-    parse_asm_label(p);
+    char *label = parse_asm_label(p);
     parse_attributes(p, &declared);
     reject_mode(p, declared);
     ast_node *init = NULL;
@@ -1244,6 +1261,7 @@ static ast_node *parse_declaration(parser *p, declaration_context context) {
     decl->var_decl.init_value = init;
     decl->var_decl.bitfield_width = width;
     decl->var_decl.specs = declared;
+    decl->var_decl.asm_label = label;
     append_item(group, decl);
 
     if (p->current_token.type != TOKEN_COMMA)

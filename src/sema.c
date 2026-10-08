@@ -41,8 +41,10 @@ typedef struct sema {
 static void resolve(sema *s, ast_node *node);
 static void resolve_type(sema *s, type_info *type, source_loc loc);
 static long long initialize_declared(sema *s, type_info *type, ast_node *value, int is_static,
-                                     source_loc loc);
+                                     source_loc loc, initializer_layout *layout);
 static type_info *sized_array(sema *s, type_info *type, long long count);
+static type_info *arithmetic_type(prim_kind prim, int is_complex);
+static void convert_to(sema *s, ast_node *node, type_info *type);
 
 static void print_location(source_loc loc) {
   if (loc.file)
@@ -402,12 +404,6 @@ static prim_kind integer_type_of(type_info *type) {
     return t->symbol->enum_type;
   return PRIM_NONE;
 }
-
-typedef struct type_layout {
-  int known;
-  long long size;
-  int alignment;
-} type_layout;
 
 static type_layout layout_of(type_info *type);
 
@@ -840,6 +836,8 @@ static constant evaluate(sema *s, ast_node *node, int evaluated) {
     return evaluate_cast(s, node, evaluated);
   case AST_NODE_TYPE_BUILTIN:
     return evaluate_builtin(s, node, evaluated);
+  case AST_NODE_TYPE_CONVERSION:
+    return evaluate(s, node->conversion.operand, evaluated);
   default:
     return non_constant();
   }
@@ -927,6 +925,8 @@ static int compatible_parameters(type_info *a, type_info *b) {
   int b_qualifiers;
   type_info *a_type = strip_typedefs(a, &a_qualifiers);
   type_info *b_type = strip_typedefs(b, &b_qualifiers);
+  if (is_unknown(a_type) || is_unknown(b_type))
+    return 1;
   type_info *a_pointee = parameter_pointee(a_type, &a_qualifiers);
   type_info *b_pointee = parameter_pointee(b_type, &b_qualifiers);
   if (a_pointee && b_pointee)
@@ -1189,11 +1189,12 @@ static symbol *declare(sema *s, const char *name, symbol_kind kind, type_info *t
       prior->type = composite_type(s, prior->type, type);
     return prior;
   }
+  symbol *linked = NULL;
   if (prior) {
     report(s, loc, "redeclaration of", name);
     note_previous(prior->loc, name);
   } else if (linkage != LINKAGE_NONE) {
-    symbol *linked = linked_symbol(s, name);
+    linked = linked_symbol(s, name);
     if (linked)
       check_redeclaration(s, linked, name, kind, type, linkage, loc);
     symbol *visible = symbol_table_lookup_ordinary(s->table, name);
@@ -1204,7 +1205,34 @@ static symbol *declare(sema *s, const char *name, symbol_kind kind, type_info *t
   symbol *sym = symbol_table_insert_ordinary(s->table, name, kind, type, loc);
   if (sym)
     sym->linkage = linkage;
+  if (sym && linked) {
+    sym->asm_label = linked->asm_label;
+    sym->dllimport = linked->dllimport;
+    sym->returns_twice = linked->returns_twice;
+  }
   return sym;
+}
+
+static int returns_twice_by_name(const char *name) {
+  const char *plain = name[0] != '_' ? name : name[1] != '_' ? name + 1 : name + 2;
+  return strcmp(plain, "setjmp") == 0 || strcmp(plain, "sigsetjmp") == 0 ||
+         strcmp(name, "savectx") == 0 || strcmp(name, "vfork") == 0 ||
+         strcmp(name, "getcontext") == 0;
+}
+
+static void record_declaration_facts(sema *s, symbol *sym, decl_specs specs, const char *label,
+                                     source_loc loc) {
+  if (!sym)
+    return;
+  if (label && sym->asm_label && strcmp(label, sym->asm_label) != 0)
+    report(s, loc, "conflicting asm labels for", sym->name);
+  else if (label)
+    sym->asm_label = label;
+  sym->dllimport |= specs.dllimport;
+  sym->returns_twice |= specs.returns_twice;
+  if (sym->kind == SYMBOL_FUNC && sym->linkage == LINKAGE_EXTERNAL &&
+      returns_twice_by_name(sym->name))
+    sym->returns_twice = 1;
 }
 
 static void record_definition(sema *s, symbol *sym, ast_node *definition, const char *name) {
@@ -1239,6 +1267,12 @@ static void check_end_of_file(sema *s, ast_node *program) {
           !sym->is_defined) {
         report(s, sym->loc, "static function used but never defined", sym->name);
         sym->is_used = 0;
+      }
+      if (decl->type == AST_NODE_TYPE_FUNCTION_DEF && sym->linkage == LINKAGE_EXTERNAL &&
+          decl->function_def.specs.is_inline) {
+        decl_specs specs = decl->function_def.specs;
+        decl->function_def.is_inline_definition =
+            specs.gnu_inline ? specs.storage_class == TOKEN_EXTERN : !sym->external_declaration;
       }
       if (sym->definition != decl || sym->is_defined || sym->linkage != LINKAGE_EXTERNAL)
         continue;
@@ -1379,6 +1413,7 @@ static void evaluate_array_size(sema *s, type_info *type, source_loc loc) {
   report_problem(s, size);
   if (size.status == CONST_NOT_CONSTANT) {
     type->is_vla = 1;
+    convert_to(s, type->array_size_expr, arithmetic_type(target_current()->size_type, 0));
     return;
   }
   if (size.status != CONST_VALUE)
@@ -1612,6 +1647,8 @@ static void resolve_var_decl(sema *s, ast_node *decl) {
   linkage_kind linkage = linkage_of(s, name, kind, storage);
   decl->symbol = declare(s, name, kind, decl->var_decl.type, linkage, decl->loc);
   symbol *sym = decl->symbol;
+  if (kind != SYMBOL_TYPEDEF)
+    record_declaration_facts(s, sym, decl->var_decl.specs, decl->var_decl.asm_label, decl->loc);
   if (sym && kind == SYMBOL_TYPEDEF) {
     sym->alignment = decl->var_decl.specs.aligned;
     sym->unsupported_mode = decl->var_decl.specs.has_mode;
@@ -1646,8 +1683,8 @@ static void resolve_var_decl(sema *s, ast_node *decl) {
   }
   resolve(s, init);
   if (is_object && init && !linked_in_block) {
-    long long count =
-        initialize_declared(s, decl->var_decl.type, init, sym->has_static_storage, decl->loc);
+    long long count = initialize_declared(s, decl->var_decl.type, init, sym->has_static_storage,
+                                          decl->loc, &decl->var_decl.init_layout);
     type_info *sized = sized_array(s, decl->var_decl.type, count);
     type_info *current = resolved_type(sym->type);
     if (current && current->kind == TYPE_ARRAY && current->array_size < 0 && !current->is_vla)
@@ -2026,6 +2063,7 @@ static void resolve_function(sema *s, ast_node *fn) {
   scope *body = s->table->current_scope;
   s->table->current_scope = body->parent;
   fn->symbol = declare(s, name, SYMBOL_FUNC, type, linkage, fn->loc);
+  record_declaration_facts(s, fn->symbol, fn->function_def.specs, NULL, fn->loc);
   s->table->current_scope = body;
   if (fn->symbol && fn->symbol->kind == SYMBOL_FUNC) {
     record_definition(s, fn->symbol, fn, name);
@@ -2243,6 +2281,46 @@ static int is_modifiable_lvalue(ast_node *expr) {
   return !((t->kind == TYPE_STRUCT || t->kind == TYPE_UNION) && has_const_member(t));
 }
 
+static type_info *operand_type(sema *s, ast_node *expr) {
+  type_info *type = value_type(s, expr);
+  if (type && is_bitfield(expr) &&
+      expr->member_access.member->var_decl.bit_width < integer_width(PRIM_INT))
+    return arithmetic_type(PRIM_INT, 0);
+  return type;
+}
+
+static void wrap_conversion(ast_node *node, conversion_kind kind, type_info *type) {
+  ast_node *operand = create_ast_node(node->type);
+  if (!operand)
+    return;
+  *operand = *node;
+  *node = (ast_node){0};
+  node->type = AST_NODE_TYPE_CONVERSION;
+  node->loc = operand->loc;
+  node->expr_type = type;
+  node->conversion.kind = kind;
+  node->conversion.operand = operand;
+}
+
+static void convert_to_value(sema *s, ast_node *node) {
+  type_info *value = value_type(s, node);
+  if (!value)
+    return;
+  type_info *t = resolved_type(node->expr_type);
+  if (t->kind == TYPE_ARRAY)
+    wrap_conversion(node, CONVERSION_ARRAY_TO_POINTER, value);
+  else if (t->kind == TYPE_FUNCTION)
+    wrap_conversion(node, CONVERSION_FUNCTION_TO_POINTER, value);
+  else if (node->is_lvalue && !is_incomplete(t))
+    wrap_conversion(node, CONVERSION_LVALUE, value);
+}
+
+static void convert_to(sema *s, ast_node *node, type_info *type) {
+  convert_to_value(s, node);
+  if (type && node->expr_type && !compatible_unqualified(node->expr_type, type))
+    wrap_conversion(node, CONVERSION_VALUE, type);
+}
+
 static type_info *address_type(sema *s, ast_node *node) {
   ast_node *operand = node->unary_op.operand;
   type_info *t = resolved_type(operand ? operand->expr_type : NULL);
@@ -2291,6 +2369,9 @@ static type_info *increment_type(sema *s, ast_node *node) {
     report(s, node->loc, "not a modifiable lvalue as the operand of", node->unary_op.op.value);
     return NULL;
   }
+  node->unary_op.computation_type =
+      is_pointer(type) ? type
+                       : arithmetic_result(operand_type(s, operand), arithmetic_type(PRIM_INT, 0));
   return type;
 }
 
@@ -2320,7 +2401,7 @@ static type_info *unary_type(sema *s, ast_node *node) {
     return increment_type(s, node);
   if (op != TOKEN_PLUS && op != TOKEN_MINUS && op != TOKEN_TILDE && op != TOKEN_NOT)
     return NULL;
-  type_info *operand = value_type(s, node->unary_op.operand);
+  type_info *operand = operand_type(s, node->unary_op.operand);
   if (!operand)
     return NULL;
   int valid = op == TOKEN_NOT     ? is_scalar(operand)
@@ -2399,8 +2480,8 @@ static type_info *binary_result(sema *s, token_type op, ast_node *left, ast_node
 static type_info *binary_type(sema *s, ast_node *node) {
   if (node->binary_op.op.type == TOKEN_COMMA)
     return value_type(s, node->binary_op.right);
-  type_info *a = value_type(s, node->binary_op.left);
-  type_info *b = value_type(s, node->binary_op.right);
+  type_info *a = operand_type(s, node->binary_op.left);
+  type_info *b = operand_type(s, node->binary_op.right);
   if (!a || !b)
     return NULL;
   type_info *result =
@@ -2412,8 +2493,8 @@ static type_info *binary_type(sema *s, ast_node *node) {
 
 static type_info *conditional_type(sema *s, ast_node *node) {
   type_info *condition = value_type(s, node->ternary.condition);
-  type_info *a = value_type(s, node->ternary.true_branch);
-  type_info *b = value_type(s, node->ternary.false_branch);
+  type_info *a = operand_type(s, node->ternary.true_branch);
+  type_info *b = operand_type(s, node->ternary.false_branch);
   if (!condition || !a || !b)
     return NULL;
   if (!is_scalar(condition)) {
@@ -2598,14 +2679,22 @@ static type_info *assignment_type(sema *s, ast_node *node) {
     }
     return target;
   }
-  int valid = op == TOKEN_PLUS_ASSIGN || op == TOKEN_MINUS_ASSIGN
-                  ? (is_arithmetic(target) && is_arithmetic(from)) ||
-                        (points_to_object(target) && is_integer(from))
-                  : binary_result(s, operator_of_assignment(op), left, right, target, from) != NULL;
-  if (!valid) {
+  type_info *a = operand_type(s, left);
+  type_info *b = operand_type(s, right);
+  type_info *computation = NULL;
+  if (op == TOKEN_PLUS_ASSIGN || op == TOKEN_MINUS_ASSIGN) {
+    if (is_arithmetic(a) && is_arithmetic(b))
+      computation = arithmetic_result(a, b);
+    else if (points_to_object(target) && is_integer(b))
+      computation = target;
+  } else {
+    computation = binary_result(s, operator_of_assignment(op), left, right, a, b);
+  }
+  if (!computation) {
     report(s, node->loc, "invalid operands to binary", node->assignment.op.value);
     return NULL;
   }
+  node->assignment.computation_type = computation;
   return target;
 }
 
@@ -2624,8 +2713,8 @@ static type_info *compound_literal_type(sema *s, ast_node *node) {
   }
   node->is_lvalue = 1;
   int is_static = s->table->current_scope->kind == SCOPE_FILE;
-  long long count =
-      initialize_declared(s, type, node->compound_literal.init_list, is_static, node->loc);
+  long long count = initialize_declared(s, type, node->compound_literal.init_list, is_static,
+                                        node->loc, &node->compound_literal.init_layout);
   return sized_array(s, type, count);
 }
 
@@ -3048,6 +3137,12 @@ typedef enum {
 static int is_static_object(sema *s, ast_node *expr);
 static constant_class classify_constant(sema *s, ast_node *expr);
 
+static ast_node *without_conversions(ast_node *node) {
+  while (node->type == AST_NODE_TYPE_CONVERSION)
+    node = node->conversion.operand;
+  return node;
+}
+
 static constant_class builtin_constant_class(sema *s, ast_node *expr) {
   switch (expr->builtin.kind) {
   case BUILTIN_HUGE_VAL:
@@ -3056,7 +3151,9 @@ static constant_class builtin_constant_class(sema *s, ast_node *expr) {
   case BUILTIN_INFF:
     return ARITHMETIC_CONSTANT;
   case BUILTIN_NANF:
-    return expr->builtin.args[0]->type == AST_NODE_TYPE_STRING ? ARITHMETIC_CONSTANT : NOT_CONSTANT;
+    return without_conversions(expr->builtin.args[0])->type == AST_NODE_TYPE_STRING
+               ? ARITHMETIC_CONSTANT
+               : NOT_CONSTANT;
   case BUILTIN_OFFSETOF:
   case BUILTIN_TYPES_COMPATIBLE_P:
     return expr->builtin.has_value ? ARITHMETIC_CONSTANT : NOT_CONSTANT;
@@ -3149,6 +3246,8 @@ static constant_class classify_constant(sema *s, ast_node *expr) {
     return type->kind == TYPE_ARRAY && is_static_object(s, expr) ? ADDRESS_CONSTANT : NOT_CONSTANT;
   case AST_NODE_TYPE_BUILTIN:
     return builtin_constant_class(s, expr);
+  case AST_NODE_TYPE_CONVERSION:
+    return classify_constant(s, expr->conversion.operand);
   default:
     return NOT_CONSTANT;
   }
@@ -3180,6 +3279,312 @@ static int is_static_object(sema *s, ast_node *expr) {
   }
 }
 
+static constant_value static_value(sema *s, ast_node *node);
+
+static constant_value integer_value(unsigned long long bits) {
+  constant_value out = {CONSTANT_INTEGER, bits, 0, 0, NULL, NULL, 0};
+  return out;
+}
+
+static constant_value floating_value(long double real, long double imag) {
+  constant_value out = {CONSTANT_FLOATING, 0, real, imag, NULL, NULL, 0};
+  return out;
+}
+
+static int is_truthy(constant_value value) {
+  if (value.kind == CONSTANT_INTEGER)
+    return value.bits != 0;
+  if (value.kind == CONSTANT_FLOATING)
+    return value.real != 0 || value.imag != 0;
+  return value.symbol || value.literal || value.offset != 0;
+}
+
+static long double rounded(long double value, prim_kind prim) {
+  if (prim == PRIM_FLOAT)
+    return (float)value;
+  if (prim == PRIM_DOUBLE)
+    return (double)value;
+  return value;
+}
+
+static long double floating_operation(token_type op, long double a, long double b, prim_kind prim) {
+  if (prim == PRIM_FLOAT) {
+    float x = (float)a;
+    float y = (float)b;
+    return op == TOKEN_PLUS ? x + y : op == TOKEN_MINUS ? x - y : op == TOKEN_STAR ? x * y : x / y;
+  }
+  if (prim == PRIM_DOUBLE) {
+    double x = (double)a;
+    double y = (double)b;
+    return op == TOKEN_PLUS ? x + y : op == TOKEN_MINUS ? x - y : op == TOKEN_STAR ? x * y : x / y;
+  }
+  return op == TOKEN_PLUS ? a + b : op == TOKEN_MINUS ? a - b : op == TOKEN_STAR ? a * b : a / b;
+}
+
+static constant_value complex_operation(token_type op, constant_value l, constant_value r,
+                                        prim_kind prim) {
+  long double a = l.real, b = l.imag, c = r.real, d = r.imag;
+  if (op == TOKEN_PLUS || op == TOKEN_MINUS)
+    return floating_value(floating_operation(op, a, c, prim), floating_operation(op, b, d, prim));
+  long double ac = floating_operation(TOKEN_STAR, a, c, prim);
+  long double bd = floating_operation(TOKEN_STAR, b, d, prim);
+  long double ad = floating_operation(TOKEN_STAR, a, d, prim);
+  long double bc = floating_operation(TOKEN_STAR, b, c, prim);
+  if (op == TOKEN_STAR)
+    return floating_value(floating_operation(TOKEN_MINUS, ac, bd, prim),
+                          floating_operation(TOKEN_PLUS, ad, bc, prim));
+  long double scale = floating_operation(TOKEN_PLUS, floating_operation(TOKEN_STAR, c, c, prim),
+                                         floating_operation(TOKEN_STAR, d, d, prim), prim);
+  return floating_value(
+      floating_operation(TOKEN_SLASH, floating_operation(TOKEN_PLUS, ac, bd, prim), scale, prim),
+      floating_operation(TOKEN_SLASH, floating_operation(TOKEN_MINUS, bc, ad, prim), scale, prim));
+}
+
+static int compare_floating(token_type op, constant_value a, constant_value b) {
+  switch (op) {
+  case TOKEN_LT:
+    return a.real < b.real;
+  case TOKEN_GT:
+    return a.real > b.real;
+  case TOKEN_LTE:
+    return a.real <= b.real;
+  case TOKEN_GTE:
+    return a.real >= b.real;
+  case TOKEN_EQ:
+    return a.real == b.real && a.imag == b.imag;
+  default:
+    return a.real != b.real || a.imag != b.imag;
+  }
+}
+
+static constant_value number_value(ast_node *node) {
+  const char *text = node->tok.value ? node->tok.value : "";
+  int is_imaginary;
+  prim_kind prim = floating_constant_type(text, &is_imaginary);
+  long double value = prim == PRIM_FLOAT    ? strtof(text, NULL)
+                      : prim == PRIM_DOUBLE ? strtod(text, NULL)
+                                            : strtold(text, NULL);
+  return is_imaginary ? floating_value(0, value) : floating_value(value, 0);
+}
+
+static constant_value truncated(sema *s, long double value, prim_kind prim, source_loc loc) {
+  int width = integer_width(prim);
+  long double limit = ldexpl(1.0L, is_unsigned(prim) ? width : width - 1);
+  long double low = is_unsigned(prim) ? -1.0L : -limit - 1.0L;
+  if (!(value > low && value < limit)) {
+    report_at(s, loc, "overflow in a constant expression");
+    return (constant_value){0};
+  }
+  unsigned long long bits =
+      is_unsigned(prim) ? (unsigned long long)value : (unsigned long long)(long long)value;
+  return integer_value(convert_value(bits, prim).bits);
+}
+
+static constant_value converted_value(sema *s, constant_value value, type_info *from, type_info *to,
+                                      source_loc loc) {
+  type_info *t = resolved_type(to);
+  if (value.kind == CONSTANT_NONE || is_unknown(t))
+    return (constant_value){0};
+  if (is_pointer(t)) {
+    if (value.kind != CONSTANT_INTEGER)
+      return value;
+    constant_value address = {CONSTANT_ADDRESS, 0, 0, 0, NULL, NULL, (long long)value.bits};
+    return address;
+  }
+  prim_kind prim = integer_type_of(t);
+  if (prim == PRIM_BOOL)
+    return integer_value(is_truthy(value));
+  if (prim != PRIM_NONE) {
+    if (value.kind == CONSTANT_INTEGER)
+      return integer_value(convert_value(value.bits, prim).bits);
+    if (value.kind == CONSTANT_FLOATING)
+      return truncated(s, value.real, prim, loc);
+    return (constant_value){0};
+  }
+  long double real = value.real;
+  long double imag = value.imag;
+  if (value.kind == CONSTANT_INTEGER) {
+    real = is_unsigned(integer_type_of(from)) ? (long double)value.bits
+                                              : (long double)(long long)value.bits;
+    imag = 0;
+  }
+  return floating_value(rounded(real, t->prim), t->is_complex ? rounded(imag, t->prim) : 0);
+}
+
+static constant_value address_value(sema *s, ast_node *node) {
+  constant_value out = {CONSTANT_ADDRESS, 0, 0, 0, NULL, NULL, 0};
+  switch (node->type) {
+  case AST_NODE_TYPE_IDENTIFIER:
+    out.symbol = node->symbol;
+    return out;
+  case AST_NODE_TYPE_STRING:
+  case AST_NODE_TYPE_COMPOUND_LITERAL:
+    out.literal = node;
+    return out;
+  case AST_NODE_TYPE_UNARY_OP:
+    if (node->unary_op.op.type != TOKEN_STAR)
+      return (constant_value){0};
+    return static_value(s, node->unary_op.operand);
+  case AST_NODE_TYPE_ARRAY_SUBSCRIPT: {
+    ast_node *left = node->array_subscript.left;
+    ast_node *index = node->array_subscript.index;
+    int pointer_left = is_pointer(left->expr_type);
+    out = static_value(s, pointer_left ? left : index);
+    constant_value count = static_value(s, pointer_left ? index : left);
+    if (out.kind != CONSTANT_ADDRESS || count.kind != CONSTANT_INTEGER)
+      return (constant_value){0};
+    out.offset += (long long)count.bits * layout_of(node->expr_type).size;
+    return out;
+  }
+  case AST_NODE_TYPE_MEMBER_ACCESS:
+    out = node->member_access.is_pointer ? static_value(s, node->member_access.left)
+                                         : address_value(s, node->member_access.left);
+    if (out.kind == CONSTANT_ADDRESS)
+      out.offset += node->member_access.member->var_decl.offset;
+    return out;
+  case AST_NODE_TYPE_BUILTIN:
+    if (node->builtin.kind != BUILTIN_CHOOSE_EXPR || !node->builtin.chosen)
+      return (constant_value){0};
+    return address_value(s, node->builtin.chosen);
+  default:
+    return (constant_value){0};
+  }
+}
+
+static constant_value unary_value(sema *s, ast_node *node) {
+  token_type op = node->unary_op.op.type;
+  ast_node *operand = node->unary_op.operand;
+  if (op == TOKEN_AMPERSAND)
+    return address_value(s, operand);
+  constant_value value = static_value(s, operand);
+  if (value.kind == CONSTANT_FLOATING)
+    return op == TOKEN_MINUS ? floating_value(-value.real, -value.imag) : value;
+  if (value.kind != CONSTANT_INTEGER)
+    return (constant_value){0};
+  prim_kind prim = integer_type_of(operand->expr_type);
+  if (op == TOKEN_NOT)
+    return integer_value(value.bits == 0);
+  if (op == TOKEN_TILDE)
+    return integer_value(convert_value(~value.bits, prim).bits);
+  if (op != TOKEN_MINUS)
+    return value;
+  int_value zero = {prim, 0};
+  int_value v = {prim, value.bits};
+  constant result = evaluate_arithmetic(TOKEN_MINUS, zero, v, node->loc);
+  if (result.status != CONST_VALUE) {
+    report_problem(s, result);
+    return (constant_value){0};
+  }
+  return integer_value(result.value.bits);
+}
+
+static constant_value binary_value(sema *s, ast_node *node) {
+  token_type op = node->binary_op.op.type;
+  ast_node *left = node->binary_op.left;
+  ast_node *right = node->binary_op.right;
+  constant_value a = static_value(s, left);
+  if (a.kind == CONSTANT_NONE)
+    return a;
+  if (op == TOKEN_AND || op == TOKEN_OR) {
+    if (is_truthy(a) == (op == TOKEN_OR))
+      return integer_value(op == TOKEN_OR);
+    constant_value b = static_value(s, right);
+    return b.kind == CONSTANT_NONE ? b : integer_value(is_truthy(b));
+  }
+  constant_value b = static_value(s, right);
+  if (b.kind == CONSTANT_NONE)
+    return b;
+  if (a.kind == CONSTANT_ADDRESS || b.kind == CONSTANT_ADDRESS) {
+    int address_left = a.kind == CONSTANT_ADDRESS;
+    constant_value out = address_left ? a : b;
+    constant_value count = address_left ? b : a;
+    type_info *pointer = address_left ? left->expr_type : right->expr_type;
+    long long step = (long long)count.bits * layout_of(pointee(pointer)).size;
+    out.offset += op == TOKEN_MINUS ? -step : step;
+    return out;
+  }
+  if (a.kind == CONSTANT_FLOATING) {
+    type_info *t = resolved_type(left->expr_type);
+    if (is_comparison(op))
+      return integer_value(compare_floating(op, a, b));
+    if (t->is_complex)
+      return complex_operation(op, a, b, t->prim);
+    return floating_value(floating_operation(op, a.real, b.real, t->prim), 0);
+  }
+  int_value l = {integer_type_of(left->expr_type), a.bits};
+  int_value r = {integer_type_of(right->expr_type), b.bits};
+  constant result = op == TOKEN_LSHIFT || op == TOKEN_RSHIFT
+                        ? evaluate_shift(s, node, constant_of(l), constant_of(r), 1)
+                        : evaluate_arithmetic(op, l, r, node->loc);
+  if (result.status != CONST_VALUE) {
+    report_problem(s, result);
+    return (constant_value){0};
+  }
+  return integer_value(result.value.bits);
+}
+
+static constant_value builtin_value(sema *s, ast_node *node) {
+  switch (node->builtin.kind) {
+  case BUILTIN_HUGE_VAL:
+  case BUILTIN_HUGE_VALF:
+  case BUILTIN_HUGE_VALL:
+  case BUILTIN_INFF:
+    return floating_value(HUGE_VALL, 0);
+  case BUILTIN_NANF:
+    return floating_value(NAN, 0);
+  case BUILTIN_CHOOSE_EXPR:
+    return node->builtin.chosen ? static_value(s, node->builtin.chosen) : (constant_value){0};
+  default:
+    return (constant_value){0};
+  }
+}
+
+static constant_value static_value(sema *s, ast_node *node) {
+  type_info *type = resolved_type(node->expr_type);
+  if (is_unknown(type))
+    return (constant_value){0};
+  if (is_integer(type)) {
+    constant value = evaluate(s, node, 1);
+    if (value.status == CONST_VALUE)
+      return integer_value(convert_value(value.value.bits, integer_type_of(type)).bits);
+    if (value.status == CONST_NO_VALUE) {
+      report_problem(s, value);
+      return (constant_value){0};
+    }
+  }
+  switch (node->type) {
+  case AST_NODE_TYPE_NUMBER:
+    return number_value(node);
+  case AST_NODE_TYPE_CONVERSION: {
+    ast_node *operand = node->conversion.operand;
+    if (node->conversion.kind == CONVERSION_VALUE)
+      return converted_value(s, static_value(s, operand), operand->expr_type, type, node->loc);
+    if (node->conversion.kind == CONVERSION_LVALUE)
+      return (constant_value){0};
+    return address_value(s, operand);
+  }
+  case AST_NODE_TYPE_CAST: {
+    ast_node *operand = node->cast_expr.operand;
+    return converted_value(s, static_value(s, operand), operand->expr_type, type, node->loc);
+  }
+  case AST_NODE_TYPE_UNARY_OP:
+    return unary_value(s, node);
+  case AST_NODE_TYPE_BINARY_OP:
+    return binary_value(s, node);
+  case AST_NODE_TYPE_TERNARY: {
+    constant_value condition = static_value(s, node->ternary.condition);
+    if (condition.kind == CONSTANT_NONE)
+      return condition;
+    return static_value(s, is_truthy(condition) ? node->ternary.true_branch
+                                                : node->ternary.false_branch);
+  }
+  case AST_NODE_TYPE_BUILTIN:
+    return builtin_value(s, node);
+  default:
+    return (constant_value){0};
+  }
+}
+
 typedef struct init_frame {
   type_info *type;
   long long position;
@@ -3193,6 +3598,7 @@ typedef struct initializer {
   int is_static;
   init_frame *frames;
   int depth;
+  initializer_layout *layout;
 } initializer;
 
 static int is_aggregate(type_info *t) {
@@ -3258,19 +3664,74 @@ static type_info *current_element(init_frame *frame) {
   return frame->members[frame->position]->var_decl.type;
 }
 
+static long long element_offset(init_frame *frame) {
+  if (frame->type->kind == TYPE_ARRAY)
+    return frame->position * layout_of(frame->type->ptr_to).size;
+  return frame->members[frame->position]->var_decl.offset;
+}
+
+static long long current_offset(initializer *init) {
+  long long offset = 0;
+  for (int i = 0; i < init->depth; i++)
+    offset += element_offset(&init->frames[i]);
+  return offset;
+}
+
+static long long entry_bits(initializer_entry *entry) {
+  return entry->bit_width ? entry->bit_width : layout_of(entry->type).size * 8;
+}
+
+static void forget_overlapping(initializer_layout *layout, long long start, long long bits) {
+  int kept = 0;
+  for (int i = 0; i < layout->count; i++) {
+    initializer_entry *entry = &layout->entries[i];
+    long long from = entry->offset * 8 + entry->bit_offset;
+    if (from >= start + bits || from + entry_bits(entry) <= start)
+      layout->entries[kept++] = *entry;
+  }
+  layout->count = kept;
+}
+
+static void record_entry(initializer *init, type_info *type, ast_node *value,
+                         constant_value constant) {
+  initializer_entry entry = {current_offset(init), 0, 0, type, value, constant};
+  init_frame *frame = init->depth > 0 ? &init->frames[init->depth - 1] : NULL;
+  if (frame && frame->type->kind != TYPE_ARRAY) {
+    ast_node *member = frame->members[frame->position];
+    if (member->var_decl.bitfield_width) {
+      entry.bit_offset = member->var_decl.bit_offset;
+      entry.bit_width = member->var_decl.bit_width;
+    }
+  }
+  initializer_layout *layout = init->layout;
+  forget_overlapping(layout, entry.offset * 8 + entry.bit_offset, entry_bits(&entry));
+  initializer_entry *grown = (initializer_entry *)realloc(
+      layout->entries, sizeof(initializer_entry) * (size_t)(layout->count + 1));
+  if (!grown)
+    return;
+  layout->entries = grown;
+  grown[layout->count++] = entry;
+}
+
 static long long initialize_object(initializer *init, type_info *type, ast_node *value);
 
 static void initialize_leaf(initializer *init, type_info *type, ast_node *value) {
   if (!value_type(init->s, value))
     return;
-  const char *problem = conversion_problem(init->s, unqualified(init->s, type), value);
-  if (problem)
+  type_info *target = unqualified(init->s, type);
+  const char *problem = conversion_problem(init->s, target, value);
+  int fold = init->is_static && !problem;
+  if (problem) {
     report_conversion(init->s, value->loc, problem, "initialization");
-  else if (init->is_static && classify_constant(init->s, value) == NOT_CONSTANT)
+  } else if (fold && classify_constant(init->s, value) == NOT_CONSTANT) {
     report_at(init->s, value->loc,
               "an initializer for an object with static storage must be constant");
-  else if (init->is_static && is_integer(value->expr_type))
-    report_problem(init->s, evaluate(init->s, value, 1));
+    fold = 0;
+  }
+  if (problem)
+    return;
+  convert_to(init->s, value, target);
+  record_entry(init, type, value, fold ? static_value(init->s, value) : (constant_value){0});
 }
 
 static long long initialize_string(initializer *init, type_info *array, ast_node *string) {
@@ -3281,6 +3742,7 @@ static long long initialize_string(initializer *init, type_info *array, ast_node
   }
   if (array->array_size >= 0 && string->literal.length > array->array_size)
     report_at(init->s, string->loc, "initializer string is too long for its array");
+  record_entry(init, array, string, (constant_value){0});
   return (long long)string->literal.length + 1;
 }
 
@@ -3380,6 +3842,7 @@ static void place_value(initializer *init, int base, ast_node *value, int *exces
 }
 
 static long long initialize_list(initializer *init, type_info *type, ast_node *list) {
+  forget_overlapping(init->layout, current_offset(init) * 8, layout_of(type).size * 8);
   int base = init->depth;
   if (!push_frame(init, type))
     return -1;
@@ -3406,6 +3869,8 @@ static long long initialize_object(initializer *init, type_info *type, ast_node 
   if (is_unknown(t))
     return -1;
   if (value->type == AST_NODE_TYPE_INIT_LIST) {
+    if (value->init_list.count == 0)
+      return is_aggregate(t) ? initialize_list(init, t, value) : -1;
     ast_node *first = value->init_list.items[0].value;
     int plain = !value->init_list.items[0].member_name && !value->init_list.items[0].index;
     if (is_string_array(t) && value->init_list.count == 1 && plain &&
@@ -3432,7 +3897,7 @@ static long long initialize_object(initializer *init, type_info *type, ast_node 
 }
 
 static long long initialize_declared(sema *s, type_info *type, ast_node *value, int is_static,
-                                     source_loc loc) {
+                                     source_loc loc, initializer_layout *layout) {
   type_info *t = resolved_type(type);
   if (!value)
     return -1;
@@ -3444,7 +3909,7 @@ static long long initialize_declared(sema *s, type_info *type, ast_node *value, 
     report_at(s, loc, "an object with incomplete type cannot be initialized");
     return -1;
   }
-  initializer init = {s, is_static, NULL, 0};
+  initializer init = {s, is_static, NULL, 0, layout};
   long long count = initialize_object(&init, type, value);
   pop_frames(&init, 0);
   free(init.frames);
@@ -3464,6 +3929,197 @@ static type_info *sized_array(sema *s, type_info *type, long long count) {
     return type;
   copy->array_size = count;
   return copy;
+}
+
+static void convert_unary_operand(sema *s, ast_node *node) {
+  token_type op = node->unary_op.op.type;
+  ast_node *operand = node->unary_op.operand;
+  if (op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_TILDE)
+    convert_to(s, operand, node->expr_type);
+  else if (op == TOKEN_NOT)
+    convert_to(s, operand, arithmetic_type(PRIM_BOOL, 0));
+  else if (op == TOKEN_STAR)
+    convert_to_value(s, operand);
+}
+
+static void convert_binary_operands(sema *s, ast_node *node) {
+  token_type op = node->binary_op.op.type;
+  ast_node *left = node->binary_op.left;
+  ast_node *right = node->binary_op.right;
+  if (op == TOKEN_COMMA) {
+    convert_to_value(s, right);
+    return;
+  }
+  type_info *a = operand_type(s, left);
+  type_info *b = operand_type(s, right);
+  if (op == TOKEN_AND || op == TOKEN_OR) {
+    a = b = arithmetic_type(PRIM_BOOL, 0);
+  } else if (op == TOKEN_LSHIFT || op == TOKEN_RSHIFT) {
+    a = promoted(a);
+    b = promoted(b);
+  } else if (is_arithmetic(a) && is_arithmetic(b)) {
+    a = b = arithmetic_result(a, b);
+  } else if (op == TOKEN_PLUS || op == TOKEN_MINUS) {
+    type_info *index = arithmetic_type(target_current()->ptrdiff_type, 0);
+    a = is_integer(a) ? index : a;
+    b = is_integer(b) ? index : b;
+  } else if (op == TOKEN_EQ || op == TOKEN_NEQ) {
+    if (is_null_pointer_constant(s, right))
+      b = a;
+    else if (is_null_pointer_constant(s, left))
+      a = b;
+    else if (void_pointer_pair(a, b))
+      a = b = is_void(pointee(a)) ? a : b;
+  }
+  convert_to(s, left, a);
+  convert_to(s, right, b);
+}
+
+static void convert_subscript_operands(sema *s, ast_node *node) {
+  ast_node *left = node->array_subscript.left;
+  ast_node *index = node->array_subscript.index;
+  int pointer_left = is_pointer(value_type(s, left));
+  convert_to_value(s, pointer_left ? left : index);
+  convert_to(s, pointer_left ? index : left, arithmetic_type(target_current()->ptrdiff_type, 0));
+}
+
+static void convert_assigned_value(sema *s, ast_node *node) {
+  ast_node *right = node->assignment.right;
+  token_type op = node->assignment.op.type;
+  type_info *computation = node->assignment.computation_type;
+  if (op == TOKEN_ASSIGN)
+    convert_to(s, right, node->expr_type);
+  else if (op == TOKEN_LSHIFT_ASSIGN || op == TOKEN_RSHIFT_ASSIGN)
+    convert_to(s, right, promoted(operand_type(s, right)));
+  else if (is_pointer(computation))
+    convert_to(s, right, arithmetic_type(target_current()->ptrdiff_type, 0));
+  else
+    convert_to(s, right, computation);
+}
+
+static type_info *promoted_argument(sema *s, ast_node *arg) {
+  type_info *type = operand_type(s, arg);
+  if (is_integer(type))
+    return promoted(type);
+  if (is_real(type) && resolved_type(type)->prim == PRIM_FLOAT)
+    return arithmetic_type(PRIM_DOUBLE, 0);
+  return type;
+}
+
+static void convert_arguments(sema *s, type_info *fn, ast_node **args, int count) {
+  for (int i = 0; i < count; i++) {
+    if (fn->has_prototype && i < fn->param_count)
+      convert_to(s, args[i], unqualified(s, adjusted_parameter_type(s, fn->param_types[i])));
+    else
+      convert_to(s, args[i], promoted_argument(s, args[i]));
+  }
+}
+
+static void convert_call_operands(sema *s, ast_node *node) {
+  ast_node *callable = node->function_call.callable;
+  type_info *fn = resolved_type(pointee(value_type(s, callable)));
+  convert_to_value(s, callable);
+  convert_arguments(s, fn, node->function_call.arguments, node->function_call.arg_count);
+}
+
+static void convert_va_list(sema *s, ast_node *arg, int written) {
+  if (!written || resolved_type(s->va_list)->kind == TYPE_ARRAY)
+    convert_to_value(s, arg);
+}
+
+static void convert_builtin_operands(sema *s, ast_node *node) {
+  ast_node **args = node->builtin.args;
+  switch (node->builtin.kind) {
+  case BUILTIN_VA_START:
+  case BUILTIN_VA_END:
+  case BUILTIN_VA_ARG:
+    convert_va_list(s, args[0], 1);
+    break;
+  case BUILTIN_VA_COPY:
+    convert_va_list(s, args[0], 1);
+    convert_va_list(s, args[1], 0);
+    break;
+  case BUILTIN_OFFSETOF:
+    for (int i = 0; i < node->builtin.step_count; i++) {
+      if (node->builtin.steps[i].index)
+        convert_to(s, node->builtin.steps[i].index,
+                   arithmetic_type(target_current()->ptrdiff_type, 0));
+    }
+    break;
+  case BUILTIN_NANF:
+    convert_to(s, args[0], pointer_to(s, qualified(s, arithmetic_type(PRIM_CHAR, 0), 1)));
+    break;
+  case BUILTIN_LLABS:
+    convert_to(s, args[0], arithmetic_type(PRIM_LLONG, 0));
+    break;
+  case BUILTIN_SIGNBIT:
+    convert_to_value(s, args[0]);
+    break;
+  case BUILTIN_SIGNBITF:
+    convert_to(s, args[0], arithmetic_type(PRIM_FLOAT, 0));
+    break;
+  case BUILTIN_SIGNBITL:
+    convert_to(s, args[0], arithmetic_type(PRIM_LDOUBLE, 0));
+    break;
+  case BUILTIN_ISGREATER:
+  case BUILTIN_ISGREATEREQUAL:
+  case BUILTIN_ISLESS:
+  case BUILTIN_ISLESSEQUAL:
+  case BUILTIN_ISLESSGREATER:
+  case BUILTIN_ISUNORDERED: {
+    type_info *common = arithmetic_result(operand_type(s, args[0]), operand_type(s, args[1]));
+    convert_to(s, args[0], common);
+    convert_to(s, args[1], common);
+    break;
+  }
+  case BUILTIN_TGMATH: {
+    int functions = (int)node->builtin.value;
+    type_info *fn = resolved_type(pointee(value_type(s, node->builtin.chosen)));
+    convert_to_value(s, node->builtin.chosen);
+    convert_arguments(s, fn, args + functions, node->builtin.arg_count - functions);
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+static void convert_operands(sema *s, ast_node *node) {
+  switch (node->type) {
+  case AST_NODE_TYPE_UNARY_OP:
+    convert_unary_operand(s, node);
+    break;
+  case AST_NODE_TYPE_BINARY_OP:
+    convert_binary_operands(s, node);
+    break;
+  case AST_NODE_TYPE_TERNARY:
+    convert_to(s, node->ternary.condition, arithmetic_type(PRIM_BOOL, 0));
+    convert_to(s, node->ternary.true_branch, node->expr_type);
+    convert_to(s, node->ternary.false_branch, node->expr_type);
+    break;
+  case AST_NODE_TYPE_CAST:
+    if (!is_void(node->expr_type))
+      convert_to_value(s, node->cast_expr.operand);
+    break;
+  case AST_NODE_TYPE_MEMBER_ACCESS:
+    if (node->member_access.is_pointer)
+      convert_to_value(s, node->member_access.left);
+    break;
+  case AST_NODE_TYPE_ARRAY_SUBSCRIPT:
+    convert_subscript_operands(s, node);
+    break;
+  case AST_NODE_TYPE_ASSIGNMENT:
+    convert_assigned_value(s, node);
+    break;
+  case AST_NODE_TYPE_FUNCTION_CALL:
+    convert_call_operands(s, node);
+    break;
+  case AST_NODE_TYPE_BUILTIN:
+    convert_builtin_operands(s, node);
+    break;
+  default:
+    break;
+  }
 }
 
 static void type_expression(sema *s, ast_node *node) {
@@ -3514,6 +4170,8 @@ static void type_expression(sema *s, ast_node *node) {
   default:
     break;
   }
+  if (node->expr_type)
+    convert_operands(s, node);
 }
 
 typedef struct switch_context {
@@ -3537,6 +4195,8 @@ static void check_condition(sema *s, ast_node *statement, ast_node *condition,
   type_info *type = value_type(s, condition);
   if (type && !is_scalar(type))
     report_at(s, statement->loc, message);
+  else if (type)
+    convert_to(s, condition, arithmetic_type(PRIM_BOOL, 0));
 }
 
 static void resolve_loop_body(sema *s, ast_node *body) {
@@ -3550,13 +4210,15 @@ static void resolve_loop_body(sema *s, ast_node *body) {
 static void resolve_switch(sema *s, ast_node *node) {
   symbol_table_enter_scope(s->table, SCOPE_BLOCK);
   resolve(s, node->switch_stmt.condition);
-  type_info *type = value_type(s, node->switch_stmt.condition);
+  type_info *type = operand_type(s, node->switch_stmt.condition);
   switch_context context = {0};
   context.type = PRIM_NONE;
-  if (type && !is_integer(type))
+  if (type && !is_integer(type)) {
     report_at(s, node->loc, "the controlling expression of 'switch' needs an integer type");
-  else if (type)
+  } else if (type) {
     context.type = promote(integer_type_of(type));
+    convert_to(s, node->switch_stmt.condition, arithmetic_type(context.type, 0));
+  }
   context.vm = s->vm;
   context.outer = s->current_switch;
   s->current_switch = &context;
@@ -3580,6 +4242,7 @@ static void record_case(sema *s, switch_context *context, ast_node *node) {
   if (result.status != CONST_VALUE || context->type == PRIM_NONE)
     return;
   unsigned long long bits = convert_value(result.value.bits, context->type).bits;
+  node->case_stmt.label_value = bits;
   for (int i = 0; i < context->count; i++) {
     if (context->values[i] == bits) {
       report_at(s, node->loc, "duplicate case value");
@@ -3645,9 +4308,12 @@ static void resolve_return(sema *s, ast_node *node) {
   }
   if (!value_type(s, value))
     return;
-  const char *problem = conversion_problem(s, unqualified(s, expected), value);
+  type_info *target = unqualified(s, expected);
+  const char *problem = conversion_problem(s, target, value);
   if (problem)
     report_conversion(s, value->loc, problem, "return");
+  else
+    convert_to(s, value, target);
 }
 
 static void resolve_asm(sema *s, ast_node *node) {
@@ -3820,6 +4486,10 @@ static void resolve(sema *s, ast_node *node) {
     break;
   }
   type_expression(s, node);
+}
+
+type_layout sema_type_layout(type_info *type) {
+  return layout_of(type);
 }
 
 int sema_check(symbol_table *table, ast_node *program) {
