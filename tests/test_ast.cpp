@@ -428,6 +428,82 @@ TEST(AstTests, FreeAstReleasesEachDerivedTypeButNothingItPointsTo) {
   free_type_info(borrowed);
 }
 
+TEST(AstTests, FreeAstReleasesAConversionsOperandButNotItsType) {
+  type_info *borrowed = create_type_info(TYPE_PRIMITIVE);
+  ast_node *operand = create_ast_node(AST_NODE_TYPE_IDENTIFIER);
+  operand->tok.value = strdup("x");
+  void *name = operand->tok.value;
+  ast_node *conversion = create_ast_node(AST_NODE_TYPE_CONVERSION);
+  conversion->conversion.kind = CONVERSION_LVALUE;
+  conversion->conversion.operand = operand;
+  conversion->expr_type = borrowed;
+
+  std::map<void *, int> frees;
+  frees[conversion] = 0;
+  frees[operand] = 0;
+  frees[name] = 0;
+  frees[borrowed] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(conversion);
+  }
+  EXPECT_EQ(frees[conversion], 1);
+  EXPECT_EQ(frees[operand], 1) << "a conversion owns the expression it converts";
+  EXPECT_EQ(frees[name], 1) << "the operand's token is freed once, by the operand";
+  EXPECT_EQ(frees[borrowed], 0) << "a conversion's type is borrowed";
+  free_type_info(borrowed);
+}
+
+TEST(AstTests, FreeAstReleasesEachInitializerLayoutButNothingItPointsTo) {
+  type_info *borrowed = create_type_info(TYPE_PRIMITIVE);
+  ast_node *value = create_ast_node(AST_NODE_TYPE_NUMBER);
+  ast_node *decl = create_ast_node(AST_NODE_TYPE_VAR_DECL);
+  ast_node *literal = create_ast_node(AST_NODE_TYPE_COMPOUND_LITERAL);
+  initializer_entry *decl_entries = (initializer_entry *)calloc(2, sizeof(initializer_entry));
+  initializer_entry *literal_entries = (initializer_entry *)calloc(1, sizeof(initializer_entry));
+  decl_entries[0].type = borrowed;
+  decl_entries[0].value = value;
+  decl_entries[1].type = borrowed;
+  decl_entries[1].value = value;
+  literal_entries[0].type = borrowed;
+  literal_entries[0].value = value;
+  decl->var_decl.init_layout.entries = decl_entries;
+  decl->var_decl.init_layout.count = 2;
+  literal->compound_literal.init_layout.entries = literal_entries;
+  literal->compound_literal.init_layout.count = 1;
+
+  std::map<void *, int> frees;
+  frees[decl_entries] = 0;
+  frees[literal_entries] = 0;
+  frees[value] = 0;
+  frees[borrowed] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(decl);
+    free_ast(literal);
+  }
+  EXPECT_EQ(frees[decl_entries], 1);
+  EXPECT_EQ(frees[literal_entries], 1);
+  EXPECT_EQ(frees[value], 0) << "an entry's value belongs to the initializer";
+  EXPECT_EQ(frees[borrowed], 0) << "an entry's type is borrowed";
+  free_ast(value);
+  free_type_info(borrowed);
+}
+
+TEST(AstTests, FreeAstReleasesADeclarationsAsmLabel) {
+  ast_node *decl = create_ast_node(AST_NODE_TYPE_VAR_DECL);
+  decl->var_decl.asm_label = strdup("renamed");
+  void *label = decl->var_decl.asm_label;
+
+  std::map<void *, int> frees;
+  frees[label] = 0;
+  {
+    TrackFrees track(frees);
+    free_ast(decl);
+  }
+  EXPECT_EQ(frees[label], 1);
+}
+
 TEST(AstTests, FreeAstReleasesTheFunctionNameType) {
   ast_node *fn = create_ast_node(AST_NODE_TYPE_FUNCTION_DEF);
   fn->function_def.name_type = create_type_info(TYPE_ARRAY);

@@ -36,6 +36,9 @@ typedef struct symbol {
   int external_declaration;
   int is_used;
   int unsupported_mode;
+  const char *asm_label;
+  int dllimport;
+  int returns_twice;
   source_loc loc;
   struct symbol *next;
   struct symbol *all_next;

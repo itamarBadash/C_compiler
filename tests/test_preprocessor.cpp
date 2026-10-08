@@ -61,11 +61,15 @@ protected:
   int rc = 0;
 
   void run(const char *source) {
+    if (initialised)
+      token_buf_free(&tb);
     rc = pp_run(&tb, source);
     initialised = true;
   }
 
   void lex_all(const char *source) {
+    if (initialised)
+      token_buf_free(&tb);
     char *spliced = pp_splice_lines(source);
     token_buf_init(&tb);
     lexer lex;
@@ -1162,6 +1166,29 @@ TEST_F(PreprocessorTest, RedefiningAFunctionLikeMacroDoesNotLeakParams) {
   EXPECT_GT(frees_many - frees_one, 2000)
       << "99 extra function-like macros must free three parameter names each "
          "on top of names, bodies and structs";
+}
+
+TEST_F(PreprocessorTest, AConditionFreesTheTokensDefinedWasResolvedInto) {
+  std::string one = "#if defined A || 1\n#endif\n";
+  std::string many;
+  for (int i = 0; i < 100; i++)
+    many += one;
+
+  token_buf a;
+  tb_free_pointer_calls = 0;
+  pp_run(&a, one.c_str());
+  int frees_one = tb_free_pointer_calls;
+  token_buf_free(&a);
+
+  token_buf b;
+  tb_free_pointer_calls = 0;
+  pp_run(&b, many.c_str());
+  int frees_many = tb_free_pointer_calls;
+  token_buf_free(&b);
+
+  EXPECT_GT(frees_many - frees_one, 2700)
+      << "each extra #if must free the three tokens of '0 || 1' and their list; "
+         "a leaked list measures ~2475, not ~2871";
 }
 
 TEST_F(PreprocessorTest, FunctionLikeMacroExpands) {

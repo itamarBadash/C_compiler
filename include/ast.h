@@ -37,7 +37,8 @@ typedef enum ast_node_type {
   AST_NODE_TYPE_LABEL,
   AST_NODE_TYPE_COMPOUND_LITERAL,
   AST_NODE_TYPE_ASM,
-  AST_NODE_TYPE_BUILTIN
+  AST_NODE_TYPE_BUILTIN,
+  AST_NODE_TYPE_CONVERSION
 } ast_node_type;
 
 typedef enum type_kind {
@@ -106,6 +107,9 @@ typedef struct decl_specs {
   int is_inline;
   int aligned;
   int has_mode;
+  int gnu_inline;
+  int dllimport;
+  int returns_twice;
 } decl_specs;
 
 typedef struct source_loc {
@@ -142,6 +146,44 @@ typedef enum builtin_kind {
   BUILTIN_TGMATH
 } builtin_kind;
 
+typedef enum conversion_kind {
+  CONVERSION_LVALUE,
+  CONVERSION_ARRAY_TO_POINTER,
+  CONVERSION_FUNCTION_TO_POINTER,
+  CONVERSION_VALUE
+} conversion_kind;
+
+typedef enum constant_kind {
+  CONSTANT_NONE,
+  CONSTANT_INTEGER,
+  CONSTANT_FLOATING,
+  CONSTANT_ADDRESS
+} constant_kind;
+
+typedef struct constant_value {
+  constant_kind kind;
+  unsigned long long bits;
+  long double real;
+  long double imag;
+  struct symbol *symbol;
+  struct ast_node *literal;
+  long long offset;
+} constant_value;
+
+typedef struct initializer_entry {
+  long long offset;
+  int bit_offset;
+  int bit_width;
+  struct type_info *type;
+  struct ast_node *value;
+  constant_value constant;
+} initializer_entry;
+
+typedef struct initializer_layout {
+  initializer_entry *entries;
+  int count;
+} initializer_layout;
+
 typedef struct ast_node {
   ast_node_type type;
   token tok;
@@ -174,12 +216,14 @@ typedef struct ast_node {
       token op;
       struct ast_node *operand;
       int is_postfix; // 1 for x++, 0 for ++x
+      struct type_info *computation_type;
     } unary_op;
 
     struct {
       token op;
       struct ast_node *left;
       struct ast_node *right;
+      struct type_info *computation_type;
     } assignment;
 
     struct {
@@ -229,6 +273,8 @@ typedef struct ast_node {
       long long offset;
       int bit_offset;
       int bit_width;
+      initializer_layout init_layout;
+      char *asm_label;
     } var_decl;
 
     struct {
@@ -238,6 +284,7 @@ typedef struct ast_node {
       struct ast_node *body;
       decl_specs specs;
       struct type_info *name_type;
+      int is_inline_definition;
     } function_def;
 
     struct {
@@ -265,6 +312,7 @@ typedef struct ast_node {
     struct {
       struct ast_node *value;
       struct ast_node *body;
+      unsigned long long label_value;
     } case_stmt;
 
     struct {
@@ -308,6 +356,7 @@ typedef struct ast_node {
       struct type_info *type;
       struct ast_node *init_list;
       struct ast_node *definition;
+      initializer_layout init_layout;
     } compound_literal;
 
     struct {
@@ -346,6 +395,11 @@ typedef struct ast_node {
       int has_value;
       struct ast_node *chosen;
     } builtin;
+
+    struct {
+      conversion_kind kind;
+      struct ast_node *operand;
+    } conversion;
   };
 } ast_node;
 

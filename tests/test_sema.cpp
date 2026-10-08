@@ -1,5 +1,8 @@
+#include "conversion_walk.h"
 #include "target_guard.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <string>
@@ -138,6 +141,9 @@ static void collect(ast_node *node, std::vector<ast_node *> &out) {
     break;
   case AST_NODE_TYPE_LABEL:
     collect(node->label_stmt.statement, out);
+    break;
+  case AST_NODE_TYPE_CONVERSION:
+    collect(node->conversion.operand, out);
     break;
   default:
     break;
@@ -2293,18 +2299,18 @@ TEST(SemaTest, EveryFunctionBodyDeclaresItsOwnFunc) {
   EXPECT_NE(func[0]->symbol, func[1]->symbol);
   EXPECT_EQ(func[2]->symbol, nullptr);
   const struct {
-    symbol *symbol;
+    symbol *declared;
     long long size;
   } expected[] = {{func[0]->symbol, 2}, {func[1]->symbol, 3}};
   for (const auto &test : expected) {
-    EXPECT_EQ(test.symbol->kind, SYMBOL_VAR);
-    EXPECT_EQ(test.symbol->linkage, LINKAGE_NONE);
-    ASSERT_NE(test.symbol->type, nullptr);
-    EXPECT_EQ(test.symbol->type->kind, TYPE_ARRAY);
-    EXPECT_EQ(test.symbol->type->array_size, test.size) << "the name and its terminator";
-    ASSERT_NE(test.symbol->type->ptr_to, nullptr);
-    EXPECT_EQ(test.symbol->type->ptr_to->prim, PRIM_CHAR);
-    EXPECT_EQ(test.symbol->type->ptr_to->is_const, 1);
+    EXPECT_EQ(test.declared->kind, SYMBOL_VAR);
+    EXPECT_EQ(test.declared->linkage, LINKAGE_NONE);
+    ASSERT_NE(test.declared->type, nullptr);
+    EXPECT_EQ(test.declared->type->kind, TYPE_ARRAY);
+    EXPECT_EQ(test.declared->type->array_size, test.size) << "the name and its terminator";
+    ASSERT_NE(test.declared->type->ptr_to, nullptr);
+    EXPECT_EQ(test.declared->type->ptr_to->prim, PRIM_CHAR);
+    EXPECT_EQ(test.declared->type->ptr_to->is_const, 1);
   }
 }
 
@@ -2494,6 +2500,18 @@ TEST(CompatibilityTest, ATypeThatFailedToResolveConflictsWithNothing) {
   EXPECT_EQ(c.errors, 2) << c.diagnostics;
   EXPECT_EQ(c.diagnostics, error_at(src, "x;", 1, "unknown type name 'U'") +
                                error_at(src, "g(U", 1, "unknown type name 'U'"));
+}
+
+TEST(CompatibilityTest, AnIdentifierListLeftByAParseErrorConflictsWithNothing) {
+  const char *src = "int g(U);\n"
+                    "int g(int *);\n"
+                    "int k(int);\n"
+                    "int k(V);\n"
+                    "int (*p)(int *) = g;\n";
+  Checked c;
+  check(c, src);
+  EXPECT_EQ(c.parse_errors, 2) << "one for each identifier list";
+  EXPECT_EQ(c.errors, 0) << c.diagnostics;
 }
 
 TEST(RedeclarationTest, KindAndLinkageMustAgree) {
@@ -4372,6 +4390,16 @@ TEST(InlineTest, InlineDefinitionsKeepToThemselves) {
       << "the definition leaves inline mode when its body ends";
 }
 
+TEST(InitializerTest, AnEmptyListLeftByAParseErrorIsSkipped) {
+  const char *src = "int x = {};\n"
+                    "struct S { int a; } s = {};\n"
+                    "void f(void) { double *p = {}; int y = (int){}; }\n";
+  Checked c;
+  check(c, src);
+  EXPECT_EQ(c.parse_errors, 4) << "one for each empty list";
+  EXPECT_EQ(c.errors, 0) << c.diagnostics;
+}
+
 TEST(InitializerTest, UntypedPartsAddNoError) {
   const char *src = "int uc = (int)missing1;\n"
                     "int ud = -(int)missing2 + 1;\n"
@@ -5352,7 +5380,9 @@ TEST(TgmathTest, TheChosenFunctionIsRecorded) {
   ast_node *call = r[0]->var_decl.init_value;
   ASSERT_EQ(call->type, AST_NODE_TYPE_BUILTIN);
   ASSERT_NE(call->builtin.chosen, nullptr);
-  EXPECT_STREQ(call->builtin.chosen->tok.value, "pd");
+  ASSERT_EQ(call->builtin.chosen->type, AST_NODE_TYPE_CONVERSION) << "the chosen function decays";
+  EXPECT_EQ(call->builtin.chosen->conversion.kind, CONVERSION_FUNCTION_TO_POINTER);
+  EXPECT_STREQ(call->builtin.chosen->conversion.operand->tok.value, "pd");
   EXPECT_EQ(call->builtin.value, 6) << "six of the eight arguments are functions";
 }
 
@@ -5393,4 +5423,1409 @@ TEST(TgmathTest, MisuseIsReported) {
                    "wrong number of arguments to '__builtin_tgmath'") +
           error_at(s, "vd);\n  __builtin_tgmath(vd", 1, "incompatible types in argument") +
           error_at(s, "vd, sd", 1, prototype));
+}
+
+static std::string shape(ast_node *node);
+
+static std::string shape_list(ast_node **nodes, int count) {
+  std::string out;
+  for (int i = 0; i < count; i++)
+    out += (i > 0 ? ", " : "") + shape(nodes[i]);
+  return out;
+}
+
+static std::string shape(ast_node *node) {
+  if (node == nullptr)
+    return "";
+  switch (node->type) {
+  case AST_NODE_TYPE_CONVERSION: {
+    std::string operand = shape(node->conversion.operand);
+    switch (node->conversion.kind) {
+    case CONVERSION_LVALUE:
+      return "load(" + operand + ")";
+    case CONVERSION_ARRAY_TO_POINTER:
+      return "decay(" + operand + ")";
+    case CONVERSION_FUNCTION_TO_POINTER:
+      return "address(" + operand + ")";
+    default:
+      return "(" + describe(node->expr_type) + ")" + operand;
+    }
+  }
+  case AST_NODE_TYPE_IDENTIFIER:
+  case AST_NODE_TYPE_NUMBER:
+    return node->tok.value;
+  case AST_NODE_TYPE_STRING:
+    return "\"" +
+           (node->literal.bytes != nullptr ? std::string(node->literal.bytes, node->literal.length)
+                                           : std::string()) +
+           "\"";
+  case AST_NODE_TYPE_UNARY_OP: {
+    std::string op = node->unary_op.op.value;
+    std::string operand = shape(node->unary_op.operand);
+    if (node->unary_op.is_postfix)
+      return operand + op;
+    return op == "sizeof" ? "sizeof " + operand : op + operand;
+  }
+  case AST_NODE_TYPE_BINARY_OP:
+    return "(" + shape(node->binary_op.left) + " " + node->binary_op.op.value + " " +
+           shape(node->binary_op.right) + ")";
+  case AST_NODE_TYPE_ASSIGNMENT:
+    return "(" + shape(node->assignment.left) + " " + node->assignment.op.value + " " +
+           shape(node->assignment.right) + ")";
+  case AST_NODE_TYPE_TERNARY:
+    return "(" + shape(node->ternary.condition) + " ? " + shape(node->ternary.true_branch) + " : " +
+           shape(node->ternary.false_branch) + ")";
+  case AST_NODE_TYPE_FUNCTION_CALL:
+    return shape(node->function_call.callable) + "(" +
+           shape_list(node->function_call.arguments, node->function_call.arg_count) + ")";
+  case AST_NODE_TYPE_ARRAY_SUBSCRIPT:
+    return shape(node->array_subscript.left) + "[" + shape(node->array_subscript.index) + "]";
+  case AST_NODE_TYPE_MEMBER_ACCESS:
+    return shape(node->member_access.left) + (node->member_access.is_pointer ? "->" : ".") +
+           node->member_access.member_name;
+  case AST_NODE_TYPE_CAST:
+    return "cast<" + describe(node->cast_expr.type) + ">(" + shape(node->cast_expr.operand) + ")";
+  case AST_NODE_TYPE_BUILTIN: {
+    std::string out = std::string(node->tok.value) + "(" +
+                      shape_list(node->builtin.args, node->builtin.arg_count);
+    for (int i = 0; i < node->builtin.step_count; i++) {
+      if (node->builtin.steps[i].index != nullptr)
+        out += "[" + shape(node->builtin.steps[i].index) + "]";
+    }
+    return out + ")";
+  }
+  case AST_NODE_TYPE_COMPOUND_LITERAL:
+    return "literal";
+  case AST_NODE_TYPE_INIT_LIST: {
+    std::string out = "{";
+    for (int i = 0; i < node->init_list.count; i++)
+      out += (i > 0 ? ", " : "") + shape(node->init_list.items[i].value);
+    return out + "}";
+  }
+  default:
+    return "?";
+  }
+}
+
+static void add_statement_shape(ast_node *node, std::vector<std::string> &out) {
+  if (node == nullptr)
+    return;
+  switch (node->type) {
+  case AST_NODE_TYPE_DECL_GROUP:
+    for (int i = 0; i < node->block.count; i++)
+      add_statement_shape(node->block.statements[i], out);
+    break;
+  case AST_NODE_TYPE_VAR_DECL:
+    if (node->var_decl.init_value != nullptr)
+      out.push_back(std::string(node->var_decl.var_name) + " = " +
+                    shape(node->var_decl.init_value));
+    break;
+  case AST_NODE_TYPE_RETURN:
+    out.push_back("return " + shape(node->return_stmt.return_value));
+    break;
+  case AST_NODE_TYPE_IF:
+    out.push_back("if " + shape(node->if_stmt.condition));
+    break;
+  case AST_NODE_TYPE_WHILE:
+    out.push_back("while " + shape(node->while_stmt.condition));
+    break;
+  case AST_NODE_TYPE_DO_WHILE:
+    out.push_back("do " + shape(node->do_while_stmt.condition));
+    break;
+  case AST_NODE_TYPE_FOR:
+    out.push_back("for " + shape(node->for_stmt.init) + "; " + shape(node->for_stmt.condition) +
+                  "; " + shape(node->for_stmt.increment));
+    break;
+  case AST_NODE_TYPE_SWITCH:
+    out.push_back("switch " + shape(node->switch_stmt.condition));
+    break;
+  default:
+    out.push_back(shape(node));
+    break;
+  }
+}
+
+static std::vector<std::string> body_shapes(const Checked &c, const char *function) {
+  std::vector<ast_node *> definition = declarations(c, function);
+  if (definition.size() != 1 || definition[0]->type != AST_NODE_TYPE_FUNCTION_DEF)
+    return {"<no definition>"};
+  std::vector<std::string> out;
+  ast_node *body = definition[0]->function_def.body;
+  for (int i = 0; i < body->block.count; i++)
+    add_statement_shape(body->block.statements[i], out);
+  return out;
+}
+
+static void expect_shapes(const std::string &decls, const std::string &body,
+                          const std::vector<std::string> &expected) {
+  std::string source = decls + "void probe(void) {\n" + body + "}\n";
+  SCOPED_TRACE(source);
+  Checked c;
+  check(c, source.c_str());
+  ASSERT_EQ(c.parse_errors, 0);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(body_shapes(c, "probe"), expected);
+}
+
+static std::string init_shape(const Checked &c, const char *name) {
+  std::vector<ast_node *> decl = declarations(c, name);
+  if (decl.size() != 1 || decl[0]->type != AST_NODE_TYPE_VAR_DECL)
+    return "<no declaration>";
+  return shape(decl[0]->var_decl.init_value);
+}
+
+TEST(ConversionTest, ArithmeticOperandsMeetInTheTypeTheOperatorWorksIn) {
+  expect_shapes("int i; unsigned u; char c; unsigned short us; long double ld;\n"
+                "double _Complex z; float fl;\n",
+                "i < u;\n"
+                "c + us;\n"
+                "i + i;\n"
+                "ld * c;\n"
+                "z + fl;\n"
+                "u << c;\n"
+                "c >> 1u;\n"
+                "-c;\n"
+                "~us;\n"
+                "!fl;\n"
+                "i && fl;\n"
+                "c || u;\n"
+                "c ? fl : ld;\n",
+                {
+                    "((unsigned int)load(i) < load(u))",
+                    "((int)load(c) + (int)load(us))",
+                    "(load(i) + load(i))",
+                    "(load(ld) * (long double)load(c))",
+                    "(load(z) + (double _Complex)load(fl))",
+                    "(load(u) << (int)load(c))",
+                    "((int)load(c) >> 1u)",
+                    "-(int)load(c)",
+                    "~(int)load(us)",
+                    "!(_Bool)load(fl)",
+                    "((_Bool)load(i) && (_Bool)load(fl))",
+                    "((_Bool)load(c) || (_Bool)load(u))",
+                    "((_Bool)load(c) ? (long double)load(fl) : load(ld))",
+                });
+}
+
+TEST(ConversionTest, AnLvalueIsReadOnlyWhereItsValueIsUsed) {
+  expect_shapes("int x; const int ci = 1; struct S { int m; } s, *ps; int *p;\n",
+                "&x;\n"
+                "sizeof x;\n"
+                "x++;\n"
+                "--x;\n"
+                "x = ci;\n"
+                "x += ci;\n"
+                "s.m;\n"
+                "ps->m;\n"
+                "*p;\n"
+                "(long)x;\n",
+                {
+                    "&x",
+                    "sizeof x",
+                    "x++",
+                    "--x",
+                    "(x = load(ci))",
+                    "(x += load(ci))",
+                    "s.m",
+                    "load(ps)->m",
+                    "*load(p)",
+                    "cast<long>(load(x))",
+                });
+}
+
+TEST(ConversionTest, ThrownAwayValuesAreNotConverted) {
+  expect_shapes("int x, y; volatile int v;\n",
+                "x;\n"
+                "v;\n"
+                "(void)x;\n"
+                "x, y;\n"
+                "for (x; 0; v) ;\n",
+                {
+                    "x",
+                    "v",
+                    "cast<void>(x)",
+                    "(x , load(y))",
+                    "for x; (_Bool)0; v",
+                });
+}
+
+TEST(ConversionTest, ALoadedValueLosesItsQualifiers) {
+  const char *src = "const volatile int cv; int r;\n"
+                    "void probe(void) { r = cv; }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  std::vector<ast_node *> loads = nodes_of(c, AST_NODE_TYPE_CONVERSION);
+  ASSERT_EQ(loads.size(), 1u);
+  EXPECT_EQ(loads[0]->conversion.kind, CONVERSION_LVALUE);
+  EXPECT_EQ(describe(loads[0]->conversion.operand->expr_type), "const volatile int");
+  EXPECT_EQ(describe(loads[0]->expr_type), "int");
+  EXPECT_EQ(loads[0]->is_lvalue, 0);
+  EXPECT_EQ(loads[0]->loc.line, loads[0]->conversion.operand->loc.line);
+  EXPECT_EQ(loads[0]->loc.column, loads[0]->conversion.operand->loc.column);
+}
+
+TEST(ConversionTest, AnIncompleteObjectIsNeverRead) {
+  expect_shapes("struct In; struct In *ip;\n",
+                "(0, *ip);\n"
+                "0 ? *ip : *ip;\n",
+                {
+                    "(0 , *load(ip))",
+                    "((_Bool)0 ? *load(ip) : *load(ip))",
+                });
+}
+
+TEST(ConversionTest, ArraysAndFunctionsDecay) {
+  expect_shapes("int a[3]; int f(int); int (*fp)(int); char *q;\n",
+                "f(1);\n"
+                "fp(2);\n"
+                "a[1];\n"
+                "q = \"hi\";\n"
+                "sizeof a;\n"
+                "&a;\n"
+                "fp = f;\n"
+                "char t[] = \"hi\";\n",
+                {
+                    "address(f)(1)",
+                    "load(fp)(2)",
+                    "decay(a)[(long long)1]",
+                    "(q = decay(\"hi\"))",
+                    "sizeof a",
+                    "&a",
+                    "(fp = address(f))",
+                    "t = \"hi\"",
+                });
+}
+
+TEST(ConversionTest, PointerOperandsFollowTheirOwnRules) {
+  expect_shapes("int *p, *q; void *vp; char c; unsigned u;\n",
+                "p + c;\n"
+                "u + p;\n"
+                "p - u;\n"
+                "p - q;\n"
+                "p < q;\n"
+                "c[p];\n"
+                "p == 0;\n"
+                "0 != p;\n"
+                "p == vp;\n"
+                "vp != q;\n"
+                "p == (void *)0;\n"
+                "p && vp;\n"
+                "c ? p : 0;\n"
+                "c ? vp : p;\n",
+                {
+                    "(load(p) + (long long)load(c))",
+                    "((long long)load(u) + load(p))",
+                    "(load(p) - (long long)load(u))",
+                    "(load(p) - load(q))",
+                    "(load(p) < load(q))",
+                    "(long long)load(c)[load(p)]",
+                    "(load(p) == (int *)0)",
+                    "((int *)0 != load(p))",
+                    "((void *)load(p) == load(vp))",
+                    "(load(vp) != (void *)load(q))",
+                    "(load(p) == (int *)cast<void *>(0))",
+                    "((_Bool)load(p) && (_Bool)load(vp))",
+                    "((_Bool)load(c) ? load(p) : (int *)0)",
+                    "((_Bool)load(c) ? load(vp) : (void *)load(p))",
+                });
+}
+
+TEST(ConversionTest, ArgumentsConvertToTheirParameterOrArePromoted) {
+  expect_shapes("int f(long, const char *); int old(); int v(int, ...);\n"
+                "void k(int a[], int g(void)); int h(void); int arr[2];\n"
+                "char c; float fl; long double ld; double _Complex z; float _Complex zf;\n"
+                "struct B { unsigned u3 : 3; unsigned u32 : 32; } s;\n",
+                "f(c, \"x\");\n"
+                "old(c, fl, ld);\n"
+                "v(c, c, fl, z, zf, s.u3, s.u32);\n"
+                "k(arr, h);\n",
+                {
+                    "address(f)((long)load(c), (const char *)decay(\"x\"))",
+                    "address(old)((int)load(c), (double)load(fl), load(ld))",
+                    "address(v)((int)load(c), (int)load(c), (double)load(fl), load(z), load(zf), "
+                    "(int)load(s.u3), load(s.u32))",
+                    "address(k)(decay(arr), address(h))",
+                });
+}
+
+TEST(ConversionTest, StatementsConvertTheValuesTheyUse) {
+  std::string decls = "int i; float fl; char c; double _Complex z; int *p;\n"
+                      "struct B { unsigned u3 : 3; } s;\n";
+  expect_shapes(decls,
+                "if (p) ;\n"
+                "while (fl) break;\n"
+                "do ; while (z);\n"
+                "for (i = 0; i < 3; i++) ;\n"
+                "switch (c) { default: ; }\n"
+                "switch (s.u3) { default: ; }\n"
+                "switch (i) { default: ; }\n"
+                "int d = c;\n"
+                "double e[2] = { i, c };\n"
+                "struct B t = s;\n",
+                {
+                    "if (_Bool)load(p)",
+                    "while (_Bool)load(fl)",
+                    "do (_Bool)load(z)",
+                    "for (i = 0); (_Bool)(load(i) < 3); i++",
+                    "switch (int)load(c)",
+                    "switch (int)load(s.u3)",
+                    "switch load(i)",
+                    "d = (int)load(c)",
+                    "e = {(double)load(i), (double)load(c)}",
+                    "t = load(s)",
+                });
+
+  std::string returns = decls + "char r(void) { return i; }\nint *n(void) { return 0; }\n";
+  Checked c;
+  check(c, returns.c_str());
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(body_shapes(c, "r"), std::vector<std::string>{"return (char)load(i)"});
+  EXPECT_EQ(body_shapes(c, "n"), std::vector<std::string>{"return (int *)0"});
+}
+
+TEST(ConversionTest, CompoundAssignmentAndIncrementRecordTheirComputationType) {
+  const char *src = "unsigned char uc; _Bool b; int *p; char c; unsigned short us;\n"
+                    "long double ld; float fl; double _Complex z; long long q;\n"
+                    "struct B { unsigned u3 : 3; _Bool bb : 1; } s;\n"
+                    "void probe(void) {\n"
+                    "  uc += 10;\n"
+                    "  uc <<= us;\n"
+                    "  q <<= c;\n"
+                    "  p += c;\n"
+                    "  p -= us;\n"
+                    "  ld *= c;\n"
+                    "  z += fl;\n"
+                    "  s.u3 /= -2;\n"
+                    "  b++;\n"
+                    "  --p;\n"
+                    "  fl++;\n"
+                    "  uc = c;\n"
+                    "  s.bb = 0.5;\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  std::vector<ast_node *> definition = declarations(c, "probe");
+  ASSERT_EQ(definition.size(), 1u);
+  ast_node *body = definition[0]->function_def.body;
+  std::vector<std::string> seen;
+  for (int i = 0; i < body->block.count; i++) {
+    ast_node *statement = body->block.statements[i];
+    type_info *computation = statement->type == AST_NODE_TYPE_ASSIGNMENT
+                                 ? statement->assignment.computation_type
+                                 : statement->unary_op.computation_type;
+    seen.push_back(shape(statement) + " in " + describe(computation));
+  }
+  std::vector<std::string> expected = {
+      "(uc += 10) in int",
+      "(uc <<= (int)load(us)) in int",
+      "(q <<= (int)load(c)) in long long",
+      "(p += (long long)load(c)) in int *",
+      "(p -= (long long)load(us)) in int *",
+      "(ld *= (long double)load(c)) in long double",
+      "(z += (double _Complex)load(fl)) in double _Complex",
+      "(s.u3 /= -2) in int",
+      "b++ in int",
+      "--p in int *",
+      "fl++ in float",
+      "(uc = (unsigned char)load(c)) in <none>",
+      "(s.bb = (_Bool)0.5) in <none>",
+  };
+  EXPECT_EQ(seen, expected);
+}
+
+TEST(ConversionTest, ABitFieldNarrowerThanIntPromotesToInt) {
+  const char *s = "struct B { unsigned u3 : 3; unsigned u31 : 31; unsigned u32 : 32; int i5 : 5;\n"
+                  "  _Bool b : 1; unsigned long long q3 : 3; unsigned long long q40 : 40; } s;\n";
+  expect_types({
+      {s, "s.u3 - 4", "int"},
+      {s, "s.u31 + 0", "int"},
+      {s, "s.u32 - 4", "unsigned int"},
+      {s, "s.i5 * 2", "int"},
+      {s, "s.b + 0", "int"},
+      {s, "s.q3 + 0", "int"},
+      {s, "s.q40 + 0", "unsigned long long"},
+      {s, "-s.u3", "int"},
+      {s, "~s.u32", "unsigned int"},
+      {s, "s.u3 << 1", "int"},
+      {s, "1 ? s.u3 : s.u3", "int"},
+      {s, "s.u3 < 0u", "int"},
+      {s, "s.u3", "unsigned int"},
+      {s, "s.u3 = 9", "unsigned int"},
+      {s, "s.u3 += 1", "unsigned int"},
+      {s, "s.u3++", "unsigned int"},
+  });
+}
+
+TEST(ConversionTest, AVaListIsUsedWhereTheBuiltinNeedsIt) {
+  const char *src = "void f(int n, ...) {\n"
+                    "  __builtin_va_list ap, aq;\n"
+                    "  __builtin_va_start(ap, n);\n"
+                    "  __builtin_va_arg(ap, int);\n"
+                    "  __builtin_va_copy(aq, ap);\n"
+                    "  __builtin_va_end(aq);\n"
+                    "}\n"
+                    "void g(__builtin_va_list ap) { __builtin_va_arg(ap, int); }\n";
+  {
+    SCOPED_TRACE("windows: va_list is a char * the builtins write into");
+    TargetGuard guard(TARGET_WINDOWS_X64);
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    EXPECT_EQ(body_shapes(c, "f"), (std::vector<std::string>{
+                                       "__builtin_va_start(ap, n)", "__builtin_va_arg(ap)",
+                                       "__builtin_va_copy(aq, load(ap))", "__builtin_va_end(aq)"}));
+    EXPECT_EQ(body_shapes(c, "g"), std::vector<std::string>{"__builtin_va_arg(ap)"});
+  }
+  {
+    SCOPED_TRACE("linux: va_list is an array, so every use is a pointer to it");
+    TargetGuard guard(TARGET_LINUX_X64);
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    EXPECT_EQ(body_shapes(c, "f"),
+              (std::vector<std::string>{
+                  "__builtin_va_start(decay(ap), n)", "__builtin_va_arg(decay(ap))",
+                  "__builtin_va_copy(decay(aq), decay(ap))", "__builtin_va_end(decay(aq))"}));
+    EXPECT_EQ(body_shapes(c, "g"), std::vector<std::string>{"__builtin_va_arg(load(ap))"});
+  }
+}
+
+TEST(ConversionTest, BuiltinArgumentsConvertToWhatEachBuiltinTakes) {
+  expect_shapes("float fl; int i; long double ld; char c; struct S { int a[4]; };\n",
+                "__builtin_isgreater(fl, i);\n"
+                "__builtin_isunordered(ld, fl);\n"
+                "__builtin_signbit(fl);\n"
+                "__builtin_signbitf(ld);\n"
+                "__builtin_signbitl(fl);\n"
+                "__builtin_llabs(c);\n"
+                "__builtin_nanf(\"\");\n"
+                "__builtin_offsetof(struct S, a[i]);\n",
+                {
+                    "__builtin_isgreater(load(fl), (float)load(i))",
+                    "__builtin_isunordered(load(ld), (long double)load(fl))",
+                    "__builtin_signbit(load(fl))",
+                    "__builtin_signbitf((float)load(ld))",
+                    "__builtin_signbitl((long double)load(fl))",
+                    "__builtin_llabs((long long)load(c))",
+                    "__builtin_nanf((const char *)decay(\"\"))",
+                    "__builtin_offsetof([(long long)load(i)])",
+                });
+}
+
+TEST(ConversionTest, ConstantRulesStillHoldThroughConversions) {
+  const char *src =
+      "int x;\n"
+      "static _Bool b = &x;\n"
+      "static char *p = \"abc\" + 1;\n"
+      "static float n = __builtin_nanf(\"\");\n"
+      "static int *np = 0;\n"
+      "enum { A = -1 < 0u, B = !5, C = (unsigned char)250 + 10, D = (int)(1 ? -1 : 0u) };\n"
+      "int arr[sizeof(int) * 2];\n"
+      "void f(int v) { switch (v) { case 'a' + 1: case (char)300: case 2u: ; } }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(init_shape(c, "b"), "(_Bool)&x");
+  EXPECT_EQ(init_shape(c, "p"), "(decay(\"abc\") + (long long)1)");
+  EXPECT_EQ(init_shape(c, "n"), "__builtin_nanf((const char *)decay(\"\"))");
+  EXPECT_EQ(init_shape(c, "np"), "(int *)0");
+  const char *names[] = {"A", "B", "C", "D"};
+  long long values[] = {0, 0, 260, -1};
+  for (int i = 0; i < 4; i++) {
+    symbol *sym = find_symbol(c, names[i], SYMBOL_ENUM_CONSTANT);
+    ASSERT_NE(sym, nullptr) << names[i];
+    EXPECT_EQ(sym->value, values[i]) << names[i];
+  }
+  type_info *arr = type_of(c, "arr");
+  ASSERT_NE(arr, nullptr);
+  EXPECT_EQ(arr->array_size, 8);
+}
+
+TEST(ConversionTest, ATypeGenericCallConvertsItsArgumentsForTheChosenFunction) {
+  std::string src =
+      std::string(tgmath_declarations) + "void g(void) { POW(vf, vi); LDEXP(vf, vc); }\n";
+  Checked c;
+  check_preprocessed(c, src.c_str());
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(body_shapes(c, "g"),
+            (std::vector<std::string>{
+                "__builtin_tgmath(pf, address(pd), pl, cpf, cpd, cpl, (double)load(vf), "
+                "(double)load(vi))",
+                "__builtin_tgmath(address(lf), ld, ll, load(vf), (int)load(vc))"}));
+}
+
+static const char *every_operator_source =
+    "struct S { unsigned u3 : 3; _Bool b : 1; int i; int arr[4]; } s, *ps = &s;\n"
+    "typedef __builtin_va_list va;\n"
+    "int f(int, double); int old(); int v(const char *, ...);\n"
+    "float fl; char c; unsigned short us; int i, *p, a[10]; unsigned u; long double ld;\n"
+    "double _Complex z; const int ci = 3; volatile int vi; void *vp;\n"
+    "static int *sp = 0; static char *str = \"abc\" + 1; static int *ap = &a[2];\n"
+    "static _Bool sb = &i; static int si = 1.5; static float sf = 2;\n"
+    "static void (*fp)(void) = 0;\n"
+    "enum E { E0, E1 } e;\n"
+    "int g(va list, ...) {\n"
+    "  va mine;\n"
+    "  __builtin_va_start(mine, list);\n"
+    "  int x = __builtin_va_arg(mine, int);\n"
+    "  __builtin_va_copy(mine, list);\n"
+    "  __builtin_va_end(mine);\n"
+    "  return x + __builtin_va_arg(list, int);\n"
+    "}\n"
+    "long double h(void) {\n"
+    "  int r, *rp; void *rv;\n"
+    "  r = c + us; r = s.u3 - 4 < 0; r = -s.u3; r = i < u; r = !p && fl;\n"
+    "  r = c ? fl : ld; rp = i ? p : 0; rv = i ? vp : p;\n"
+    "  r = p == 0; r = 0 == p; r = p == vp; r = p[c]; r = c[p]; r = *(p + c); r = p - p;\n"
+    "  r = f(c, i); r = old(c, fl, s); r = v(\"x\", c, fl, ld, z, s.u3);\n"
+    "  c += 10; c <<= us; p += c; p -= us; ld *= c; z += fl; s.u3 += 1; s.b = 0.5;\n"
+    "  c++; --p; s.b--; fl++; e = E1; r = e + 1; r = (long)ci + ci;\n"
+    "  r = sizeof a + sizeof(a + 0); (void)vi; vi; i, vi;\n"
+    "  r = ps->i + ps->arr[1] + s.arr[2];\n"
+    "  r = __builtin_isgreater(fl, i) + __builtin_signbitf(ld) + __builtin_signbit(fl);\n"
+    "  r = (int)__builtin_llabs(c);\n"
+    "  switch (c) { case 1: break; }\n"
+    "  switch (s.u3) { default: break; }\n"
+    "  if (p) r = 1;\n"
+    "  while (fl) break;\n"
+    "  do ; while (z);\n"
+    "  for (; c;) break;\n"
+    "  for (r = 0; r < 3; r++) ;\n"
+    "  struct S t = s;\n"
+    "  int init[3] = { c, fl, 2.5 };\n"
+    "  char text[] = \"hi\";\n"
+    "  const char *q = text;\n"
+    "  int *cl = (int[]){ c, 2 };\n"
+    "  r = __builtin_offsetof(struct S, arr[i]);\n"
+    "  double vla[c + 1][r];\n"
+    "  return c;\n"
+    "}\n";
+
+TEST(ConversionTest, EveryOperatorsOperandsHaveTheTypeTheOperatorWorksIn) {
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    Checked c;
+    check(c, every_operator_source);
+    ASSERT_EQ(c.parse_errors, 0);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    ConversionWalk walk = walk_conversions(c.program);
+    EXPECT_EQ(walk.problems, std::vector<std::string>{});
+    EXPECT_GT(walk.kinds[CONVERSION_LVALUE], 0);
+    EXPECT_GT(walk.kinds[CONVERSION_ARRAY_TO_POINTER], 0);
+    EXPECT_GT(walk.kinds[CONVERSION_FUNCTION_TO_POINTER], 0);
+    EXPECT_GT(walk.kinds[CONVERSION_VALUE], 0);
+  }
+}
+
+static std::vector<std::string> layout_text(const Checked &c, const initializer_layout &layout) {
+  std::vector<std::string> out;
+  for (int i = 0; i < layout.count; i++) {
+    const initializer_entry &entry = layout.entries[i];
+    if (std::find(c.nodes.begin(), c.nodes.end(), entry.value) == c.nodes.end()) {
+      out.push_back("<an entry whose value is not in the tree>");
+      continue;
+    }
+    std::string where = std::to_string(entry.offset);
+    if (entry.bit_width != 0)
+      where += "." + std::to_string(entry.bit_offset) + ":" + std::to_string(entry.bit_width);
+    out.push_back(where + " " + describe(entry.type) + " = " + shape(entry.value));
+  }
+  return out;
+}
+
+static std::vector<std::string> layout_of(const Checked &c, const char *name) {
+  std::vector<ast_node *> decl = declarations(c, name);
+  if (decl.size() != 1 || decl[0]->type != AST_NODE_TYPE_VAR_DECL)
+    return {"<no declaration>"};
+  return layout_text(c, decl[0]->var_decl.init_layout);
+}
+
+static const char *layout_records = "struct P { int x, y; };\n"
+                                    "struct O { struct P p; int z; };\n"
+                                    "union U { int i; unsigned char c[4]; };\n"
+                                    "struct W { union U u; int tail; };\n"
+                                    "struct B { unsigned a : 4, b : 4; int c; };\n"
+                                    "struct V { union U u; };\n"
+                                    "struct L { int : 32; int a; };\n"
+                                    "struct Q { struct L l; int z; };\n"
+                                    "struct P q = {7, 8};\n";
+
+TEST(InitializerLayoutTest, EachValueIsPlacedWhereTheObjectStoresIt) {
+  std::string src = std::string(layout_records) +
+                    "struct O e1 = {1, 2, 3};\n"
+                    "int e2[2][3] = {1, 2, 3, 4};\n"
+                    "struct { char c; long long d; short e[3]; } e5 = {97, 1, {1, 2, 3}};\n"
+                    "int t3[2][2] = {[0][1] = 5, [1][0] = 6};\n"
+                    "int e8 = {42};\n"
+                    "char e4[] = \"hey\";\n"
+                    "char e3[2][4] = {\"ab\", \"cd\"};\n"
+                    "void f(void) { struct P r = q; int *cl = (int[]){7, 8}; }\n";
+  Checked c;
+  check(c, src.c_str());
+  ASSERT_EQ(c.parse_errors, 0);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(layout_of(c, "q"), (std::vector<std::string>{"0 int = 7", "4 int = 8"}));
+  EXPECT_EQ(layout_of(c, "e1"), (std::vector<std::string>{"0 int = 1", "4 int = 2", "8 int = 3"}));
+  EXPECT_EQ(layout_of(c, "e2"),
+            (std::vector<std::string>{"0 int = 1", "4 int = 2", "8 int = 3", "12 int = 4"}));
+  EXPECT_EQ(layout_of(c, "e5"),
+            (std::vector<std::string>{"0 char = (char)97", "8 long long = (long long)1",
+                                      "16 short = (short)1", "18 short = (short)2",
+                                      "20 short = (short)3"}));
+  EXPECT_EQ(layout_of(c, "t3"), (std::vector<std::string>{"4 int = 5", "8 int = 6"}));
+  EXPECT_EQ(layout_of(c, "e8"), std::vector<std::string>{"0 int = 42"});
+  EXPECT_EQ(layout_of(c, "e4"), std::vector<std::string>{"0 char[4] = \"hey\""});
+  EXPECT_EQ(layout_of(c, "e3"),
+            (std::vector<std::string>{"0 char[4] = \"ab\"", "4 char[4] = \"cd\""}));
+  EXPECT_EQ(layout_of(c, "r"), std::vector<std::string>{"0 P = load(q)"});
+  EXPECT_EQ(layout_of(c, "cl"), std::vector<std::string>{"0 int * = decay(literal)"});
+  std::vector<ast_node *> literals = nodes_of(c, AST_NODE_TYPE_COMPOUND_LITERAL);
+  ASSERT_EQ(literals.size(), 1u);
+  EXPECT_EQ(layout_text(c, literals[0]->compound_literal.init_layout),
+            (std::vector<std::string>{"0 int = 7", "4 int = 8"}));
+}
+
+TEST(InitializerLayoutTest, AValueReplacesEveryEarlierValueItOverlaps) {
+  std::string src = std::string(layout_records) +
+                    "union U s2 = {.i = 0x11223344, .c[0] = 1};\n"
+                    "union U s3 = {.c[1] = 9, .i = 0x55667788};\n"
+                    "int s4[3] = {[0] = 1, [1] = 2, [0] = 3};\n"
+                    "struct B s7 = {.b = 3, .a = 2, .b = 1};\n"
+                    "struct B s8 = {.b = 3, .a = 2};\n"
+                    "struct O s1 = {.p = {7, 8}, .p.y = 5};\n"
+                    "struct W s6 = {.u.i = 0x11223344, .u.c[2] = 0xAA, .tail = 1};\n"
+                    "void f(void) {\n"
+                    "  struct P lq = q;\n"
+                    "  struct O a1 = {.p = lq, .p.y = 5};\n"
+                    "  struct O a9 = {lq, 3, .p.x = 9};\n"
+                    "}\n";
+  Checked c;
+  check(c, src.c_str());
+  ASSERT_EQ(c.parse_errors, 0);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(layout_of(c, "s2"), std::vector<std::string>{"0 unsigned char = (unsigned char)1"});
+  EXPECT_EQ(layout_of(c, "s3"), std::vector<std::string>{"0 int = 0x55667788"});
+  EXPECT_EQ(layout_of(c, "s4"), (std::vector<std::string>{"4 int = 2", "0 int = 3"}));
+  EXPECT_EQ(layout_of(c, "s7"), (std::vector<std::string>{"0.0:4 unsigned int = (unsigned int)2",
+                                                          "0.4:4 unsigned int = (unsigned int)1"}))
+      << "two bit-fields in one byte do not overlap";
+  EXPECT_EQ(layout_of(c, "s8"), (std::vector<std::string>{"0.4:4 unsigned int = (unsigned int)3",
+                                                          "0.0:4 unsigned int = (unsigned int)2"}));
+  EXPECT_EQ(layout_of(c, "s1"), (std::vector<std::string>{"0 int = 7", "4 int = 5"}));
+  EXPECT_EQ(layout_of(c, "s6"),
+            (std::vector<std::string>{"2 unsigned char = (unsigned char)0xAA", "4 int = 1"}));
+  EXPECT_EQ(layout_of(c, "a1"), std::vector<std::string>{"4 int = 5"})
+      << "a member replaces the whole struct value it is part of";
+  EXPECT_EQ(layout_of(c, "a9"), (std::vector<std::string>{"8 int = 3", "0 int = 9"}));
+}
+
+TEST(InitializerLayoutTest, ABraceListReinitializesTheWholePartItCovers) {
+  std::string src = std::string(layout_records) + "struct O t1 = {.p.y = 5, .p = {7}};\n"
+                                                  "struct V t2 = {.u.c[1] = 9, .u = {0x01}};\n"
+                                                  "int t3[2][2] = {[0][1] = 5, [0] = {7}};\n"
+                                                  "struct O s5 = {.p.y = 5, .p = {7, 8}};\n"
+                                                  "struct O t4 = {.z = 3, .p = {7}};\n"
+                                                  "struct Q t5 = {.z = 3, .l = {7}};\n"
+                                                  "void f(void) {\n"
+                                                  "  struct P lq = q;\n"
+                                                  "  struct O a5 = {.p.y = 5, .p = lq};\n"
+                                                  "}\n";
+  Checked c;
+  check(c, src.c_str());
+  ASSERT_EQ(c.parse_errors, 0);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(layout_of(c, "t1"), std::vector<std::string>{"0 int = 7"});
+  EXPECT_EQ(layout_of(c, "t2"), std::vector<std::string>{"0 int = 0x01"});
+  EXPECT_EQ(layout_of(c, "t3"), std::vector<std::string>{"0 int = 7"});
+  EXPECT_EQ(layout_of(c, "s5"), (std::vector<std::string>{"0 int = 7", "4 int = 8"}));
+  EXPECT_EQ(layout_of(c, "t4"), (std::vector<std::string>{"8 int = 3", "0 int = 7"}))
+      << "a list wipes only the part it covers";
+  EXPECT_EQ(layout_of(c, "t5"), (std::vector<std::string>{"8 int = 3", "4 int = 7"}))
+      << "the wipe starts where the part starts, not where its first named member does";
+  EXPECT_EQ(layout_of(c, "a5"), std::vector<std::string>{"0 P = load(lq)"});
+}
+
+TEST(InitializerLayoutTest, ABitFieldIsPlacedAsEachTargetLaysItOut) {
+  const char *src = "struct M { char c; int b : 3; int d : 5; } m = {1, 2, 3};\n";
+  {
+    TargetGuard guard(TARGET_WINDOWS_X64);
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    EXPECT_EQ(layout_of(c, "m"),
+              (std::vector<std::string>{"0 char = (char)1", "4.0:3 int = 2", "4.3:5 int = 3"}))
+        << "windows starts a new int unit after the char";
+  }
+  {
+    TargetGuard guard(TARGET_LINUX_X64);
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    EXPECT_EQ(layout_of(c, "m"),
+              (std::vector<std::string>{"0 char = (char)1", "0.8:3 int = 2", "0.11:5 int = 3"}))
+        << "linux packs the fields after the char";
+  }
+}
+
+TEST(InitializerLayoutTest, AValueThatDoesNotConvertIsNotRecorded) {
+  const char *src = "int a[2] = {1.5, 2};\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(layout_of(c, "a"), (std::vector<std::string>{"0 int = (int)1.5", "4 int = 2"}));
+
+  Checked bad;
+  check(bad, "int *p = 1.5;\nstruct S { int *q; int n; } s = {2.5, 3};\n");
+  EXPECT_EQ(bad.errors, 2) << bad.diagnostics;
+  EXPECT_EQ(layout_of(bad, "p"), std::vector<std::string>{});
+  EXPECT_EQ(layout_of(bad, "s"), std::vector<std::string>{"8 int = 3"});
+}
+
+static long long object_size(type_info *type) {
+  type = ConversionWalk::resolved(type);
+  switch (type->kind) {
+  case TYPE_ARRAY:
+    return type->array_size * object_size(type->ptr_to);
+  case TYPE_STRUCT:
+  case TYPE_UNION:
+    return type->symbol->size;
+  case TYPE_POINTER:
+    return 8;
+  default:
+    break;
+  }
+  switch (type->prim) {
+  case PRIM_BOOL:
+  case PRIM_CHAR:
+  case PRIM_SCHAR:
+  case PRIM_UCHAR:
+    return 1;
+  case PRIM_SHORT:
+  case PRIM_USHORT:
+    return 2;
+  case PRIM_INT:
+  case PRIM_UINT:
+  case PRIM_FLOAT:
+    return 4;
+  case PRIM_LONG:
+  case PRIM_ULONG:
+    return target_current()->long_size;
+  default:
+    return 8;
+  }
+}
+
+static std::vector<unsigned char> play(const Checked &c, const char *name);
+
+static std::vector<unsigned char> value_bytes(const Checked &c, ast_node *value, long long size) {
+  while (value->type == AST_NODE_TYPE_CONVERSION)
+    value = value->conversion.operand;
+  std::vector<unsigned char> out((size_t)size, 0);
+  if (value->type == AST_NODE_TYPE_IDENTIFIER)
+    return play(c, value->tok.value);
+  if (value->type == AST_NODE_TYPE_STRING) {
+    for (long long i = 0; i < size && i < value->literal.length; i++)
+      out[(size_t)i] = (unsigned char)value->literal.bytes[i];
+    return out;
+  }
+  if (value->type == AST_NODE_TYPE_NUMBER) {
+    unsigned long long number = std::strtoull(value->tok.value, nullptr, 0);
+    for (long long i = 0; i < size && i < 8; i++)
+      out[(size_t)i] = (unsigned char)(number >> (8 * i));
+  }
+  return out;
+}
+
+static std::vector<unsigned char> play(const Checked &c, const char *name) {
+  std::vector<ast_node *> decl = declarations(c, name);
+  if (decl.size() != 1)
+    return {};
+  long long size = object_size(decl[0]->var_decl.type);
+  std::vector<unsigned char> bytes((size_t)size, 0);
+  const initializer_layout &layout = decl[0]->var_decl.init_layout;
+  for (int i = 0; i < layout.count; i++) {
+    const initializer_entry &entry = layout.entries[i];
+    std::vector<unsigned char> value = value_bytes(c, entry.value, object_size(entry.type));
+    if (entry.bit_width == 0) {
+      for (size_t k = 0; k < value.size() && entry.offset + (long long)k < size; k++)
+        bytes[(size_t)entry.offset + k] = value[k];
+      continue;
+    }
+    unsigned long long word = 0;
+    unsigned long long field = 0;
+    for (size_t k = 0; k < 8 && k < value.size(); k++)
+      field |= (unsigned long long)value[k] << (8 * k);
+    for (long long k = 0; k < 8 && entry.offset + k < size; k++)
+      word |= (unsigned long long)bytes[(size_t)(entry.offset + k)] << (8 * k);
+    unsigned long long mask = ((1ull << entry.bit_width) - 1) << entry.bit_offset;
+    word = (word & ~mask) | ((field << entry.bit_offset) & mask);
+    for (long long k = 0; k < 8 && entry.offset + k < size; k++)
+      bytes[(size_t)(entry.offset + k)] = (unsigned char)(word >> (8 * k));
+  }
+  return bytes;
+}
+
+static std::string hex(const std::vector<unsigned char> &bytes) {
+  std::string out;
+  char digits[4];
+  for (unsigned char b : bytes) {
+    std::snprintf(digits, sizeof digits, "%02x", b);
+    out += (out.empty() ? "" : " ") + std::string(digits);
+  }
+  return out;
+}
+
+TEST(InitializerLayoutTest, WritingEachLayoutInOrderGivesGccsBytes) {
+  std::string src = std::string(layout_records) +
+                    "struct O s1 = {.p = {7, 8}, .p.y = 5};\n"
+                    "union U s2 = {.i = 0x11223344, .c[0] = 1};\n"
+                    "union U s3 = {.c[1] = 9, .i = 0x55667788};\n"
+                    "int s4[3] = {[0] = 1, [1] = 2, [0] = 3};\n"
+                    "struct O s5 = {.p.y = 5, .p = {7, 8}};\n"
+                    "struct W s6 = {.u.i = 0x11223344, .u.c[2] = 0xAA, .tail = 1};\n"
+                    "struct B s7 = {.b = 3, .a = 2, .b = 1};\n"
+                    "struct B s8 = {.b = 3, .a = 2};\n"
+                    "struct O s9 = {{1, 2}, 3, .p.x = 9};\n"
+                    "struct O t1 = {.p.y = 5, .p = {7}};\n"
+                    "struct V t2 = {.u.c[1] = 9, .u = {0x01}};\n"
+                    "int t3[2][2] = {[0][1] = 5, [0] = {7}};\n"
+                    "struct Q t5 = {.z = 3, .l = {7}};\n"
+                    "struct O e1 = {1, 2, 3};\n"
+                    "int e2[2][3] = {1, 2, 3, 4};\n"
+                    "char e3[2][4] = {\"ab\", [0] = \"x\"};\n"
+                    "char e4[] = \"hey\";\n"
+                    "struct { char c; long long d; short e[3]; } e5 = {97, 0x1122334455667788,\n"
+                    "                                                  {1, 2, 3}};\n"
+                    "struct B e7 = {1, 2, 3};\n"
+                    "int e8 = {42};\n"
+                    "union U e9 = {0x7f};\n"
+                    "void f(void) {\n"
+                    "  struct P lq = q;\n"
+                    "  struct O a1 = {.p = lq, .p.y = 5};\n"
+                    "  struct O a5 = {.p.y = 5, .p = lq};\n"
+                    "  struct O a9 = {lq, 3, .p.x = 9};\n"
+                    "  struct P e6[3] = {lq, 5, 6, [2].y = 4};\n"
+                    "}\n";
+  const std::vector<std::pair<const char *, const char *>> gcc = {
+      {"q", "07 00 00 00 08 00 00 00"},
+      {"s1", "07 00 00 00 05 00 00 00 00 00 00 00"},
+      {"s2", "01 00 00 00"},
+      {"s3", "88 77 66 55"},
+      {"s4", "03 00 00 00 02 00 00 00 00 00 00 00"},
+      {"s5", "07 00 00 00 08 00 00 00 00 00 00 00"},
+      {"s6", "00 00 aa 00 01 00 00 00"},
+      {"s7", "12 00 00 00 00 00 00 00"},
+      {"s8", "32 00 00 00 00 00 00 00"},
+      {"s9", "09 00 00 00 02 00 00 00 03 00 00 00"},
+      {"t1", "07 00 00 00 00 00 00 00 00 00 00 00"},
+      {"t2", "01 00 00 00"},
+      {"t3", "07 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"},
+      {"t5", "00 00 00 00 07 00 00 00 03 00 00 00"},
+      {"e1", "01 00 00 00 02 00 00 00 03 00 00 00"},
+      {"e2", "01 00 00 00 02 00 00 00 03 00 00 00 04 00 00 00 00 00 00 00 00 00 00 00"},
+      {"e3", "78 00 00 00 00 00 00 00"},
+      {"e4", "68 65 79 00"},
+      {"e5", "61 00 00 00 00 00 00 00 88 77 66 55 44 33 22 11 01 00 02 00 03 00 00 00"},
+      {"e7", "21 00 00 00 03 00 00 00"},
+      {"e8", "2a 00 00 00"},
+      {"e9", "7f 00 00 00"},
+      {"lq", "07 00 00 00 08 00 00 00"},
+      {"a1", "00 00 00 00 05 00 00 00 00 00 00 00"},
+      {"a5", "07 00 00 00 08 00 00 00 00 00 00 00"},
+      {"a9", "09 00 00 00 00 00 00 00 03 00 00 00"},
+      {"e6", "07 00 00 00 08 00 00 00 05 00 00 00 06 00 00 00 00 00 00 00 04 00 00 00"},
+  };
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    Checked c;
+    check(c, src.c_str());
+    ASSERT_EQ(c.parse_errors, 0);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    for (const auto &object : gcc)
+      EXPECT_EQ(hex(play(c, object.first)), object.second) << object.first;
+  }
+}
+
+TEST(CaseValueTest, EachLabelKeepsItsValueInTheSwitchsPromotedType) {
+  const char *src = "void f(unsigned char c, long long q, unsigned u) {\n"
+                    "  switch (c) { case 'a' + 1: case (char)300: case 2u: ; }\n"
+                    "  switch (q) { case -1: case 0x100000000: ; }\n"
+                    "  switch (u) { case -1: ; }\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  std::vector<unsigned long long> seen;
+  for (ast_node *label : nodes_of(c, AST_NODE_TYPE_CASE))
+    seen.push_back(label->case_stmt.label_value);
+  std::vector<unsigned long long> expected = {
+      98, 44, 2, 0xFFFFFFFFFFFFFFFFull, 0x100000000ull, 0xFFFFFFFFull};
+  EXPECT_EQ(seen, expected);
+}
+
+static const initializer_entry *only_entry(const Checked &c, const char *name) {
+  std::vector<ast_node *> decl = declarations(c, name);
+  if (decl.size() != 1 || decl[0]->type != AST_NODE_TYPE_VAR_DECL ||
+      decl[0]->var_decl.init_layout.count != 1)
+    return nullptr;
+  return &decl[0]->var_decl.init_layout.entries[0];
+}
+
+static std::string constant_text(const initializer_entry *entry) {
+  if (entry == nullptr)
+    return "<no single entry>";
+  const constant_value &value = entry->constant;
+  char text[96];
+  switch (value.kind) {
+  case CONSTANT_INTEGER:
+    return "integer " + std::to_string((long long)value.bits);
+  case CONSTANT_FLOATING:
+    if (value.imag != 0)
+      std::snprintf(text, sizeof text, "floating %g%+gi", (double)value.real, (double)value.imag);
+    else
+      std::snprintf(text, sizeof text, "floating %g", (double)value.real);
+    return text;
+  case CONSTANT_ADDRESS: {
+    std::string base = value.symbol    ? value.symbol->name
+                       : value.literal ? shape(value.literal)
+                                       : "null";
+    std::snprintf(text, sizeof text, "%+lld", value.offset);
+    return "address " + base + text;
+  }
+  default:
+    return "none";
+  }
+}
+
+TEST(StaticValueTest, EachKindOfValueIsRecorded) {
+  const char *src = "int arr[10];\n"
+                    "static int i = (int)(2.5 * 2);\n"
+                    "static int t = 0.5 ? 3 : 4;\n"
+                    "static int s = 0.0 && 1 / 0;\n"
+                    "static unsigned char u = -1;\n"
+                    "static double d = -1.5;\n"
+                    "static long double l = 1;\n"
+                    "static double _Complex z = 1.0 + 2.0i;\n"
+                    "static _Bool b = 0.0 / 0.0;\n"
+                    "static _Bool bp = &arr[1];\n"
+                    "static _Bool bz = &arr[0];\n"
+                    "static _Bool bn = (int *)0;\n"
+                    "static int *p = &arr[3];\n"
+                    "static char str[] = \"a\";\n"
+                    "static int cmp = 1.5 < 2.5;\n"
+                    "static int ceq = 1.0 + 1.0i == 1.0;\n"
+                    "static int rq = (double)9007199254740993LL == 9007199254740992.0;\n"
+                    "static int rf = (float)16777217 == 16777216.0f;\n"
+                    "static double re = 1.0 + 2.0i;\n"
+                    "static int ia = (int)2.5 + (int)(0.5 * 4);\n"
+                    "static int sh = (int)(1.5 * 2) << 2;\n"
+                    "static int un = -(int)(1.5 * 2);\n"
+                    "static int ut = ~(int)(1.5 * 2);\n"
+                    "void f(void) { int x = 5; }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(constant_text(only_entry(c, "i")), "integer 5");
+  EXPECT_EQ(constant_text(only_entry(c, "t")), "integer 3");
+  EXPECT_EQ(constant_text(only_entry(c, "s")), "integer 0") << "1 / 0 is never evaluated";
+  EXPECT_EQ(constant_text(only_entry(c, "u")), "integer 255");
+  EXPECT_EQ(constant_text(only_entry(c, "d")), "floating -1.5");
+  EXPECT_EQ(constant_text(only_entry(c, "l")), "floating 1");
+  EXPECT_EQ(constant_text(only_entry(c, "z")), "floating 1+2i");
+  EXPECT_EQ(constant_text(only_entry(c, "b")), "integer 1") << "a NaN compares unequal to 0";
+  EXPECT_EQ(constant_text(only_entry(c, "bp")), "integer 1");
+  EXPECT_EQ(constant_text(only_entry(c, "bz")), "integer 1") << "an object's address is never null";
+  EXPECT_EQ(constant_text(only_entry(c, "bn")), "integer 0");
+  EXPECT_EQ(constant_text(only_entry(c, "p")), "address arr+12");
+  EXPECT_EQ(constant_text(only_entry(c, "str")), "none") << "a string's bytes are the literal";
+  EXPECT_EQ(constant_text(only_entry(c, "x")), "none")
+      << "an automatic object is filled at run time";
+  EXPECT_EQ(constant_text(only_entry(c, "cmp")), "integer 1");
+  EXPECT_EQ(constant_text(only_entry(c, "ceq")), "integer 0")
+      << "== compares the imaginary parts too";
+  EXPECT_EQ(constant_text(only_entry(c, "rq")), "integer 1") << "the conversion rounds to double";
+  EXPECT_EQ(constant_text(only_entry(c, "rf")), "integer 1") << "the conversion rounds to float";
+  EXPECT_EQ(constant_text(only_entry(c, "re")), "floating 1")
+      << "a real type drops the imaginary part";
+  EXPECT_EQ(constant_text(only_entry(c, "ia")), "integer 4");
+  EXPECT_EQ(constant_text(only_entry(c, "sh")), "integer 12");
+  EXPECT_EQ(constant_text(only_entry(c, "un")), "integer -3");
+  EXPECT_EQ(constant_text(only_entry(c, "ut")), "integer -4");
+}
+
+TEST(StaticValueTest, AnAddressIsABaseAndAByteOffset) {
+  const char *src = "struct S { int a; char b[8]; struct { short x, y; } in[3]; } s;\n"
+                    "int arr[10];\n"
+                    "int f(void);\n"
+                    "char *p1 = \"hello\" + 2;\n"
+                    "int *p2 = &arr[3];\n"
+                    "int *p3 = arr + 5;\n"
+                    "char *p4 = &s.b[2];\n"
+                    "short *p5 = &s.in[1].y;\n"
+                    "int (*p6)(void) = f;\n"
+                    "int (*p7)(void) = &f;\n"
+                    "int *p8 = 0;\n"
+                    "int *p9 = (int *)4096;\n"
+                    "char *p10 = &\"xyz\"[1];\n"
+                    "int *p11 = (int *)((char *)&arr[2] + 1);\n"
+                    "int *p14 = 1 ? &arr[1] : 0;\n"
+                    "int *p15 = (int[]){1, 2} + 1;\n"
+                    "short *p16 = &((struct S *)0)->in[2].x;\n"
+                    "int *p17 = arr + 7 - 2;\n"
+                    "int *p18 = &*arr + 1;\n"
+                    "struct S *p19 = &s;\n"
+                    "int *p20 = &s.a;\n"
+                    "char *p21 = s.b + 3;\n";
+  const std::vector<std::pair<const char *, const char *>> gcc = {
+      {"p1", "address \"hello\"+2"}, {"p2", "address arr+12"},   {"p3", "address arr+20"},
+      {"p4", "address s+6"},         {"p5", "address s+18"},     {"p6", "address f+0"},
+      {"p7", "address f+0"},         {"p8", "address null+0"},   {"p9", "address null+4096"},
+      {"p10", "address \"xyz\"+1"},  {"p11", "address arr+9"},   {"p14", "address arr+4"},
+      {"p15", "address literal+4"},  {"p16", "address null+20"}, {"p17", "address arr+20"},
+      {"p18", "address arr+4"},      {"p19", "address s+0"},     {"p20", "address s+0"},
+      {"p21", "address s+7"},
+  };
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.parse_errors, 0);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    for (const auto &object : gcc)
+      EXPECT_EQ(constant_text(only_entry(c, object.first)), object.second) << object.first;
+  }
+}
+
+static std::string constant_bytes(const initializer_entry *entry) {
+  if (entry == nullptr)
+    return "<no single entry>";
+  type_info *type = ConversionWalk::resolved(entry->type);
+  const constant_value &value = entry->constant;
+  std::vector<unsigned char> bytes;
+  if (value.kind == CONSTANT_INTEGER) {
+    long long size = sema_type_layout(type).size;
+    for (long long i = 0; i < size; i++)
+      bytes.push_back((unsigned char)(value.bits >> (8 * i)));
+  } else if (value.kind == CONSTANT_FLOATING) {
+    for (int part = 0; part < (type->is_complex ? 2 : 1); part++) {
+      long double v = part ? value.imag : value.real;
+      unsigned char raw[16] = {0};
+      if (type->prim == PRIM_FLOAT) {
+        float f = (float)v;
+        std::memcpy(raw, &f, 4);
+        bytes.insert(bytes.end(), raw, raw + 4);
+      } else if (type->prim == PRIM_DOUBLE) {
+        double d = (double)v;
+        std::memcpy(raw, &d, 8);
+        bytes.insert(bytes.end(), raw, raw + 8);
+      } else {
+        std::memcpy(raw, &v, 10);
+        bytes.insert(bytes.end(), raw, raw + 16);
+      }
+    }
+  } else {
+    return "<not a number>";
+  }
+  return hex(bytes);
+}
+
+TEST(StaticValueTest, ArithmeticValuesHaveGccsBytes) {
+  const char *src = "double d1 = 1e308 * 10;\n"
+                    "double _Complex z1 = (1.0 + 2.0i) * (3.0 + 4.0i);\n"
+                    "double _Complex z2 = (1.0 + 2.0i) / (3.0 + 4.0i);\n"
+                    "long double l1 = 1.0L / 3;\n"
+                    "float f1 = 16777217;\n"
+                    "double g1 = 0.1f;\n"
+                    "long long h1 = 9007199254740993.0;\n"
+                    "_Bool b1 = 0.5;\n"
+                    "_Bool b2 = __builtin_nanf(\"\");\n"
+                    "float f2 = 1.0 / 3.0;\n"
+                    "double g2 = 1.0f / 3.0f;\n"
+                    "unsigned long long u1 = 1.8446744073709552e19 - 4096;\n"
+                    "long double l2 = 0x1.fffffffffffffffep0L;\n"
+                    "float f3 = 3.4028235677973366e38;\n"
+                    "double _Complex z3 = 2.0 * 1.0i;\n"
+                    "float _Complex z4 = 1.0 / 3.0 + 0.5i;\n"
+                    "char c1 = 300;\n"
+                    "int i1 = 7 / 2 * 2.0;\n"
+                    "float fr = 16777216.0f + 1.0f - 1.0f;\n"
+                    "double dd = 9007199254740992.0 + 1.0 - 1.0;\n"
+                    "double neg = -3;\n"
+                    "double ub = 18446744073709551615u;\n"
+                    "double hv = __builtin_huge_val();\n";
+  const std::vector<std::pair<const char *, const char *>> gcc = {
+      {"d1", "00 00 00 00 00 00 f0 7f"},
+      {"z1", "00 00 00 00 00 00 14 c0 00 00 00 00 00 00 24 40"},
+      {"z2", "29 5c 8f c2 f5 28 dc 3f 7b 14 ae 47 e1 7a b4 3f"},
+      {"l1", "ab aa aa aa aa aa aa aa fd 3f 00 00 00 00 00 00"},
+      {"f1", "00 00 80 4b"},
+      {"g1", "00 00 00 a0 99 99 b9 3f"},
+      {"h1", "00 00 00 00 00 00 20 00"},
+      {"b1", "01"},
+      {"b2", "01"},
+      {"f2", "ab aa aa 3e"},
+      {"g2", "00 00 00 60 55 55 d5 3f"},
+      {"u1", "00 f0 ff ff ff ff ff ff"},
+      {"l2", "ff ff ff ff ff ff ff ff ff 3f 00 00 00 00 00 00"},
+      {"f3", "00 00 80 7f"},
+      {"z3", "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 40"},
+      {"z4", "ab aa aa 3e 00 00 00 3f"},
+      {"c1", "2c"},
+      {"i1", "06 00 00 00"},
+      {"fr", "ff ff 7f 4b"},
+      {"dd", "ff ff ff ff ff ff 3f 43"},
+      {"neg", "00 00 00 00 00 00 08 c0"},
+      {"ub", "00 00 00 00 00 00 f0 43"},
+      {"hv", "00 00 00 00 00 00 f0 7f"},
+  };
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.parse_errors, 0);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    for (const auto &object : gcc)
+      EXPECT_EQ(constant_bytes(only_entry(c, object.first)), object.second) << object.first;
+  }
+}
+
+TEST(StaticValueTest, AFloatingValueThatDoesNotFitItsIntegerIsAnError) {
+  const char *src = "int a1 = 1e10;\n"
+                    "unsigned a2 = -1.0;\n"
+                    "int a3 = __builtin_nanf(\"\");\n"
+                    "int a4 = -1e10;\n"
+                    "unsigned a5 = 4294967296.0;\n"
+                    "int big = 1e100;\n"
+                    "int ok1 = 2147483647.0;\n"
+                    "unsigned ok2 = -0.5;\n"
+                    "int ok3 = -2147483648.0;\n"
+                    "int m = (int)(2.5 * 2) / 0;\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  const std::string overflow = "overflow in a constant expression";
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "1e10;", 1, overflow) + error_at(src, "-1.0;", 1, overflow) +
+                error_at(src, "__builtin_nanf", 1, overflow) +
+                error_at(src, "-1e10;", 1, overflow) + error_at(src, "4294967296.0;", 1, overflow) +
+                error_at(src, "1e100;", 1, overflow) +
+                error_at(src, "/ 0", 1, "division by zero in a constant expression"))
+      << "6.6p4: a constant must be in range for its type; GCC only warns and clamps";
+  EXPECT_EQ(constant_text(only_entry(c, "ok1")), "integer 2147483647");
+  EXPECT_EQ(constant_text(only_entry(c, "ok2")), "integer 0") << "-0.5 truncates to 0";
+  EXPECT_EQ(constant_text(only_entry(c, "ok3")), "integer -2147483648");
+}
+
+static symbol *ordinary(const Checked &c, const char *name) {
+  symbol *found = find_symbol(c, name, SYMBOL_FUNC);
+  return found != nullptr ? found : find_symbol(c, name, SYMBOL_VAR);
+}
+
+TEST(DeclarationFactTest, AnAsmLabelNamesTheSymbol) {
+  const char *src = "int f(void) __asm__(\"\" \"real_f\");\n"
+                    "int g __asm__(\"gee\");\n"
+                    "int h;\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  ASSERT_NE(ordinary(c, "f"), nullptr);
+  ASSERT_NE(ordinary(c, "g"), nullptr);
+  ASSERT_NE(ordinary(c, "h"), nullptr);
+  EXPECT_STREQ(ordinary(c, "f")->asm_label, "real_f") << "the strings are glued together";
+  EXPECT_STREQ(ordinary(c, "g")->asm_label, "gee");
+  EXPECT_EQ(ordinary(c, "h")->asm_label, nullptr);
+}
+
+TEST(DeclarationFactTest, FactsJoinOverEveryDeclarationOfAName) {
+  const char *src = "extern int a;\n"
+                    "__attribute__((__dllimport__)) extern int a;\n"
+                    "extern int a;\n"
+                    "int r(void) __attribute__((returns_twice));\n"
+                    "int r(void);\n"
+                    "int n(void) __asm__(\"named\");\n"
+                    "int n(void);\n"
+                    "int k(void) __asm__(\"kk\");\n"
+                    "void use(void) { extern int k(void); k(); }\n"
+                    "__attribute__((dllimport)) extern int dv;\n"
+                    "int jump(void) __attribute__((returns_twice));\n"
+                    "void use2(void) { extern int dv; extern int jump(void); dv; jump(); }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  ASSERT_NE(ordinary(c, "a"), nullptr);
+  EXPECT_EQ(ordinary(c, "a")->dllimport, 1) << "a later declaration without it does not erase it";
+  EXPECT_EQ(ordinary(c, "r")->returns_twice, 1);
+  EXPECT_STREQ(ordinary(c, "n")->asm_label, "named");
+  std::vector<ast_node *> k = uses(c, "k");
+  std::vector<ast_node *> k_decls = declarations(c, "k");
+  ASSERT_EQ(k.size(), 1u);
+  ASSERT_EQ(k_decls.size(), 2u);
+  ASSERT_NE(k[0]->symbol, nullptr);
+  EXPECT_NE(k_decls[0]->symbol, k_decls[1]->symbol)
+      << "a block-scope extern has a symbol of its own";
+  EXPECT_EQ(k[0]->symbol, k_decls[1]->symbol);
+  EXPECT_STREQ(k[0]->symbol->asm_label, "kk") << "and takes the facts of what it refers to";
+  std::vector<ast_node *> dv = uses(c, "dv");
+  std::vector<ast_node *> jump = uses(c, "jump");
+  ASSERT_EQ(dv.size(), 1u);
+  ASSERT_EQ(jump.size(), 1u);
+  ASSERT_NE(dv[0]->symbol, nullptr);
+  ASSERT_NE(jump[0]->symbol, nullptr);
+  EXPECT_EQ(dv[0]->symbol->dllimport, 1);
+  EXPECT_EQ(jump[0]->symbol->returns_twice, 1);
+
+  const char *conflict = "int h(void) __asm__(\"x\");\nint h(void) __asm__(\"y\");\n";
+  Checked d;
+  check(d, conflict);
+  EXPECT_EQ(d.diagnostics,
+            error_at(conflict, "h(void) __asm__(\"y\")", 1, "conflicting asm labels for 'h'"));
+}
+
+TEST(DeclarationFactTest, DeclspecDllimportIsAnAttribute) {
+  const char *src = "__declspec(dllimport) int c(void);\n"
+                    "extern __declspec(dllimport) int v;\n";
+  Checked c;
+  check_preprocessed(c, src);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  ASSERT_NE(ordinary(c, "c"), nullptr);
+  ASSERT_NE(ordinary(c, "v"), nullptr);
+  EXPECT_EQ(ordinary(c, "c")->dllimport, 1);
+  EXPECT_EQ(ordinary(c, "v")->dllimport, 1);
+}
+
+TEST(DeclarationFactTest, SetjmpAndItsKinReturnTwiceByName) {
+  const char *src =
+      "int setjmp(void); int _setjmp(void); int __setjmp(void);\n"
+      "int sigsetjmp(void); int __sigsetjmp(void); int savectx(void);\n"
+      "int vfork(void); int getcontext(void);\n"
+      "int _longjmp(void); int setjmpx(void); int _vfork(void); int ___setjmp(void);\n"
+      "static int _getcontext(void) { return 0; }\n"
+      "static int __sigsetjmp_local(void) { return 0; }\n"
+      "int ordinary(void);\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  for (const char *name : {"setjmp", "_setjmp", "__setjmp", "sigsetjmp", "__sigsetjmp", "savectx",
+                           "vfork", "getcontext"}) {
+    ASSERT_NE(ordinary(c, name), nullptr) << name;
+    EXPECT_EQ(ordinary(c, name)->returns_twice, 1) << name;
+  }
+  for (const char *name : {"_longjmp", "setjmpx", "_vfork", "___setjmp", "_getcontext",
+                           "__sigsetjmp_local", "ordinary"}) {
+    ASSERT_NE(ordinary(c, name), nullptr) << name;
+    EXPECT_EQ(ordinary(c, name)->returns_twice, 0) << name;
+  }
+
+  const char *internal =
+      "static int setjmp(void) { return 0; }\nint savectx;\nint getcontext(void) { return 0; }\n";
+  Checked d;
+  check(d, internal);
+  ASSERT_EQ(d.errors, 0) << d.diagnostics;
+  ASSERT_NE(ordinary(d, "setjmp"), nullptr);
+  EXPECT_EQ(ordinary(d, "setjmp")->returns_twice, 0) << "only a function with external linkage";
+  ASSERT_NE(ordinary(d, "savectx"), nullptr);
+  EXPECT_EQ(ordinary(d, "savectx")->returns_twice, 0) << "and never a variable";
+  ASSERT_NE(ordinary(d, "getcontext"), nullptr);
+  EXPECT_EQ(ordinary(d, "getcontext")->returns_twice, 1) << "a definition counts too";
+}
+
+static int inline_definition(const Checked &c, const char *name) {
+  for (ast_node *decl : declarations(c, name)) {
+    if (decl->type == AST_NODE_TYPE_FUNCTION_DEF)
+      return decl->function_def.is_inline_definition;
+  }
+  return -1;
+}
+
+TEST(DeclarationFactTest, AnInlineDefinitionIsMarkedAtTheEndOfTheFile) {
+  const char *src = "inline int a(void) { return 0; }\n"
+                    "inline int b(void) { return 0; }\n"
+                    "int b(void);\n"
+                    "int h(void);\n"
+                    "inline int h(void) { return 0; }\n"
+                    "extern inline int e(void) { return 0; }\n"
+                    "static inline int s(void) { return 0; }\n"
+                    "extern inline __attribute__((__gnu_inline__)) int ge(void) { return 0; }\n"
+                    "inline __attribute__((gnu_inline)) int gi(void) { return 0; }\n"
+                    "int plain(void) { return 0; }\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(inline_definition(c, "a"), 1) << "every declaration is inline without extern";
+  EXPECT_EQ(inline_definition(c, "b"), 0) << "a later plain declaration makes it external";
+  EXPECT_EQ(inline_definition(c, "h"), 0) << "so does an earlier one";
+  EXPECT_EQ(inline_definition(c, "e"), 0);
+  EXPECT_EQ(inline_definition(c, "s"), 0) << "internal linkage is emitted locally";
+  EXPECT_EQ(inline_definition(c, "ge"), 1) << "GNU's extern inline is the inline-only one";
+  EXPECT_EQ(inline_definition(c, "gi"), 0) << "and GNU's plain inline is emitted";
+  EXPECT_EQ(inline_definition(c, "plain"), 0);
+}
+
+TEST(SizeTest, TheExportedLayoutIsSemasLayout) {
+  const char *src = "struct M { char c; double d; } m;\n"
+                    "long double ld;\n"
+                    "long l;\n"
+                    "int arr[10];\n"
+                    "struct Unknown *u;\n";
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    type_layout record = sema_type_layout(type_of(c, "m"));
+    EXPECT_EQ(record.known, 1);
+    EXPECT_EQ(record.size, 16);
+    EXPECT_EQ(record.alignment, 8);
+    EXPECT_EQ(sema_type_layout(type_of(c, "ld")).size, 16);
+    EXPECT_EQ(sema_type_layout(type_of(c, "l")).size, kind == TARGET_LINUX_X64 ? 8 : 4);
+    type_layout array = sema_type_layout(type_of(c, "arr"));
+    EXPECT_EQ(array.size, 40);
+    EXPECT_EQ(array.alignment, 4);
+    EXPECT_EQ(sema_type_layout(type_of(c, "u")->ptr_to).known, 0) << "an incomplete struct";
+  }
+}
+
+TEST(VlaTest, AVariableLengthIsASizeTValue) {
+  const char *src = "void f(int n) { double a[n]; int m[n][n + 1]; int k[4]; }\n";
+  for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
+    TargetGuard guard(kind);
+    SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
+    std::string size_t_name = kind == TARGET_LINUX_X64 ? "unsigned long" : "unsigned long long";
+    Checked c;
+    check(c, src);
+    ASSERT_EQ(c.errors, 0) << c.diagnostics;
+    type_info *a = type_of(c, "a");
+    type_info *m = type_of(c, "m");
+    type_info *k = type_of(c, "k");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(m, nullptr);
+    ASSERT_NE(k, nullptr);
+    EXPECT_EQ(shape(a->array_size_expr), "(" + size_t_name + ")load(n)");
+    EXPECT_EQ(shape(m->array_size_expr), "(" + size_t_name + ")load(n)");
+    EXPECT_EQ(shape(m->ptr_to->array_size_expr), "(" + size_t_name + ")(load(n) + 1)");
+    EXPECT_EQ(shape(k->array_size_expr), "4") << "a constant size is never evaluated at run time";
+  }
+}
+
+TEST(StaticValueTest, ANonConstantInitializerIsNotEvaluated) {
+  const char *src = "int gv;\n"
+                    "static int nz = (1 / 0) + gv;\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(
+      c.diagnostics,
+      error_at(src, "+ gv", 1, "an initializer for an object with static storage must be constant"))
+      << "the division inside is never reported";
+  EXPECT_EQ(constant_text(only_entry(c, "nz")), "none");
 }

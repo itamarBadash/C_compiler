@@ -120,6 +120,8 @@ void free_ast(ast_node *node) {
     }
     free_ast(node->var_decl.init_value);
     free_ast(node->var_decl.bitfield_width);
+    free(node->var_decl.init_layout.entries);
+    free(node->var_decl.asm_label);
     break;
   case AST_NODE_TYPE_PROGRAM:
     if (node->program.declarations != NULL) {
@@ -227,6 +229,7 @@ void free_ast(ast_node *node) {
     if (node->compound_literal.init_list)
       free_ast(node->compound_literal.init_list);
     free_ast(node->compound_literal.definition);
+    free(node->compound_literal.init_layout.entries);
     break;
 
   case AST_NODE_TYPE_GOTO:
@@ -267,6 +270,10 @@ void free_ast(ast_node *node) {
       free_ast(node->builtin.steps[i].index);
     }
     free(node->builtin.steps);
+    break;
+
+  case AST_NODE_TYPE_CONVERSION:
+    free_ast(node->conversion.operand);
     break;
 
   case AST_NODE_TYPE_EMPTY:
