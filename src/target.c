@@ -60,7 +60,10 @@ static const target targets[] = {
                             .ptrdiff_type = PRIM_LLONG,
                             .microsoft_bitfields = 1,
                             .predefines = windows_predefines,
-                            .builtin_declarations = windows_builtins},
+                            .builtin_declarations = windows_builtins,
+                            .triple = "x86_64-w64-windows-gnu",
+                            .data_layout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-"
+                                           "f80:128-n8:16:32:64-S128"},
     [TARGET_LINUX_X64] = {.long_size = 8,
                           .wchar_size = 4,
                           .wchar_type = PRIM_INT,
@@ -68,7 +71,10 @@ static const target targets[] = {
                           .ptrdiff_type = PRIM_LONG,
                           .microsoft_bitfields = 0,
                           .predefines = linux_predefines,
-                          .builtin_declarations = linux_builtins},
+                          .builtin_declarations = linux_builtins,
+                          .triple = "x86_64-pc-linux-gnu",
+                          .data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-"
+                                         "f80:128-n8:16:32:64-S128"},
 };
 
 static target_kind selected = TARGET_WINDOWS_X64;

@@ -27,8 +27,8 @@ add_executable(C_compiler ${SOURCES}
         src/sema.c
         include/target.h
         src/target.c
-        include/target.h
-        src/target.c
+        include/codegen.h
+        src/codegen.c
 )
 
 # ==========================================
@@ -101,3 +101,12 @@ target_compile_definitions(HeaderTests PRIVATE
         HEADER_PROBES_DIR="${CMAKE_SOURCE_DIR}/tests/headers")
 target_link_libraries(HeaderTests gtest_main)
 gtest_discover_tests(HeaderTests)
+
+add_executable(CodegenTests tests/test_codegen.cpp src/codegen.c src/preprocessor.c src/lexer.c
+        src/parser.c src/ast.c src/sema.c src/symbol_table.c src/token_buf.c src/target.c)
+target_compile_definitions(CodegenTests PRIVATE
+        CLANG_PATH="C:/Program Files/LLVM/bin/clang.exe"
+        GCC_PATH="${CMAKE_C_COMPILER}"
+        CODEGEN_PROGRAMS_DIR="${CMAKE_SOURCE_DIR}/tests/codegen")
+target_link_libraries(CodegenTests gtest_main)
+gtest_discover_tests(CodegenTests)

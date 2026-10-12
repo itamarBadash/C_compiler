@@ -1,0 +1,23 @@
+a 1 2 3 0 0 sum 6
+b 100 4
+grid 3 21 10
+word hello 5 0
+exact abc
+text !racecar
+ds 0.500000 0.000000 2.500000
+big 1 -1
+p 3 2 0
+diff 2 2
+cmp 1 1 1
+swap 2 1
+null 1 1
+deref 7
+ops 14 21 12 15
+s e ral
+idx z
+names one two
+row 6 4
+bytes 2 4
+void 7
+addr 8
+exit 0

@@ -1,0 +1,13 @@
+-1 -50 -1 -1 -1 -1 100 11 12 3 -1 -1 7 -1
+alpha max other
+gcd 12 1
+collatz 111
+search 607 -1
+odd 25
+n 5
+five
+depth 2
+inner 9
+outer 0
+k -1
+exit 42

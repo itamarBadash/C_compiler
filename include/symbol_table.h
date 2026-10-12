@@ -39,6 +39,7 @@ typedef struct symbol {
   const char *asm_label;
   int dllimport;
   int returns_twice;
+  int local_slot;
   source_loc loc;
   struct symbol *next;
   struct symbol *all_next;

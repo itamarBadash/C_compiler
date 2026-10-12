@@ -13,6 +13,8 @@ typedef struct target {
   int microsoft_bitfields;
   const char *predefines;
   const char *builtin_declarations;
+  const char *triple;
+  const char *data_layout;
 } target;
 
 void target_select(target_kind kind);
