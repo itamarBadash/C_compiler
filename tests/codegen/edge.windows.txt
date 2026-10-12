@@ -1,0 +1,27 @@
+ucn 10
+later 31
+half 2.500000
+scale 1250.000000
+lower q 7
+widen 9464
+positive 1 0
+block-scope declaration
+escapes [tab	here "q" \] 10 -1
+wide 6 120 2
+wide unit 105
+ptrint 4096 16
+ptr += 8
+not 0 1 0
+bool 1 0
+shift 8 2 -4
+shift= 48
+big 281474976710656
+cond 1
+inf 1
+chain 1
+assign 7 7
+mod -1 1
+conv -56 255
+float int 4000000000
+int float 4000000000.000000
+exit 0
