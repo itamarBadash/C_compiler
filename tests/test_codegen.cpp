@@ -802,6 +802,614 @@ TEST(CodegenDataTest, UnusualNamesAreQuoted) {
   EXPECT_NE(ir.find("%\"na\\5Cu00efve.0\" = alloca i32, align 4"), std::string::npos) << ir;
 }
 
+static bool has_line(const std::string &text, const std::string &line) {
+  return text.find("\n" + line + "\n") != std::string::npos;
+}
+
+static const char *records = "struct point { int x, y; };\n"
+                             "struct shape { char tag; struct point corner[2]; };\n"
+                             "union u { int i; char c; };\n";
+
+TEST(CodegenRecordTest, MemberAccessIsAByteOffsetFromTheRecord) {
+  std::string ir = generate((std::string(records) +
+                             "int get(struct point *p) { return p->y; }\n"
+                             "int nested(struct shape *s) { return s->corner[1].y; }\n"
+                             "int dot(void) { struct shape s; s.tag = 1; return s.corner[0].x; }\n"
+                             "char un(union u *v) { return v->c; }\n")
+                                .c_str());
+  expect_lines(function(ir, "get"),
+               {"%1 = load ptr, ptr %p.0, align 8", "%2 = getelementptr inbounds i8, ptr %1, i64 4",
+                "%3 = load i32, ptr %2, align 4", "ret i32 %3"});
+  expect_lines(function(ir, "nested"),
+               {"%2 = getelementptr inbounds i8, ptr %1, i64 4",
+                "%4 = getelementptr inbounds [8 x i8], ptr %2, i64 %3",
+                "%5 = getelementptr inbounds i8, ptr %4, i64 4", "%6 = load i32, ptr %5, align 4"});
+  expect_lines(function(ir, "dot"),
+               {"%s.0 = alloca [20 x i8], align 4", "store i8 %0, ptr %s.0, align 1",
+                "%1 = getelementptr inbounds i8, ptr %s.0, i64 4",
+                "%3 = getelementptr inbounds [8 x i8], ptr %1, i64 %2",
+                "%4 = load i32, ptr %3, align 4"});
+  std::string un = function(ir, "un");
+  expect_lines(un, {"%1 = load ptr, ptr %v.0, align 8", "%2 = load i8, ptr %1, align 1"});
+  EXPECT_EQ(count(un, "getelementptr"), 0) << un;
+}
+
+TEST(CodegenRecordTest, StructureAssignmentCopiesItsBytes) {
+  std::string ir =
+      generate((std::string(records) +
+                "void copy(struct shape *a, struct shape *b) { *a = *b; }\n"
+                "void vcopy(volatile struct point *a, struct point *b) { *a = *b; }\n"
+                "int comma(void) { struct point a, b; b = (a.x = 1, a); return b.x; }\n"
+                "void ucopy(union u *a, union u *b) { *a = *b; }\n")
+                   .c_str());
+  expect_lines(
+      function(ir, "copy"),
+      {"%2 = load ptr, ptr %b.1, align 8", "%3 = load ptr, ptr %a.0, align 8",
+       "call void @llvm.memcpy.p0.p0.i64(ptr align 4 %3, ptr align 4 %2, i64 20, i1 false)",
+       "ret void"});
+  expect_lines(
+      function(ir, "vcopy"),
+      {"call void @llvm.memcpy.p0.p0.i64(ptr align 4 %3, ptr align 4 %2, i64 8, i1 true)"});
+  expect_lines(
+      function(ir, "comma"),
+      {"store i32 1, ptr %a.0, align 4",
+       "call void @llvm.memcpy.p0.p0.i64(ptr align 4 %b.1, ptr align 4 %a.0, i64 8, i1 false)",
+       "%0 = load i32, ptr %b.1, align 4"});
+  expect_lines(
+      function(ir, "ucopy"),
+      {"call void @llvm.memcpy.p0.p0.i64(ptr align 4 %3, ptr align 4 %2, i64 4, i1 false)"});
+  EXPECT_TRUE(has_line(ir, "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)")) << ir;
+}
+
+TEST(CodegenRecordTest, ConditionalOfStructuresJoinsTheirAddresses) {
+  std::string ir = generate((std::string(records) +
+                             "int pick(int c, struct point *a, struct point *b) {\n"
+                             "  struct point r = c ? *a : *b; return r.x; }\n"
+                             "int member(int c) { struct point a, b; return (c ? a : b).y; }\n")
+                                .c_str());
+  expect_lines(
+      function(ir, "pick"),
+      {"%r.3 = alloca [8 x i8], align 4", "cond.true.4:", "%5 = load ptr, ptr %a.1, align 8",
+       "cond.false.5:", "%6 = load ptr, ptr %b.2, align 8",
+       "cond.end.6:", "%7 = phi ptr [ %5, %cond.true.4 ], [ %6, %cond.false.5 ]",
+       "call void @llvm.memcpy.p0.p0.i64(ptr align 4 %r.3, ptr align 4 %7, i64 8, i1 false)",
+       "%8 = load i32, ptr %r.3, align 4"});
+  expect_lines(function(ir, "member"),
+               {"cond.end.5:", "%3 = phi ptr [ %a.1, %cond.true.3 ], [ %b.2, %cond.false.4 ]",
+                "%4 = getelementptr inbounds i8, ptr %3, i64 4", "%5 = load i32, ptr %4, align 4",
+                "ret i32 %5"});
+}
+
+static const char *flags =
+    "struct flags { unsigned ready : 1; int delta : 5; unsigned mode : 3; };\n"
+    "struct full { int x : 32; _Bool b : 1; };\n";
+
+TEST(CodegenBitfieldTest, ReadsShiftTheFieldOutOfItsBytes) {
+  std::string ir =
+      generate((std::string(flags) + "int rd(struct flags *f) { return f->delta; }\n"
+                                     "unsigned rm(struct flags *f) { return f->mode; }\n")
+                   .c_str());
+  expect_lines(function(ir, "rd"), {"%2 = load i8, ptr %1, align 1", "%3 = shl i8 %2, 2",
+                                    "%4 = ashr i8 %3, 3", "%5 = sext i8 %4 to i32", "ret i32 %5"});
+  expect_lines(function(ir, "rm"),
+               {"%2 = load i16, ptr %1, align 1", "%3 = shl i16 %2, 7", "%4 = lshr i16 %3, 13",
+                "%5 = zext i16 %4 to i32", "ret i32 %5"});
+}
+
+TEST(CodegenBitfieldTest, WritesMergeTheFieldIntoItsBytes) {
+  std::string ir =
+      generate((std::string(flags) + "void wr(struct flags *f, int v) { f->delta = v; }\n"
+                                     "void wf(struct full *f, int v) { f->x = v; }\n")
+                   .c_str());
+  expect_lines(function(ir, "wr"),
+               {"%2 = load i32, ptr %v.1, align 4", "%3 = load ptr, ptr %f.0, align 8",
+                "%4 = trunc i32 %2 to i8", "%5 = load i8, ptr %3, align 1", "%6 = and i8 %4, 31",
+                "%7 = shl i8 %6, 1", "%8 = and i8 %5, -63", "%9 = or i8 %8, %7",
+                "store i8 %9, ptr %3, align 1"});
+  std::string wf = function(ir, "wf");
+  expect_lines(wf,
+               {"%3 = load ptr, ptr %f.0, align 8", "store i32 %2, ptr %3, align 1", "ret void"});
+  EXPECT_EQ(count(wf, " and "), 0) << wf;
+  EXPECT_EQ(count(wf, "load i32, ptr %3"), 0) << wf;
+}
+
+TEST(CodegenBitfieldTest, AssignmentValueIsWhatTheFieldNowHolds) {
+  std::string ir =
+      generate((std::string(flags) + "int av(struct flags *f) { return f->delta = 100; }\n"
+                                     "unsigned inc(struct flags *f) { return ++f->mode; }\n"
+                                     "int post(struct flags *f) { return f->delta++; }\n"
+                                     "void add(struct flags *f) { f->mode += 3; }\n")
+                   .c_str());
+  expect_lines(function(ir, "av"), {"%2 = trunc i32 100 to i8", "store i8 %7, ptr %1, align 1",
+                                    "%8 = shl i32 100, 27", "%9 = ashr i32 %8, 27", "ret i32 %9"});
+  expect_lines(function(ir, "inc"),
+               {"%2 = load i16, ptr %1, align 1", "%5 = zext i16 %4 to i32", "%6 = add i32 %5, 1",
+                "%7 = trunc i32 %6 to i16", "%8 = load i16, ptr %1, align 1", "%9 = and i16 %7, 7",
+                "%10 = shl i16 %9, 6", "%11 = and i16 %8, -449", "%12 = or i16 %11, %10",
+                "store i16 %12, ptr %1, align 1", "%13 = shl i32 %6, 29", "%14 = lshr i32 %13, 29",
+                "ret i32 %14"});
+  expect_lines(function(ir, "post"),
+               {"%4 = ashr i8 %3, 3", "%5 = sext i8 %4 to i32", "%6 = add i32 %5, 1",
+                "store i8 %12, ptr %1, align 1", "ret i32 %5"});
+  expect_lines(function(ir, "add"),
+               {"%5 = zext i16 %4 to i32", "%6 = add i32 %5, 3", "%7 = trunc i32 %6 to i16",
+                "%9 = and i16 %7, 7", "%10 = shl i16 %9, 6", "store i16 %12, ptr %1, align 1"});
+}
+
+TEST(CodegenBitfieldTest, BoolFieldStoresTheConvertedValue) {
+  std::string ir = generate(
+      (std::string(flags) + "int bb(struct full *f) { f->b = 5; return f->b; }\n").c_str());
+  expect_lines(function(ir, "bb"),
+               {"%1 = icmp ne i32 5, 0", "%2 = zext i1 %1 to i8",
+                "%4 = getelementptr inbounds i8, ptr %3, i64 4", "%5 = load i8, ptr %4, align 1",
+                "%6 = and i8 %2, 1", "%7 = and i8 %5, -2", "%8 = or i8 %7, %6",
+                "store i8 %8, ptr %4, align 1", "%13 = load i8, ptr %12, align 1",
+                "%14 = shl i8 %13, 7", "%15 = lshr i8 %14, 7", "%16 = zext i8 %15 to i32"});
+}
+
+TEST(CodegenBitfieldTest, FieldsSitWhereEachTargetPutsThem) {
+  const char *source = "struct mixed { char c : 4; int i : 6; };\n"
+                       "int rd(struct mixed *m) { return m->i; }\n";
+  expect_lines(function(generate(source), "rd"),
+               {"%2 = getelementptr inbounds i8, ptr %1, i64 4", "%3 = load i8, ptr %2, align 1",
+                "%4 = shl i8 %3, 2", "%5 = ashr i8 %4, 2", "%6 = sext i8 %5 to i32"});
+  std::string linux_rd = function(generate(source, TARGET_LINUX_X64), "rd");
+  expect_lines(linux_rd, {"%2 = load i16, ptr %1, align 1", "%3 = shl i16 %2, 6",
+                          "%4 = ashr i16 %3, 10", "%5 = sext i16 %4 to i32"});
+  EXPECT_EQ(count(linux_rd, "getelementptr"), 0) << linux_rd;
+}
+
+TEST(CodegenBitfieldTest, PackedFieldPastItsTypeUsesAWiderUnit) {
+  const char *source = "#pragma pack(1)\n"
+                       "struct packed { char c; long long s : 60; };\n"
+                       "#pragma pack()\n"
+                       "long long rs(struct packed *p) { return p->s; }\n"
+                       "void ws(struct packed *p, long long v) { p->s = v; }\n";
+  std::string linux_ir = generate(source, TARGET_LINUX_X64);
+  expect_lines(function(linux_ir, "rs"),
+               {"%2 = load i72, ptr %1, align 1", "%3 = shl i72 %2, 4", "%4 = ashr i72 %3, 12",
+                "%5 = trunc i72 %4 to i64", "ret i64 %5"});
+  expect_lines(function(linux_ir, "ws"),
+               {"%4 = zext i64 %2 to i72", "%5 = load i72, ptr %3, align 1",
+                "%6 = and i72 %4, u0x00000000000000000FFFFFFFFFFFFFFF", "%7 = shl i72 %6, 8",
+                "%8 = and i72 %5, u0x00000000000000F000000000000000FF", "%9 = or i72 %8, %7",
+                "store i72 %9, ptr %3, align 1", "%10 = shl i64 %2, 4", "%11 = ashr i64 %10, 4"});
+  std::string windows_ir = generate(source);
+  expect_lines(function(windows_ir, "rs"),
+               {"%2 = getelementptr inbounds i8, ptr %1, i64 1", "%3 = load i64, ptr %2, align 1",
+                "%4 = shl i64 %3, 4", "%5 = ashr i64 %4, 4", "ret i64 %5"});
+  expect_lines(function(windows_ir, "ws"),
+               {"%6 = and i64 %2, 1152921504606846975", "%7 = and i64 %5, -1152921504606846976",
+                "%8 = or i64 %7, %6", "store i64 %8, ptr %4, align 1"});
+}
+
+TEST(CodegenGlobalTest, StaticObjectsAreByteImages) {
+  std::string ir = generate("int table[4] = {1, 2};\n"
+                            "static int hidden;\n"
+                            "short s = -2;\n"
+                            "float f = 1.5f;\n"
+                            "double d = -2.0;\n"
+                            "long double ld = 1.0L;\n"
+                            "struct bits { unsigned x : 3; unsigned y : 5; int z : 4; } bits = "
+                            "{5, 17, -1};\n"
+                            "char text[8] = \"hi\";\n"
+                            "char exact[3] = \"hey\";\n"
+                            "struct sb { char a[2]; char b; } sb = {.b = 'x', .a = \"ab\"};\n"
+                            "char *null_pointer = 0;\n"
+                            "char *number = (char *)64;\n"
+                            "int three[3];\n"
+                            "int use(void) { return hidden; }\n");
+  for (const char *line :
+       {"@table = global [16 x i8] c\"\\01\\00\\00\\00\\02\\00\\00\\00\\00\\00\\00\\00\\00\\00\\00"
+        "\\00\", align 16",
+        "@hidden = internal global [4 x i8] zeroinitializer, align 4",
+        "@s = global [2 x i8] c\"\\FE\\FF\", align 2",
+        "@f = global [4 x i8] c\"\\00\\00\\C0?\", align 4",
+        "@d = global [8 x i8] c\"\\00\\00\\00\\00\\00\\00\\00\\C0\", align 8",
+        "@ld = global [16 x i8] "
+        "c\"\\00\\00\\00\\00\\00\\00\\00\\80\\FF?\\00\\00\\00\\00\\00\\00\", "
+        "align 16",
+        "@bits = global [4 x i8] c\"\\8D\\0F\\00\\00\", align 4",
+        "@text = global [8 x i8] c\"hi\\00\\00\\00\\00\\00\\00\", align 1",
+        "@exact = global [3 x i8] c\"hey\", align 1", "@sb = global [3 x i8] c\"abx\", align 1",
+        "@null_pointer = global [8 x i8] zeroinitializer, align 8",
+        "@number = global [8 x i8] c\"@\\00\\00\\00\\00\\00\\00\\00\", align 8",
+        "@three = global [12 x i8] zeroinitializer, align 4"})
+    EXPECT_TRUE(has_line(ir, line)) << line << "\nin:\n" << ir;
+  expect_lines(function(ir, "use"), {"%0 = load i32, ptr @hidden, align 4"});
+}
+
+TEST(CodegenGlobalTest, AddressesAreRelocationsInMemoryOrder) {
+  std::string ir =
+      generate("int table[4];\n"
+               "int *middle = &table[2];\n"
+               "int *first = table;\n"
+               "int a, b;\n"
+               "int *backwards[2] = {[1] = &a, [0] = &b};\n"
+               "struct mix { char c; int *p; char *q; } mix = {'x', &a, \"s\" + 1};\n");
+  for (const char *line :
+       {"@middle = global <{ ptr }> <{ ptr getelementptr (i8, ptr @table, i64 8) }>, align 8",
+        "@first = global <{ ptr }> <{ ptr @table }>, align 8",
+        "@backwards = global <{ ptr, ptr }> <{ ptr @b, ptr @a }>, align 16",
+        "@mix = global <{ [8 x i8], ptr, ptr }> <{ [8 x i8] c\"x\\00\\00\\00\\00\\00\\00\\00\", "
+        "ptr @a, ptr getelementptr (i8, ptr @.str.0, i64 1) }>, align 8"})
+    EXPECT_TRUE(has_line(ir, line)) << line << "\nin:\n" << ir;
+}
+
+TEST(CodegenGlobalTest, EachObjectIsDefinedOnce) {
+  std::string ir = generate("int c;\nint c;\n"
+                            "int answer = 42;\nextern int answer;\n"
+                            "extern int late;\nint late = 5;\n"
+                            "int open[];\n"
+                            "int use(void) { return c + answer + late + open[0]; }\n");
+  EXPECT_EQ(count(ir, "@c = "), 1) << ir;
+  EXPECT_EQ(count(ir, "@answer = "), 1) << ir;
+  EXPECT_EQ(count(ir, "@late = "), 1) << ir;
+  EXPECT_TRUE(has_line(ir, "@c = global [4 x i8] zeroinitializer, align 4")) << ir;
+  EXPECT_TRUE(has_line(ir, "@answer = global [4 x i8] c\"*\\00\\00\\00\", align 4")) << ir;
+  EXPECT_TRUE(has_line(ir, "@late = global [4 x i8] c\"\\05\\00\\00\\00\", align 4")) << ir;
+  EXPECT_TRUE(has_line(ir, "@open = global [4 x i8] zeroinitializer, align 4")) << ir;
+  EXPECT_EQ(count(ir, "external"), 0) << ir;
+}
+
+TEST(CodegenGlobalTest, ArraysOfSixteenBytesOrMoreAreAlignedTo16) {
+  std::string ir = generate("char sixteen[16];\nchar fifteen[15];\nint four[4];\n"
+                            "struct pair { long long a, b; } pair;\n"
+                            "void use(char *);\n"
+                            "void locals(void) { char buf[16]; char small[15]; int many[4];\n"
+                            "  use(buf); use(small); use((char *)many); }\n");
+  EXPECT_TRUE(has_line(ir, "@sixteen = global [16 x i8] zeroinitializer, align 16")) << ir;
+  EXPECT_TRUE(has_line(ir, "@fifteen = global [15 x i8] zeroinitializer, align 1")) << ir;
+  EXPECT_TRUE(has_line(ir, "@four = global [16 x i8] zeroinitializer, align 16")) << ir;
+  EXPECT_TRUE(has_line(ir, "@pair = global [16 x i8] zeroinitializer, align 8")) << ir;
+  expect_lines(function(ir, "locals"),
+               {"%buf.0 = alloca [16 x i8], align 16", "%small.1 = alloca [15 x i8], align 1",
+                "%many.2 = alloca [4 x i32], align 16"});
+}
+
+TEST(CodegenGlobalTest, DataUsedButNotDefinedIsDeclared) {
+  std::string ir = generate("extern int ext;\n"
+                            "extern int unused;\n"
+                            "__attribute__((dllimport)) extern int imported;\n"
+                            "__attribute__((dllimport)) int far(int);\n"
+                            "int use(void) { return ext + imported + far(1); }\n");
+  expect_lines(function(ir, "use"),
+               {"%0 = load i32, ptr @ext, align 4", "%1 = load i32, ptr @imported, align 4",
+                "%3 = call i32 (i32) @far(i32 1)"});
+  EXPECT_TRUE(has_line(ir, "@ext = external global i8")) << ir;
+  EXPECT_TRUE(has_line(ir, "@imported = external dllimport global i8")) << ir;
+  EXPECT_TRUE(has_line(ir, "declare dllimport i32 @far(i32)")) << ir;
+  EXPECT_EQ(count(ir, "unused"), 0) << ir;
+}
+
+TEST(CodegenGlobalTest, AsmLabelsNameEveryUseAndDefinition) {
+  std::string ir = generate("int labelled(int) __asm__(\"real_name\");\n"
+                            "int other_name(int) __asm__(\"real_name\");\n"
+                            "int data_label __asm__(\"data_real\") = 3;\n"
+                            "extern int ext_label __asm__(\"ext_real\");\n"
+                            "int defined_label(void) __asm__(\"defined_real\");\n"
+                            "int defined_label(void) { return 1; }\n"
+                            "int use(void) { return labelled(2) + other_name(3) + data_label +\n"
+                            "  ext_label + defined_label(); }\n");
+  expect_lines(function(ir, "use"),
+               {"%0 = call i32 (i32) @real_name(i32 2)", "%1 = call i32 (i32) @real_name(i32 3)",
+                "%3 = load i32, ptr @data_real, align 4", "%5 = load i32, ptr @ext_real, align 4",
+                "%7 = call i32 () @defined_real()"});
+  EXPECT_NE(function(ir, "defined_real"), "") << ir;
+  EXPECT_TRUE(has_line(ir, "@data_real = global [4 x i8] c\"\\03\\00\\00\\00\", align 4")) << ir;
+  EXPECT_TRUE(has_line(ir, "@ext_real = external global i8")) << ir;
+  EXPECT_EQ(count(ir, "declare i32 @real_name(i32)"), 1) << ir;
+  EXPECT_EQ(count(ir, "declare i32 @defined_real"), 0) << ir;
+  for (const char *name : {"labelled", "other_name", "data_label", "ext_label", "defined_label"})
+    EXPECT_EQ(count(ir, std::string("@") + name), 0) << name << "\n" << ir;
+}
+
+TEST(CodegenGlobalTest, InlineDefinitionsAreLeftToAnotherFile) {
+  std::string ir = generate("inline int helper(void) { return 2; }\n"
+                            "static inline int local(void) { return 3; }\n"
+                            "int use(void) { return helper() + local(); }\n");
+  EXPECT_EQ(function(ir, "helper"), "") << ir;
+  EXPECT_TRUE(has_line(ir, "declare i32 @helper()")) << ir;
+  EXPECT_NE(function(ir, "local"), "") << ir;
+  expect_lines(function(ir, "use"), {"%0 = call i32 () @helper()", "%1 = call i32 () @local()"});
+}
+
+TEST(CodegenGlobalTest, StaticLocalsAreInternalGlobalsNamedByTheirFunction) {
+  std::string ir = generate("int one(void) { static int calls; return ++calls; }\n"
+                            "int two(void) { static int calls = 5;\n"
+                            "  { static int calls = 9; calls++; }\n"
+                            "  static int *p = &calls; return *p; }\n");
+  for (const char *line : {"@one.calls.0 = internal global [4 x i8] zeroinitializer, align 4",
+                           "@two.calls.1 = internal global [4 x i8] c\"\\05\\00\\00\\00\", align 4",
+                           "@two.calls.2 = internal global [4 x i8] c\"\\09\\00\\00\\00\", align 4",
+                           "@two.p.3 = internal global <{ ptr }> <{ ptr @two.calls.1 }>, align 8"})
+    EXPECT_TRUE(has_line(ir, line)) << line << "\nin:\n" << ir;
+  expect_lines(function(ir, "one"), {"%0 = load i32, ptr @one.calls.0, align 4",
+                                     "store i32 %1, ptr @one.calls.0, align 4"});
+  std::string two = function(ir, "two");
+  expect_lines(two,
+               {"%0 = load i32, ptr @two.calls.2, align 4",
+                "store i32 %1, ptr @two.calls.2, align 4", "%2 = load ptr, ptr @two.p.3, align 8"});
+  EXPECT_EQ(count(two, "alloca"), 0) << two;
+}
+
+TEST(CodegenGlobalTest, FuncIsOneConstantPerFunction) {
+  std::string ir =
+      generate("const char *name(void) { return __func__; }\n"
+               "const char *both(void) { const char *a = __FUNCTION__;\n"
+               "  const char *b = __PRETTY_FUNCTION__; return a == b ? __func__ : 0; }\n");
+  EXPECT_TRUE(
+      has_line(ir, "@__func__.0 = private unnamed_addr constant [5 x i8] c\"name\\00\", align 1"))
+      << ir;
+  EXPECT_TRUE(
+      has_line(ir, "@__func__.1 = private unnamed_addr constant [5 x i8] c\"both\\00\", align 1"))
+      << ir;
+  EXPECT_EQ(count(ir, "private unnamed_addr constant"), 2) << ir;
+  expect_lines(function(ir, "name"), {"ret ptr @__func__.0"});
+  expect_lines(function(ir, "both"), {"store ptr @__func__.1, ptr %a.0, align 8",
+                                      "store ptr @__func__.1, ptr %b.1, align 8"});
+}
+
+TEST(CodegenGlobalTest, FileScopeCompoundLiteralsAreInternalGlobals) {
+  std::string ir = generate("int *literal = (int[]){10, 20, 30};\n"
+                            "int *pair[2] = {(int[]){1}, (int[]){2}};\n"
+                            "int *inside = &(int[]){4, 5}[1];\n");
+  for (const char *line :
+       {"@.compound.0 = internal global [12 x i8] c\"\\0A\\00\\00\\00\\14\\00\\00\\00\\1E\\00\\00"
+        "\\00\", align 4",
+        "@literal = global <{ ptr }> <{ ptr @.compound.0 }>, align 8",
+        "@.compound.1 = internal global [4 x i8] c\"\\01\\00\\00\\00\", align 4",
+        "@.compound.2 = internal global [4 x i8] c\"\\02\\00\\00\\00\", align 4",
+        "@pair = global <{ ptr, ptr }> <{ ptr @.compound.1, ptr @.compound.2 }>, align 16",
+        "@inside = global <{ ptr }> <{ ptr getelementptr (i8, ptr @.compound.3, i64 4) }>, align "
+        "8"})
+    EXPECT_TRUE(has_line(ir, line)) << line << "\nin:\n" << ir;
+}
+
+TEST(CodegenGlobalTest, CompoundLiteralsInAFunctionAreInitializedEachTime) {
+  std::string body = function(generate("int loop(int n) { int s = 0;\n"
+                                       "  for (int i = 0; i < n; i++) { int *r = (int[]){i, 2};\n"
+                                       "    s += r[0]; } return s; }\n"),
+                              "loop");
+  expect_lines(body,
+               {"%compound.8 = alloca [2 x i32], align 4", "for.body.4:",
+                "call void @llvm.memset.p0.i64(ptr align 4 %compound.8, i8 0, i64 8, i1 false)",
+                "%6 = load i32, ptr %i.2, align 4", "store i32 %6, ptr %compound.8, align 4",
+                "%7 = getelementptr inbounds i8, ptr %compound.8, i64 4",
+                "store i32 2, ptr %7, align 4", "store ptr %compound.8, ptr %r.7, align 8",
+                "for.inc.5:"});
+}
+
+TEST(CodegenVlaTest, VlaIsAllocatedWhereItsDeclarationRuns) {
+  std::string ir = generate("long alloc(int n) { int a[n]; a[0] = 1; return sizeof a; }\n");
+  EXPECT_EQ(function(ir, "alloc"), "define i32 @alloc(i32 %0) {\n"
+                                   "entry:\n"
+                                   "  %n.0 = alloca i32, align 4\n"
+                                   "  %size.1 = alloca i64, align 8\n"
+                                   "  store i32 %0, ptr %n.0, align 4\n"
+                                   "  %1 = load i32, ptr %n.0, align 4\n"
+                                   "  %2 = sext i32 %1 to i64\n"
+                                   "  store i64 %2, ptr %size.1, align 8\n"
+                                   "  %3 = load i64, ptr %size.1, align 8\n"
+                                   "  %4 = mul i64 %3, 4\n"
+                                   "  %5 = call ptr @llvm.stacksave.p0()\n"
+                                   "  %a.2 = alloca i8, i64 %4, align 4\n"
+                                   "  %6 = sext i32 0 to i64\n"
+                                   "  %7 = getelementptr inbounds i32, ptr %a.2, i64 %6\n"
+                                   "  store i32 1, ptr %7, align 4\n"
+                                   "  %8 = load i64, ptr %size.1, align 8\n"
+                                   "  %9 = mul i64 %8, 4\n"
+                                   "  %10 = trunc i64 %9 to i32\n"
+                                   "  ret i32 %10\n"
+                                   "}\n");
+  EXPECT_TRUE(has_line(ir, "declare ptr @llvm.stacksave.p0()")) << ir;
+  EXPECT_TRUE(has_line(ir, "declare void @llvm.stackrestore.p0(ptr)")) << ir;
+  std::string plain = generate("int none(void) { int a[4]; a[0] = 0; return a[0]; }\n");
+  EXPECT_EQ(count(plain, "stacksave"), 0) << plain;
+  EXPECT_EQ(count(plain, "stackrestore"), 0) << plain;
+}
+
+TEST(CodegenVlaTest, SizeofEvaluatesItsOperandOnlyForAVla) {
+  std::string ir = generate("long sz(int k) { long x = sizeof(int[k++]);\n"
+                            "  long y = sizeof(int[4][k++]); return x + y + k; }\n"
+                            "int noeval(int k) { long z = sizeof(k++); return k + (int)z; }\n"
+                            "long object(int n) { int a[n][3]; return sizeof a[n++]; }\n"
+                            "long ptr(int n, int (*p)[n]) { long s = sizeof *p++;\n"
+                            "  return s + (p == 0); }\n"
+                            "long outer(int n) { int a[3][n]; return sizeof a; }\n");
+  expect_lines(function(ir, "sz"),
+               {"%1 = load i32, ptr %k.0, align 4", "%2 = add i32 %1, 1",
+                "store i32 %2, ptr %k.0, align 4", "%3 = sext i32 %1 to i64",
+                "store i64 %3, ptr %size.2, align 8", "%4 = load i64, ptr %size.2, align 8",
+                "%5 = mul i64 %4, 4", "%6 = trunc i64 %5 to i32", "store i32 %6, ptr %x.1, align 4",
+                "%8 = add i32 %7, 1", "store i64 %9, ptr %size.4, align 8", "%11 = mul i64 %10, 4",
+                "%12 = mul i64 4, %11", "%13 = trunc i64 %12 to i32"});
+  std::string noeval = function(ir, "noeval");
+  expect_lines(noeval, {"%1 = trunc i64 4 to i32", "store i32 %1, ptr %z.1, align 4"});
+  EXPECT_EQ(count(noeval, "store i32 %"), 2) << noeval;
+  EXPECT_EQ(count(noeval, " add "), 1) << noeval;
+  std::string object = function(ir, "object");
+  EXPECT_EQ(count(object, "add i32"), 0) << object;
+  expect_lines(object, {"%a.2 = alloca i8, i64 %4, align 4", "%6 = trunc i64 12 to i32"});
+  expect_lines(function(ir, "ptr"),
+               {"store i64 %3, ptr %size.2, align 8", "%4 = load ptr, ptr %p.1, align 8",
+                "%7 = mul i64 1, %6", "%8 = getelementptr inbounds i8, ptr %4, i64 %7",
+                "store ptr %8, ptr %p.1, align 8", "%9 = load i64, ptr %size.2, align 8",
+                "%10 = mul i64 %9, 4", "%11 = trunc i64 %10 to i32"});
+  expect_lines(function(ir, "outer"),
+               {"%4 = mul i64 %3, 4", "%5 = mul i64 3, %4", "%a.2 = alloca i8, i64 %5, align 4",
+                "%8 = mul i64 %7, 4", "%9 = mul i64 3, %8", "%10 = trunc i64 %9 to i32"});
+}
+
+TEST(CodegenVlaTest, StepsOverAVlaElementAreInBytes) {
+  std::string body = function(
+      generate("long step(int m, int (*p)[m], int (*q)[m]) { p = p + 1; return p - q; }\n"),
+      "step");
+  expect_lines(body, {"store i64 %4, ptr %size.3, align 8", "store i64 %6, ptr %size.4, align 8",
+                      "%7 = load ptr, ptr %p.1, align 8", "%8 = sext i32 1 to i64",
+                      "%9 = load i64, ptr %size.3, align 8", "%10 = mul i64 %9, 4",
+                      "%11 = mul i64 %8, %10", "%12 = getelementptr inbounds i8, ptr %7, i64 %11",
+                      "store ptr %12, ptr %p.1, align 8", "%17 = sub i64 %15, %16",
+                      "%18 = load i64, ptr %size.3, align 8", "%19 = mul i64 %18, 4",
+                      "%20 = sdiv exact i64 %17, %19"});
+}
+
+TEST(CodegenVlaTest, SizesAreEvaluatedWhereTheTypeIsWritten) {
+  std::string ir = generate("int frozen(int m) { typedef int row[m]; m = 100; row r;\n"
+                            "  return sizeof r; }\n"
+                            "int params(int n, int m, int a[n][m]) { return a[1][2]; }\n"
+                            "void cast(int n, void *p) { (void)(int (*)[n++])p; }\n");
+  expect_lines(function(ir, "frozen"),
+               {"%2 = sext i32 %1 to i64", "store i64 %2, ptr %size.1, align 8",
+                "store i32 100, ptr %m.0, align 4", "%3 = load i64, ptr %size.1, align 8",
+                "%4 = mul i64 %3, 4", "%5 = call ptr @llvm.stacksave.p0()",
+                "%r.2 = alloca i8, i64 %4, align 4", "%6 = load i64, ptr %size.1, align 8"});
+  EXPECT_EQ(count(function(ir, "frozen"), "store i64"), 1);
+  expect_lines(function(ir, "params"),
+               {"store ptr %2, ptr %a.2, align 8", "%3 = load i32, ptr %n.0, align 4",
+                "store i64 %4, ptr %size.3, align 8", "%5 = load i32, ptr %m.1, align 4",
+                "store i64 %6, ptr %size.4, align 8", "%9 = load i64, ptr %size.4, align 8",
+                "%10 = mul i64 %9, 4", "%12 = getelementptr inbounds i8, ptr %7, i64 %11",
+                "%14 = getelementptr inbounds i32, ptr %12, i64 %13"});
+  expect_lines(function(ir, "cast"),
+               {"%2 = load i32, ptr %n.0, align 4", "%3 = add i32 %2, 1",
+                "store i32 %3, ptr %n.0, align 4", "store i64 %4, ptr %size.2, align 8"});
+}
+
+static const char *vla_paths =
+    "void use(char *);\n"
+    "void block(int n) { { char a[n]; use(a); } use(0); }\n"
+    "void brk(int n) { while (n) { char a[n]; if (n > 5) break; use(a); } }\n"
+    "void cont(int n) { while (n--) { char a[n];\n"
+    "  switch (n) { case 1: { char b[n]; use(b); continue; } } use(a); } }\n"
+    "void jump(int n) { char a[n]; { char b[n]; use(b); goto out; } out: use(a); }\n"
+    "void fors(int n) { for (char a[n]; n; n--) use(a); use(0); }\n"
+    "void back(int n) { again: { char a[n]; use(a); if (n--) goto again; } }\n"
+    "void inner(int n) { char a[n]; again: { char b[n]; use(b); if (n--) goto again; } use(a); }\n"
+    "int early(int n) { char a[n]; use(a); return 0; }\n"
+    "void deep(int n) { char a[n]; while (n--) { char b[n]; if (n == 3) break;\n"
+    "  if (n == 5) continue; use(b); } use(a); }\n"
+    "void fl(int n) { for (char a[n]; n; n--) use(a); x: { char b[n]; if (n++ < 3) goto x; } }\n";
+
+static std::vector<std::string> stack_lines(const std::string &body) {
+  std::vector<std::string> out;
+  std::istringstream in(body);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.find("stack") != std::string::npos || line.back() == ':' || line.find("  br ") == 0 ||
+        line.find("  ret") == 0)
+      out.push_back(line);
+  }
+  return out;
+}
+
+TEST(CodegenVlaTest, LeavingAScopeGivesItsStackBack) {
+  std::string ir = generate(vla_paths);
+  EXPECT_EQ(stack_lines(function(ir, "block")),
+            (std::vector<std::string>{"entry:", "  %5 = call ptr @llvm.stacksave.p0()",
+                                      "  call void @llvm.stackrestore.p0(ptr %5)", "  ret void"}));
+  EXPECT_EQ(stack_lines(function(ir, "fors")),
+            (std::vector<std::string>{
+                "entry:", "  %5 = call ptr @llvm.stacksave.p0()", "  br label %for.cond.3",
+                "for.cond.3:", "  br i1 %7, label %for.body.4, label %for.end.6",
+                "for.body.4:", "  br label %for.inc.5", "for.inc.5:", "  br label %for.cond.3",
+                "for.end.6:", "  call void @llvm.stackrestore.p0(ptr %5)", "  ret void"}));
+  EXPECT_EQ(
+      stack_lines(function(ir, "early")),
+      (std::vector<std::string>{"entry:", "  %5 = call ptr @llvm.stacksave.p0()", "  ret i32 0"}));
+}
+
+TEST(CodegenVlaTest, BreakAndContinueGiveBackWhatTheyLeave) {
+  std::string ir = generate(vla_paths);
+  EXPECT_EQ(stack_lines(function(ir, "brk")),
+            (std::vector<std::string>{
+                "entry:", "  br label %while.cond.1",
+                "while.cond.1:", "  br i1 %2, label %while.body.2, label %while.end.3",
+                "while.body.2:", "  %7 = call ptr @llvm.stacksave.p0()",
+                "  br i1 %11, label %if.then.6, label %if.end.7",
+                "if.then.6:", "  call void @llvm.stackrestore.p0(ptr %7)",
+                "  br label %while.end.3", "if.end.7:", "  call void @llvm.stackrestore.p0(ptr %7)",
+                "  br label %while.cond.1", "while.end.3:", "  ret void"}));
+  EXPECT_EQ(stack_lines(function(ir, "cont")),
+            (std::vector<std::string>{
+                "entry:", "  br label %while.cond.1",
+                "while.cond.1:", "  br i1 %3, label %while.body.2, label %while.end.3",
+                "while.body.2:", "  %8 = call ptr @llvm.stacksave.p0()",
+                "switch.case.6:", "  %14 = call ptr @llvm.stacksave.p0()",
+                "  call void @llvm.stackrestore.p0(ptr %8)", "  br label %while.cond.1",
+                "switch.end.7:", "  call void @llvm.stackrestore.p0(ptr %8)",
+                "  br label %while.cond.1", "while.end.3:", "  ret void"}));
+  EXPECT_EQ(stack_lines(function(ir, "deep")),
+            (std::vector<std::string>{"entry:",
+                                      "  %5 = call ptr @llvm.stacksave.p0()",
+                                      "  br label %while.cond.3",
+                                      "while.cond.3:",
+                                      "  br i1 %8, label %while.body.4, label %while.end.5",
+                                      "while.body.4:",
+                                      "  %13 = call ptr @llvm.stacksave.p0()",
+                                      "  br i1 %17, label %if.then.8, label %if.end.9",
+                                      "if.then.8:",
+                                      "  call void @llvm.stackrestore.p0(ptr %13)",
+                                      "  br label %while.end.5",
+                                      "if.end.9:",
+                                      "  br i1 %21, label %if.then.10, label %if.end.11",
+                                      "if.then.10:",
+                                      "  call void @llvm.stackrestore.p0(ptr %13)",
+                                      "  br label %while.cond.3",
+                                      "if.end.11:",
+                                      "  call void @llvm.stackrestore.p0(ptr %13)",
+                                      "  br label %while.cond.3",
+                                      "while.end.5:",
+                                      "  call void @llvm.stackrestore.p0(ptr %5)",
+                                      "  ret void"}));
+}
+
+TEST(CodegenVlaTest, GotoGivesBackOnlyTheScopesItLeaves) {
+  std::string ir = generate(vla_paths);
+  EXPECT_EQ(
+      stack_lines(function(ir, "jump")),
+      (std::vector<std::string>{
+          "entry:", "  %5 = call ptr @llvm.stacksave.p0()", "  %10 = call ptr @llvm.stacksave.p0()",
+          "  call void @llvm.stackrestore.p0(ptr %10)", "  br label %label.5",
+          "label.5:", "  call void @llvm.stackrestore.p0(ptr %5)", "  ret void"}));
+  EXPECT_EQ(stack_lines(function(ir, "back")),
+            (std::vector<std::string>{
+                "entry:", "  br label %label.1", "label.1:", "  %5 = call ptr @llvm.stacksave.p0()",
+                "  br i1 %8, label %if.then.4, label %if.end.5",
+                "if.then.4:", "  call void @llvm.stackrestore.p0(ptr %5)", "  br label %label.1",
+                "if.end.5:", "  call void @llvm.stackrestore.p0(ptr %5)", "  ret void"}));
+  EXPECT_EQ(stack_lines(function(ir, "inner")),
+            (std::vector<std::string>{
+                "entry:", "  %5 = call ptr @llvm.stacksave.p0()", "  br label %label.3",
+                "label.3:", "  %10 = call ptr @llvm.stacksave.p0()",
+                "  br i1 %13, label %if.then.6, label %if.end.7",
+                "if.then.6:", "  call void @llvm.stackrestore.p0(ptr %10)", "  br label %label.3",
+                "if.end.7:", "  call void @llvm.stackrestore.p0(ptr %10)",
+                "  call void @llvm.stackrestore.p0(ptr %5)", "  ret void"}));
+  EXPECT_EQ(stack_lines(function(ir, "fl")),
+            (std::vector<std::string>{"entry:",
+                                      "  %5 = call ptr @llvm.stacksave.p0()",
+                                      "  br label %for.cond.3",
+                                      "for.cond.3:",
+                                      "  br i1 %7, label %for.body.4, label %for.end.6",
+                                      "for.body.4:",
+                                      "  br label %for.inc.5",
+                                      "for.inc.5:",
+                                      "  br label %for.cond.3",
+                                      "for.end.6:",
+                                      "  call void @llvm.stackrestore.p0(ptr %5)",
+                                      "  br label %label.7",
+                                      "label.7:",
+                                      "  %14 = call ptr @llvm.stacksave.p0()",
+                                      "  br i1 %19, label %if.then.10, label %if.end.11",
+                                      "if.then.10:",
+                                      "  call void @llvm.stackrestore.p0(ptr %14)",
+                                      "  br label %label.7",
+                                      "if.end.11:",
+                                      "  call void @llvm.stackrestore.p0(ptr %14)",
+                                      "  ret void"}));
+}
+
 static std::string read_file(const std::string &path) {
   std::ifstream in(path, std::ios::binary);
   std::stringstream text;
@@ -859,18 +1467,19 @@ TEST_P(CodegenProgramTest, RunsAndMatchesGcc) {
   EXPECT_EQ(actual, expected);
 }
 
-INSTANTIATE_TEST_SUITE_P(BothTargets, CodegenProgramTest,
-                         testing::Values(ProgramCase{"arith", TARGET_WINDOWS_X64},
-                                         ProgramCase{"arith", TARGET_LINUX_X64},
-                                         ProgramCase{"control", TARGET_WINDOWS_X64},
-                                         ProgramCase{"control", TARGET_LINUX_X64},
-                                         ProgramCase{"memory", TARGET_WINDOWS_X64},
-                                         ProgramCase{"memory", TARGET_LINUX_X64},
-                                         ProgramCase{"edge", TARGET_WINDOWS_X64},
-                                         ProgramCase{"edge", TARGET_LINUX_X64},
-                                         ProgramCase{"tail", TARGET_WINDOWS_X64},
-                                         ProgramCase{"tail", TARGET_LINUX_X64}),
-                         [](const testing::TestParamInfo<ProgramCase> &info) {
-                           return std::string(info.param.name) +
-                                  (info.param.kind == TARGET_WINDOWS_X64 ? "Windows" : "Linux");
-                         });
+INSTANTIATE_TEST_SUITE_P(
+    BothTargets, CodegenProgramTest,
+    testing::Values(
+        ProgramCase{"arith", TARGET_WINDOWS_X64}, ProgramCase{"arith", TARGET_LINUX_X64},
+        ProgramCase{"control", TARGET_WINDOWS_X64}, ProgramCase{"control", TARGET_LINUX_X64},
+        ProgramCase{"memory", TARGET_WINDOWS_X64}, ProgramCase{"memory", TARGET_LINUX_X64},
+        ProgramCase{"edge", TARGET_WINDOWS_X64}, ProgramCase{"edge", TARGET_LINUX_X64},
+        ProgramCase{"tail", TARGET_WINDOWS_X64}, ProgramCase{"tail", TARGET_LINUX_X64},
+        ProgramCase{"records", TARGET_WINDOWS_X64}, ProgramCase{"records", TARGET_LINUX_X64},
+        ProgramCase{"bitfields", TARGET_WINDOWS_X64}, ProgramCase{"bitfields", TARGET_LINUX_X64},
+        ProgramCase{"globals", TARGET_WINDOWS_X64}, ProgramCase{"globals", TARGET_LINUX_X64},
+        ProgramCase{"vla", TARGET_WINDOWS_X64}, ProgramCase{"vla", TARGET_LINUX_X64}),
+    [](const testing::TestParamInfo<ProgramCase> &info) {
+      return std::string(info.param.name) +
+             (info.param.kind == TARGET_WINDOWS_X64 ? "Windows" : "Linux");
+    });

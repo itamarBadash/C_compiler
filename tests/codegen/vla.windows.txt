@@ -1,0 +1,9 @@
+grid 23 48 16
+sum 138
+pointer 12 1
+typedef 16
+sizeof 8 3
+churn 266667
+jumps 200007
+pairs 7 24
+exit 0

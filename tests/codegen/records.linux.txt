@@ -1,0 +1,16 @@
+points 1 2 0 7 6 2
+moved 9 -1
+shape r 1 4 40 2.500000 rect
+sizes 8 40 4
+array 123 0
+union 3f800000 63
+bytes 7
+chosen 2 7
+member of rvalue 1
+list 5
+compound 10 6
+loop literal 5
+flexible 102 8
+grid 7 3
+volatile 4
+exit 0
