@@ -1,4 +1,5 @@
 #include "target_guard.h"
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -15,7 +16,7 @@ extern "C" {
 }
 
 static std::string generate(const char *source, target_kind kind = TARGET_WINDOWS_X64,
-                            bool system_headers = false) {
+                            bool system_headers = false, const char *path = nullptr) {
   TargetGuard guard(kind);
   std::vector<std::string> dirs = {LIB_INCLUDE_DIR};
   if (kind == TARGET_WINDOWS_X64) {
@@ -29,9 +30,11 @@ static std::string generate(const char *source, target_kind kind = TARGET_WINDOW
     system_dirs.push_back(dir.c_str());
   testing::internal::CaptureStderr();
   token_buf tb;
-  int errors = system_headers ? pp_run_ex(&tb, source, "program.c", nullptr, 0, system_dirs.data(),
-                                          (int)system_dirs.size())
-                              : pp_run(&tb, source);
+  int errors = path
+                   ? pp_run_file(&tb, path, nullptr, 0, system_dirs.data(), (int)system_dirs.size())
+               : system_headers ? pp_run_ex(&tb, source, "program.c", nullptr, 0,
+                                            system_dirs.data(), (int)system_dirs.size())
+                                : pp_run(&tb, source);
   parser p;
   parser_init_from_buf(&p, &tb);
   ast_node *program = parse_program(&p);
@@ -112,6 +115,7 @@ TEST(CodegenModuleTest, FunctionsEndAsTheirTypeRequires) {
                             "void nothing(void) { }\n"
                             "int missing(void) { }\n"
                             "static int hidden(void) { return 1; }\n"
+                            "int uses(void) { return hidden(); }\n"
                             "static int main2(void) { }\n");
   expect_lines(function(ir, "main"), {"ret i32 0"});
   expect_lines(function(ir, "nothing"), {"ret void"});
@@ -239,8 +243,10 @@ TEST(CodegenConversionTest, FloatingConversionsFollowBothTypes) {
   expect_lines(function(ir, "d"), {"%2 = fptoui double %1 to i32"});
   expect_lines(function(ir, "e"), {"%2 = fpext float %1 to double"});
   expect_lines(function(ir, "f"), {"%2 = fptrunc double %1 to float"});
-  expect_lines(function(ir, "g"), {"%2 = fpext double %1 to x86_fp80"});
-  expect_lines(function(ir, "h"), {"%2 = fptrunc x86_fp80 %1 to double"});
+  expect_lines(function(ir, "g"),
+               {"%3 = fpext double %2 to x86_fp80", "store x86_fp80 %3, ptr %0, align 16"});
+  expect_lines(function(ir, "h"),
+               {"%1 = load x86_fp80, ptr %0, align 16", "%3 = fptrunc x86_fp80 %2 to double"});
   expect_lines(function(ir, "i"), {"%2 = uitofp i8 %1 to float"});
 }
 
@@ -789,8 +795,8 @@ TEST(CodegenDataTest, ConstantsAreExact) {
                             "int g(void) { return 'ab'; }\n");
   expect_lines(function(ir, "a"), {"ret float 0x3FF8000000000000"});
   expect_lines(function(ir, "b"), {"ret double 0x3FB999999999999A"});
-  expect_lines(function(ir, "c"), {"ret x86_fp80 0xK3FFF8000000000000000"});
-  expect_lines(function(ir, "d"), {"%0 = fneg x86_fp80 0xK4000A000000000000000"});
+  expect_lines(function(ir, "c"), {"store x86_fp80 0xK3FFF8000000000000000, ptr %0, align 16"});
+  expect_lines(function(ir, "d"), {"%1 = fneg x86_fp80 0xK4000A000000000000000"});
   expect_lines(function(ir, "e"), {"ret i32 -1"});
   expect_lines(function(ir, "f"), {"%0 = add i32 16, 8", "%1 = add i32 %0, 65",
                                    "%2 = zext i16 -1 to i32", "%3 = add i32 %1, %2"});
@@ -1744,6 +1750,345 @@ TEST(CodegenPragmaTest, FpContractNeverFusesAMultiplyAndAnAdd) {
   EXPECT_EQ(count(body, "contract"), 0) << body;
 }
 
+static std::string first_line(const std::string &text) {
+  return text.substr(0, text.find('\n'));
+}
+
+static const char *windows_abi_source =
+    "struct s4 { int a; };\n"
+    "struct s12 { int a, b, c; };\n"
+    "struct s4 small(struct s4 x) { x.a++; return x; }\n"
+    "struct s12 big(struct s12 x) { x.c++; return x; }\n"
+    "long double ld(long double x) { return x; }\n"
+    "float _Complex cf(float _Complex x) { return x; }\n"
+    "double _Complex cd(double _Complex x) { return x; }\n"
+    "_Bool b(_Bool x, char c) { return x && c; }\n"
+    "int use(struct s4 *p, struct s12 *q) { struct s4 r = small(*p); struct s12 s = big(*q);\n"
+    "  return r.a + s.c + big(*q).b; }\n"
+    "long double callld(long double x) { return ld(x); }\n";
+
+TEST(CodegenAbiWindowsTest, SmallRecordsAreIntegersAndOthersGoByPointer) {
+  std::string ir = generate(windows_abi_source);
+  std::string small = function(ir, "small");
+  EXPECT_EQ(first_line(small), "define i32 @small(i32 %0) {");
+  expect_lines(
+      small, {"store i32 %0, ptr %x.0, align 4", "%3 = load i32, ptr %x.0, align 4", "ret i32 %3"});
+  std::string big = function(ir, "big");
+  EXPECT_EQ(first_line(big), "define void @big(ptr sret([12 x i8]) align 4 %0, ptr %1) {");
+  expect_lines(
+      big, {"call void @llvm.memcpy.p0.p0.i64(ptr align 4 %x.0, ptr align 4 %1, i64 12, i1 false)",
+            "call void @llvm.memcpy.p0.p0.i64(ptr align 4 %0, ptr align 4 %x.0, i64 12, i1 false)",
+            "ret void"});
+  expect_lines(
+      function(ir, "use"),
+      {"%3 = load i32, ptr %2, align 4", "%4 = call i32 (i32) @small(i32 %3)",
+       "store i32 %4, ptr %tmp.3, align 4",
+       "call void @llvm.memcpy.p0.p0.i64(ptr align 4 %tmp.6, ptr align 4 %5, i64 12, i1 false)",
+       "call void (ptr, ptr) @big(ptr sret([12 x i8]) align 4 %tmp.5, ptr %tmp.6)",
+       "call void @llvm.memcpy.p0.p0.i64(ptr align 4 %s.4, ptr align 4 %tmp.5, i64 12, i1 false)",
+       "call void (ptr, ptr) @big(ptr sret([12 x i8]) align 4 %tmp.7, ptr %tmp.8)",
+       "%11 = getelementptr inbounds i8, ptr %tmp.7, i64 4"});
+}
+
+TEST(CodegenAbiWindowsTest, LongDoubleAndComplexFollowMinGW) {
+  std::string ir = generate(windows_abi_source);
+  std::string ld = function(ir, "ld");
+  EXPECT_EQ(first_line(ld), "define void @ld(ptr sret(x86_fp80) align 16 %0, ptr %1) {");
+  expect_lines(ld, {"%2 = load x86_fp80, ptr %1, align 16", "store x86_fp80 %3, ptr %0, align 16",
+                    "ret void"});
+  std::string cf = function(ir, "cf");
+  EXPECT_EQ(first_line(cf), "define i64 @cf(i64 %0) {");
+  expect_lines(cf,
+               {"store i64 %0, ptr %x.0, align 4", "store { float, float } %1, ptr %tmp.1, align 4",
+                "%2 = load i64, ptr %tmp.1, align 4", "ret i64 %2"});
+  EXPECT_EQ(first_line(function(ir, "cd")),
+            "define void @cd(ptr sret({ double, double }) align 8 %0, ptr %1) {");
+  expect_lines(function(ir, "callld"),
+               {"store x86_fp80 %3, ptr %tmp.2, align 16",
+                "call void (ptr, ptr) @ld(ptr sret(x86_fp80) align 16 %tmp.1, ptr %tmp.2)",
+                "%4 = load x86_fp80, ptr %tmp.1, align 16"});
+  EXPECT_EQ(first_line(function(ir, "b")), "define zeroext i8 @b(i8 zeroext %0, i8 %1) {");
+}
+
+static const char *linux_abi_source =
+    "struct s3 { char a[3]; };\n"
+    "struct s12 { int a, b, c; };\n"
+    "struct s16 { long long a, b; };\n"
+    "struct s24 { long long a, b, c; };\n"
+    "struct f2 { float a, b; };\n"
+    "struct mix { int a; double b; };\n"
+    "struct mix2 { double a; int b; };\n"
+    "struct ld1 { long double a; };\n"
+    "union u3 { float f[3]; int i; };\n"
+    "#pragma pack(1)\n"
+    "struct packed { char c; int i; };\n"
+    "struct packed2 { char c; int i; char d[11]; };\n"
+    "#pragma pack()\n"
+    "struct s3 r3(struct s3 x) { return x; }\n"
+    "struct s12 r12(struct s12 x) { return x; }\n"
+    "struct s24 r24(struct s24 x) { return x; }\n"
+    "struct f2 rf2(struct f2 x) { return x; }\n"
+    "struct mix rmix(struct mix x) { return x; }\n"
+    "struct mix2 rmix2(struct mix2 x) { return x; }\n"
+    "struct ld1 rld(struct ld1 x) { return x; }\n"
+    "union u3 ru3(union u3 x) { return x; }\n"
+    "struct packed rp(struct packed x) { return x; }\n"
+    "struct packed2 rp2(struct packed2 x) { return x; }\n"
+    "long double _Complex rcl(long double _Complex x) { return x; }\n"
+    "char c(char x, unsigned char u, short s, unsigned short us, _Bool b) {\n"
+    "  return x + u + s + us + b; }\n"
+    "int spill(int a, int b, int c, int d, int e, struct s16 f, int g) { return a + (int)f.b + g; "
+    "}\n"
+    "int callspill(struct s16 *p) { return spill(1, 2, 3, 4, 5, *p, 6); }\n"
+    "double use(struct s12 *p, struct mix *m) { extern double take(struct mix, struct s12);\n"
+    "  return r12(*p).c + take(*m, *p); }\n";
+
+TEST(CodegenAbiLinuxTest, RecordsAreClassifiedIntoEightbytes) {
+  std::string ir = generate(linux_abi_source, TARGET_LINUX_X64);
+  const char *const lines[][2] = {
+      {"r3", "define i24 @r3(i24 %0) {"},
+      {"r12", "define { i64, i32 } @r12(i64 %0, i32 %1) {"},
+      {"r24",
+       "define void @r24(ptr sret([24 x i8]) align 8 %0, ptr byval([24 x i8]) align 8 %1) {"},
+      {"rf2", "define double @rf2(double %0) {"},
+      {"rmix", "define { i64, double } @rmix(i64 %0, double %1) {"},
+      {"rmix2", "define { double, i64 } @rmix2(double %0, i64 %1) {"},
+      {"rld", "define x86_fp80 @rld(ptr byval([16 x i8]) align 16 %0) {"},
+      {"ru3", "define { i64, float } @ru3(i64 %0, float %1) {"},
+      {"rp", "define void @rp(ptr sret([5 x i8]) align 1 %0, ptr byval([5 x i8]) align 8 %1) {"},
+      {"rp2",
+       "define void @rp2(ptr sret([16 x i8]) align 1 %0, ptr byval([16 x i8]) align 8 %1) {"},
+      {"rcl",
+       "define { x86_fp80, x86_fp80 } @rcl(ptr byval({ x86_fp80, x86_fp80 }) align 16 %0) {"},
+      {"c", "define signext i8 @c(i8 signext %0, i8 zeroext %1, i16 signext %2, i16 zeroext %3, "
+            "i8 zeroext %4) {"}};
+  for (const auto &line : lines)
+    EXPECT_EQ(first_line(function(ir, line[0])), line[1]) << line[0];
+}
+
+TEST(CodegenAbiLinuxTest, PiecesAreStoredAndRebuiltThroughMemory) {
+  std::string ir = generate(linux_abi_source, TARGET_LINUX_X64);
+  expect_lines(function(ir, "r12"),
+               {"store i64 %0, ptr %x.0, align 4",
+                "%2 = getelementptr inbounds i8, ptr %x.0, i64 8", "store i32 %1, ptr %2, align 4",
+                "%3 = load i64, ptr %x.0, align 4", "%5 = load i32, ptr %4, align 4",
+                "%6 = insertvalue { i64, i32 } poison, i64 %3, 0",
+                "%7 = insertvalue { i64, i32 } %6, i32 %5, 1", "ret { i64, i32 } %7"});
+  expect_lines(function(ir, "use"),
+               {"%6 = call { i64, i32 } (i64, i32) @r12(i64 %3, i32 %5)",
+                "%7 = extractvalue { i64, i32 } %6, 0", "store i64 %7, ptr %tmp.2, align 4",
+                "%8 = extractvalue { i64, i32 } %6, 1", "store i32 %8, ptr %9, align 4",
+                "%14 = load i64, ptr %13, align 8", "%16 = load double, ptr %15, align 8",
+                "%21 = call double (i64, double, i64, i32) @take(i64 %14, double %16, i64 %18, "
+                "i32 %20)"});
+  EXPECT_TRUE(has_line(ir, "declare double @take(i64, double, i64, i32)")) << ir;
+}
+
+TEST(CodegenAbiLinuxTest, ARecordThatDoesNotFitTheRegistersLeftGoesInMemory) {
+  std::string ir = generate(linux_abi_source, TARGET_LINUX_X64);
+  EXPECT_EQ(first_line(function(ir, "spill")),
+            "define i32 @spill(i32 %0, i32 %1, i32 %2, i32 %3, i32 %4, ptr byval([16 x i8]) align "
+            "8 %5, i32 %6) {");
+  expect_lines(
+      function(ir, "callspill"),
+      {"%2 = call i32 (i32, i32, i32, i32, i32, ptr, i32) @spill(i32 1, i32 2, i32 3, i32 4, "
+       "i32 5, ptr byval([16 x i8]) align 8 %1, i32 6)"});
+  std::string fits = generate("struct s16 { long long a, b; };\n"
+                              "int g(int a, int b, int c, int d, struct s16 f) { return a; }\n",
+                              TARGET_LINUX_X64);
+  EXPECT_EQ(first_line(function(fits, "g")),
+            "define i32 @g(i32 %0, i32 %1, i32 %2, i32 %3, i64 %4, i64 %5) {");
+  std::string returned = generate("struct s24 { long long a, b, c; };\n"
+                                  "struct s16 { long long a, b; };\n"
+                                  "int g(struct s24 r, int a, int b, int c, int d,\n"
+                                  "  struct s16 f) { return a; }\n"
+                                  "struct s24 h(int a, int b, int c, int d, struct s16 f) {\n"
+                                  "  struct s24 r = {0}; return r; }\n",
+                                  TARGET_LINUX_X64);
+  EXPECT_EQ(first_line(function(returned, "g")),
+            "define i32 @g(ptr byval([24 x i8]) align 8 %0, i32 %1, i32 %2, i32 %3, i32 %4, i64 "
+            "%5, i64 %6) {")
+      << "a record in memory takes no register";
+  EXPECT_EQ(first_line(function(returned, "h")),
+            "define void @h(ptr sret([24 x i8]) align 8 %0, i32 %1, i32 %2, i32 %3, i32 %4, "
+            "ptr byval([16 x i8]) align 8 %5) {")
+      << "the result's hidden pointer takes one";
+}
+
+static const char *linux_register_source =
+    "struct s12 { int a, b, c; };\n"
+    "struct s16 { long long a, b; };\n"
+    "struct s24 { long long a, b, c; };\n"
+    "struct d2 { double a, b; };\n"
+    "struct unnamed { float a; int : 32; };\n"
+    "union lu { long double l; double d[2]; };\n"
+    "union ll { long double l; long long x; };\n"
+    "struct __attribute__((aligned(16))) aligned { long long a, b; };\n"
+    "struct unnamed run(struct unnamed x) { return x; }\n"
+    "union lu rlu(union lu x) { return x; }\n"
+    "union ll rll(union ll x) { return x; }\n"
+    "struct aligned ral(struct aligned x) { return x; }\n"
+    "long long four(struct s16 a, struct s16 b, struct s16 c, struct s16 d) { return a.a; }\n"
+    "double five(struct d2 a, struct d2 b, struct d2 c, struct d2 d, struct d2 e) { return a.a; }\n"
+    "struct s12 none(void) { }\n"
+    "struct s24 hidden_spill(int a, int b, int c, int d, struct s16 f);\n"
+    "long long callh(struct s16 *f) { return hidden_spill(1, 2, 3, 4, *f).c; }\n";
+
+TEST(CodegenAbiLinuxTest, UnionsWithLongDoubleAndUnnamedBitFieldsFollowGcc) {
+  std::string ir = generate(linux_register_source, TARGET_LINUX_X64);
+  EXPECT_EQ(first_line(function(ir, "run")), "define i64 @run(i64 %0) {")
+      << "GCC counts an unnamed bit-field, so the eightbyte is INTEGER";
+  EXPECT_EQ(
+      first_line(function(ir, "rlu")),
+      "define void @rlu(ptr sret([16 x i8]) align 16 %0, ptr byval([16 x i8]) align 16 %1) {");
+  EXPECT_EQ(
+      first_line(function(ir, "rll")),
+      "define void @rll(ptr sret([16 x i8]) align 16 %0, ptr byval([16 x i8]) align 16 %1) {");
+  std::string ral = function(ir, "ral");
+  EXPECT_EQ(first_line(ral), "define { i64, i64 } @ral(i64 %0, i64 %1) {");
+  expect_lines(ral, {"store i64 %0, ptr %x.0, align 16", "store i64 %1, ptr %2, align 8",
+                     "%3 = load i64, ptr %x.0, align 16", "%5 = load i64, ptr %4, align 8"});
+}
+
+TEST(CodegenAbiLinuxTest, EachRecordTakesTheRegistersItNeedsUntilTheyRunOut) {
+  std::string ir = generate(linux_register_source, TARGET_LINUX_X64);
+  EXPECT_EQ(first_line(function(ir, "four")),
+            "define i64 @four(i64 %0, i64 %1, i64 %2, i64 %3, i64 %4, i64 %5, ptr byval([16 x i8]) "
+            "align 8 %6) {");
+  EXPECT_EQ(first_line(function(ir, "five")),
+            "define double @five(double %0, double %1, double %2, double %3, double %4, double %5, "
+            "double %6, double %7, ptr byval([16 x i8]) align 8 %8) {");
+  expect_lines(function(ir, "callh"),
+               {"call void (ptr, i32, i32, i32, i32, ptr) @hidden_spill(ptr sret([24 x i8]) "
+                "align 8 %tmp.1, i32 1, i32 2, i32 3, i32 4, ptr byval([16 x i8]) align 8 %1)"});
+  EXPECT_TRUE(has_line(ir, "declare void @hidden_spill(ptr sret([24 x i8]) align 8, i32, i32, i32, "
+                           "i32, ptr byval([16 x i8]) align 8)"))
+      << ir;
+  expect_lines(function(ir, "none"), {"ret { i64, i32 } poison"});
+}
+
+TEST(CodegenAbiWindowsTest, DeclarationsAndFallingOffTheEndUseTheSameLowering) {
+  std::string ir = generate("struct s12 { int a, b, c; };\n"
+                            "extern struct s12 ext(struct s12, long double, _Bool);\n"
+                            "int use(struct s12 *p) { return ext(*p, 1.0L, 1).a; }\n"
+                            "struct s12 none(void) { }\n");
+  expect_lines(
+      function(ir, "use"),
+      {"call void @llvm.memcpy.p0.p0.i64(ptr align 4 %tmp.2, ptr align 4 %1, i64 12, i1 "
+       "false)",
+       "call void (ptr, ptr, ptr, i8) @ext(ptr sret([12 x i8]) align 4 %tmp.1, ptr %tmp.2, "
+       "ptr %tmp.3, i8 zeroext %3)"});
+  EXPECT_TRUE(has_line(ir, "declare void @ext(ptr sret([12 x i8]) align 4, ptr, ptr, i8 zeroext)"))
+      << ir;
+  std::string none = function(ir, "none");
+  EXPECT_EQ(first_line(none), "define void @none(ptr sret([12 x i8]) align 4 %0) {");
+  expect_lines(none, {"ret void"});
+}
+
+TEST(CodegenVariadicTest, WindowsVaArgStepsEightBytesAndFollowsPointers) {
+  std::string body =
+      function(generate("#include <stdarg.h>\n"
+                        "struct s12 { int a, b, c; };\n"
+                        "double f(int n, ...) { va_list ap, aq; va_start(ap, n); va_copy(aq, ap);\n"
+                        "  int i = va_arg(ap, int); struct s12 s = va_arg(ap, struct s12);\n"
+                        "  long double l = va_arg(ap, long double); va_end(aq); va_end(ap);\n"
+                        "  return i + s.c + (double)l; }\n",
+                        TARGET_WINDOWS_X64, true),
+               "f");
+  EXPECT_EQ(first_line(body), "define double @f(i32 %0, ...) {");
+  expect_lines(body,
+               {"call void @llvm.va_start.p0(ptr %ap.1)", "%1 = load ptr, ptr %ap.1, align 8",
+                "store ptr %1, ptr %aq.2, align 8", "%2 = load ptr, ptr %ap.1, align 8",
+                "%3 = getelementptr inbounds i8, ptr %2, i64 8", "store ptr %3, ptr %ap.1, align 8",
+                "%4 = load i32, ptr %2, align 4", "%6 = getelementptr inbounds i8, ptr %5, i64 8",
+                "%7 = load ptr, ptr %5, align 8",
+                "call void @llvm.memcpy.p0.p0.i64(ptr align 4 %s.4, ptr align 4 %7, i64 12, i1 "
+                "false)",
+                "%10 = load ptr, ptr %8, align 8", "%11 = load x86_fp80, ptr %10, align 16",
+                "call void @llvm.va_end.p0(ptr %aq.2)", "call void @llvm.va_end.p0(ptr %ap.1)"});
+  std::string declared =
+      generate("#include <stdarg.h>\n"
+               "int f(int n, ...) { va_list ap, aq; va_start(ap, n); va_copy(aq, ap); va_end(ap);\n"
+               "  return n; }\n",
+               TARGET_LINUX_X64, true);
+  for (const char *line :
+       {"declare void @llvm.va_start.p0(ptr)", "declare void @llvm.va_end.p0(ptr)",
+        "declare void @llvm.va_copy.p0(ptr, ptr)"})
+    EXPECT_EQ(count(declared, std::string("\n") + line + "\n"), 1) << line << "\n" << declared;
+}
+
+TEST(CodegenVariadicTest, SystemVVaArgChecksTheRegisterAreasItNeeds) {
+  std::string body = function(
+      generate("#include <stdarg.h>\n"
+               "struct s12 { int a, b, c; };\n"
+               "struct mix { int a; double b; };\n"
+               "struct d2 { double a, b; };\n"
+               "double f(int n, ...) { va_list ap, aq; va_start(ap, n); va_copy(aq, ap);\n"
+               "  int i = va_arg(ap, int); double d = va_arg(ap, double);\n"
+               "  struct s12 s = va_arg(ap, struct s12); struct mix m = va_arg(ap, struct mix);\n"
+               "  struct d2 e = va_arg(ap, struct d2); long double l = va_arg(ap, long double);\n"
+               "  va_end(ap); return i + d + s.c + m.b + e.b + (double)l; }\n",
+               TARGET_LINUX_X64, true),
+      "f");
+  expect_lines(body, {"call void @llvm.va_start.p0(ptr %ap.1)",
+                      "call void @llvm.va_copy.p0(ptr %aq.2, ptr %ap.1)",
+                      "%1 = load i32, ptr %ap.1, align 4",
+                      "%2 = icmp ule i32 %1, 40",
+                      "br i1 %2, label %va.reg.4, label %va.mem.5",
+                      "va.reg.4:",
+                      "%3 = getelementptr inbounds i8, ptr %ap.1, i64 16",
+                      "%5 = getelementptr i8, ptr %4, i32 %1",
+                      "%6 = add i32 %1, 8",
+                      "store i32 %6, ptr %ap.1, align 4",
+                      "va.mem.5:",
+                      "%7 = getelementptr inbounds i8, ptr %ap.1, i64 8",
+                      "%9 = getelementptr i8, ptr %8, i64 8",
+                      "store ptr %9, ptr %7, align 8",
+                      "va.end.6:",
+                      "%10 = phi ptr [ %5, %va.reg.4 ], [ %8, %va.mem.5 ]",
+                      "%14 = icmp ule i32 %13, 160",
+                      "%18 = add i32 %13, 16",
+                      "%26 = icmp ule i32 %25, 32",
+                      "%30 = add i32 %25, 16",
+                      "%33 = getelementptr i8, ptr %32, i64 16",
+                      "%40 = and i1 %36, %39",
+                      "%44 = load i64, ptr %43, align 8",
+                      "store i64 %44, ptr %tmp.19, align 8",
+                      "%46 = load double, ptr %45, align 8",
+                      "store double %46, ptr %47, align 8",
+                      "%48 = add i32 %35, 8",
+                      "%49 = add i32 %38, 16",
+                      "%54 = phi ptr [ %tmp.19, %va.reg.16 ], [ %52, %va.mem.17 ]"});
+  expect_lines(body,
+               {"%57 = icmp ule i32 %56, 144", "%60 = getelementptr i8, ptr %59, i32 %56",
+                "%61 = load double, ptr %60, align 8", "store double %61, ptr %tmp.24, align 8",
+                "%63 = getelementptr inbounds i8, ptr %62, i64 16",
+                "%64 = load double, ptr %63, align 8",
+                "%65 = getelementptr inbounds i8, ptr %tmp.24, i64 8", "%66 = add i32 %56, 32"});
+  expect_lines(body,
+               {"%74 = ptrtoint ptr %73 to i64", "%75 = add i64 %74, 15", "%76 = and i64 %75, -16",
+                "%77 = inttoptr i64 %76 to ptr", "%78 = getelementptr i8, ptr %77, i64 16",
+                "%79 = load x86_fp80, ptr %77, align 16"});
+}
+
+TEST(CodegenModuleTest, UnusedInternalFunctionsAreLeftOut) {
+  std::string ir = generate("static int leaf(void) { return 1; }\n"
+                            "static int middle(void) { return leaf(); }\n"
+                            "static int unused(void) { return middle(); }\n"
+                            "static int lonely(void) { return 2; }\n"
+                            "static int only_from_unused(void) { return 3; }\n"
+                            "static int dead_end(void) { return only_from_unused(); }\n"
+                            "static int pointed(void) { return 4; }\n"
+                            "int (*table[1])(void) = {pointed};\n"
+                            "int api(void) { return middle(); }\n");
+  for (const char *kept : {"leaf", "middle", "pointed", "api"})
+    EXPECT_NE(function(ir, kept), "") << kept << "\n" << ir;
+  for (const char *dropped : {"unused", "lonely", "only_from_unused", "dead_end"})
+    EXPECT_EQ(function(ir, dropped), "") << dropped << "\n" << ir;
+  EXPECT_LT(ir.find("define internal i32 @leaf"), ir.find("define internal i32 @middle"))
+      << "kept functions stay in source order";
+}
+
 static std::string read_file(const std::string &path) {
   std::ifstream in(path, std::ios::binary);
   std::stringstream text;
@@ -1816,8 +2161,83 @@ INSTANTIATE_TEST_SUITE_P(
         ProgramCase{"complex", TARGET_WINDOWS_X64}, ProgramCase{"complex", TARGET_LINUX_X64},
         ProgramCase{"builtins", TARGET_WINDOWS_X64}, ProgramCase{"builtins", TARGET_LINUX_X64},
         ProgramCase{"asm", TARGET_WINDOWS_X64}, ProgramCase{"asm", TARGET_LINUX_X64},
-        ProgramCase{"setjmp", TARGET_WINDOWS_X64}, ProgramCase{"setjmp", TARGET_LINUX_X64}),
+        ProgramCase{"setjmp", TARGET_WINDOWS_X64}, ProgramCase{"setjmp", TARGET_LINUX_X64},
+        ProgramCase{"stdio", TARGET_WINDOWS_X64}, ProgramCase{"stdio", TARGET_LINUX_X64}),
     [](const testing::TestParamInfo<ProgramCase> &info) {
       return std::string(info.param.name) +
              (info.param.kind == TARGET_WINDOWS_X64 ? "Windows" : "Linux");
+    });
+
+static std::string wsl_path(const std::string &path) {
+  if (path.size() < 2 || path[1] != ':')
+    return path;
+  return std::string("/mnt/") + (char)tolower((unsigned char)path[0]) + path.substr(2);
+}
+
+struct AbiCase {
+  target_kind kind;
+  bool ours_caller;
+  bool ours_callee;
+};
+
+class CodegenAbiTest : public testing::TestWithParam<AbiCase> {};
+
+TEST_P(CodegenAbiTest, LinksWithGccAndMatchesItsOutput) {
+  AbiCase test = GetParam();
+  bool windows = test.kind == TARGET_WINDOWS_X64;
+  std::string dir = std::string(CODEGEN_PROGRAMS_DIR) + "/abi";
+  std::string base = std::string("codegen_abi_") + (windows ? "windows" : "linux") +
+                     (test.ours_caller ? "_ours" : "_gcc") + (test.ours_callee ? "_ours" : "_gcc");
+  std::string triple = windows ? "x86_64-w64-windows-gnu" : "x86_64-pc-linux-gnu";
+  std::string gcc = std::string(GCC_PATH);
+  std::string bin = gcc.substr(0, gcc.find_last_of("/\\"));
+  std::string old_path = getenv("PATH") ? getenv("PATH") : "";
+  if (windows)
+    _putenv_s("PATH", (bin + ";" + old_path).c_str());
+  std::string objects;
+  for (const char *half : {"caller", "callee"}) {
+    bool ours = std::string(half) == "caller" ? test.ours_caller : test.ours_callee;
+    std::string path = dir + "/" + half + ".c";
+    std::string object = base + "_" + half + ".o";
+    if (ours) {
+      std::string ir = generate(nullptr, test.kind, true, path.c_str());
+      {
+        std::ofstream out(base + "_" + half + ".ll", std::ios::binary);
+        out << ir;
+      }
+      ASSERT_EQ(run("\"" CLANG_PATH "\" -c -Wno-override-module --target=" + triple + " " + base +
+                    "_" + half + ".ll -o " + object),
+                0)
+          << ir;
+    } else if (windows) {
+      ASSERT_EQ(run("\"" + gcc + "\" -std=c99 -w -c \"" + path + "\" -o " + object), 0);
+    } else {
+      ASSERT_EQ(run("wsl gcc -std=c99 -w -c '" + wsl_path(path) + "' -o " + object), 0);
+    }
+    objects += " " + object;
+  }
+  int status;
+  if (windows) {
+    ASSERT_EQ(run("\"" + gcc + "\"" + objects + " -o " + base + ".exe"), 0);
+    status = run(".\\" + base + ".exe > " + base + ".txt");
+    _putenv_s("PATH", old_path.c_str());
+  } else {
+    ASSERT_EQ(run("wsl gcc" + objects + " -o " + base), 0);
+    status = run("wsl ./" + base + " > " + base + ".txt");
+  }
+  std::string actual = read_file(base + ".txt") + "exit " + std::to_string(status) + "\n";
+  std::string expected = read_file(dir + (windows ? "/abi.windows.txt" : "/abi.linux.txt"));
+  EXPECT_EQ(actual, expected);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    BothTargets, CodegenAbiTest,
+    testing::Values(AbiCase{TARGET_WINDOWS_X64, true, false},
+                    AbiCase{TARGET_WINDOWS_X64, false, true},
+                    AbiCase{TARGET_WINDOWS_X64, true, true}, AbiCase{TARGET_LINUX_X64, true, false},
+                    AbiCase{TARGET_LINUX_X64, false, true}, AbiCase{TARGET_LINUX_X64, true, true}),
+    [](const testing::TestParamInfo<AbiCase> &info) {
+      return std::string(info.param.kind == TARGET_WINDOWS_X64 ? "Windows" : "Linux") +
+             (info.param.ours_caller ? "OurCaller" : "GccCaller") +
+             (info.param.ours_callee ? "OurCallee" : "GccCallee");
     });

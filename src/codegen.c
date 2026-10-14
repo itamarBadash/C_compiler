@@ -42,6 +42,26 @@ typedef struct relocation {
   const char *target;
 } relocation;
 
+typedef enum pass_kind { PASS_DIRECT, PASS_PIECES, PASS_POINTER, PASS_MEMORY } pass_kind;
+
+typedef struct passing {
+  pass_kind kind;
+  const char *pieces[2];
+  int piece_count;
+  const char *extension;
+} passing;
+
+typedef struct function_span {
+  symbol *sym;
+  size_t start;
+  size_t end;
+} function_span;
+
+typedef struct function_use {
+  symbol *from;
+  symbol *to;
+} function_use;
+
 typedef struct codegen {
   text globals;
   text functions;
@@ -80,6 +100,13 @@ typedef struct codegen {
   int vla_count;
   vla_size *sizes;
   int size_count;
+  symbol *current_function;
+  passing result;
+  const char *result_slot;
+  function_span *spans;
+  int span_count;
+  function_use *uses;
+  int use_count;
 } codegen;
 
 static const char *compound_global(codegen *cg, ast_node *node);
@@ -189,6 +216,8 @@ static void free_codegen(codegen *cg) {
   free(cg->vla_decls);
   free(cg->vla_saved);
   free(cg->sizes);
+  free(cg->spans);
+  free(cg->uses);
 }
 
 static type_info *resolved(type_info *type) {
@@ -973,8 +1002,23 @@ static const char *function_name_global(codegen *cg) {
   return name;
 }
 
+static void note_use(codegen *cg, symbol *sym) {
+  if (sym->kind != SYMBOL_FUNC || sym->linkage != LINKAGE_INTERNAL)
+    return;
+  function_use *grown =
+      (function_use *)realloc(cg->uses, sizeof(function_use) * (size_t)(cg->use_count + 1));
+  if (!grown) {
+    cg->failed = 1;
+    return;
+  }
+  cg->uses = grown;
+  grown[cg->use_count].from = cg->current_function;
+  grown[cg->use_count++].to = sym;
+}
+
 static const char *symbol_address(codegen *cg, symbol *sym) {
   if (sym->kind == SYMBOL_FUNC || sym->linkage != LINKAGE_NONE) {
+    note_use(cg, sym);
     note_reference(cg, sym);
     return global_name(cg, sym);
   }
@@ -1427,20 +1471,312 @@ static const char *cast_value(codegen *cg, ast_node *node) {
   return convert(cg, v, operand->expr_type, node->expr_type);
 }
 
+enum { CLASS_NONE, CLASS_INTEGER, CLASS_SSE, CLASS_X87, CLASS_X87UP, CLASS_MEMORY };
+
+static int merge_class(int a, int b) {
+  if (a == b || b == CLASS_NONE)
+    return a;
+  if (a == CLASS_NONE)
+    return b;
+  if (a == CLASS_MEMORY || b == CLASS_MEMORY)
+    return CLASS_MEMORY;
+  if (a == CLASS_INTEGER || b == CLASS_INTEGER)
+    return CLASS_INTEGER;
+  if (a == CLASS_X87 || a == CLASS_X87UP || b == CLASS_X87 || b == CLASS_X87UP)
+    return CLASS_MEMORY;
+  return CLASS_SSE;
+}
+
+static void classify_eightbytes(type_info *type, long long offset, int classes[2]);
+
+static void classify_member(ast_node *member, long long offset, int classes[2]) {
+  if (member->type != AST_NODE_TYPE_VAR_DECL)
+    return;
+  if (!member->var_decl.bitfield_width) {
+    classify_eightbytes(member->var_decl.type, offset + member->var_decl.offset, classes);
+    return;
+  }
+  if (!member->var_decl.bit_width)
+    return;
+  long long first = (offset + member->var_decl.offset) * 8 + member->var_decl.bit_offset;
+  long long last = first + member->var_decl.bit_width - 1;
+  for (long long i = first / 64; i <= last / 64 && i < 2; i++)
+    classes[i] = merge_class(classes[i], CLASS_INTEGER);
+}
+
+static void classify_eightbytes(type_info *type, long long offset, int classes[2]) {
+  type_info *t = resolved(type);
+  if (t->kind == TYPE_ARRAY) {
+    long long element = size_of(t->ptr_to);
+    for (long long i = 0; i < t->array_size && element > 0; i++)
+      classify_eightbytes(t->ptr_to, offset + i * element, classes);
+    return;
+  }
+  if (offset % alignment_of(t)) {
+    classes[0] = classes[1] = CLASS_MEMORY;
+    return;
+  }
+  if (is_aggregate(t)) {
+    ast_node *def = t->symbol->definition;
+    for (int i = 0; i < def->struct_def.member_count; i++) {
+      ast_node *item = def->struct_def.members[i];
+      int group = item->type == AST_NODE_TYPE_DECL_GROUP;
+      for (int j = 0; j < (group ? item->block.count : 1); j++)
+        classify_member(group ? item->block.statements[j] : item, offset, classes);
+    }
+    return;
+  }
+  if (is_complex(t)) {
+    type_info *part = complex_part(t);
+    classify_eightbytes(part, offset, classes);
+    classify_eightbytes(part, offset + size_of(part), classes);
+    return;
+  }
+  int index = (int)(offset / 8);
+  if (is_floating(t) && t->prim == PRIM_LDOUBLE) {
+    classes[index] = merge_class(classes[index], CLASS_X87);
+    if (index == 0)
+      classes[1] = merge_class(classes[1], CLASS_X87UP);
+    return;
+  }
+  classes[index] = merge_class(classes[index], is_floating(t) ? CLASS_SSE : CLASS_INTEGER);
+}
+
+static int classify_system_v(type_info *type, int classes[2]) {
+  classes[0] = classes[1] = CLASS_NONE;
+  if (size_of(type) > 16)
+    return 0;
+  classify_eightbytes(type, 0, classes);
+  if (classes[0] == CLASS_MEMORY || classes[1] == CLASS_MEMORY)
+    return 0;
+  return (classes[0] == CLASS_X87) == (classes[1] == CLASS_X87UP);
+}
+
+static passing pieces_of(codegen *cg, type_info *type, int classes[2]) {
+  passing p = {PASS_PIECES, {NULL, NULL}, 0, ""};
+  long long size = size_of(type);
+  for (int i = 0; i < 2 && classes[i] != CLASS_X87UP; i++) {
+    long long bytes = size - 8 * i < 8 ? size - 8 * i : 8;
+    if (classes[i] == CLASS_NONE || bytes <= 0)
+      continue;
+    if (classes[i] == CLASS_X87)
+      p.pieces[p.piece_count++] = "x86_fp80";
+    else if (classes[i] == CLASS_SSE)
+      p.pieces[p.piece_count++] = bytes <= 4 ? "float" : "double";
+    else
+      p.pieces[p.piece_count++] = formatted(cg, "i%lld", bytes * 8);
+  }
+  return p;
+}
+
+static const char *extension_of(type_info *type) {
+  prim_kind prim = integer_kind(type);
+  if (prim == PRIM_BOOL)
+    return "zeroext";
+  if (target_current()->windows_abi)
+    return "";
+  if (prim == PRIM_CHAR || prim == PRIM_SCHAR || prim == PRIM_SHORT)
+    return "signext";
+  if (prim == PRIM_UCHAR || prim == PRIM_USHORT)
+    return "zeroext";
+  return "";
+}
+
+static const char *with_extension(codegen *cg, const char *type, const char *extension,
+                                  int result) {
+  if (!*extension)
+    return type;
+  if (result)
+    return formatted(cg, "%s %s", extension, type);
+  return formatted(cg, "%s %s", type, extension);
+}
+
+static int is_long_double(type_info *type) {
+  type_info *t = resolved(type);
+  return is_floating(t) && t->prim == PRIM_LDOUBLE;
+}
+
+static passing pass_windows(codegen *cg, type_info *type) {
+  passing p = {PASS_DIRECT, {NULL, NULL}, 0, extension_of(type)};
+  if (!is_aggregate(type) && !is_complex(type) && !is_long_double(type))
+    return p;
+  long long size = size_of(type);
+  if (size == 1 || size == 2 || size == 4 || size == 8) {
+    p.kind = PASS_PIECES;
+    p.pieces[p.piece_count++] = formatted(cg, "i%lld", size * 8);
+    return p;
+  }
+  p.kind = PASS_POINTER;
+  return p;
+}
+
+static passing pass_argument(codegen *cg, type_info *type, int *ints, int *sses) {
+  passing p = {PASS_DIRECT, {NULL, NULL}, 0, extension_of(type)};
+  if (target_current()->windows_abi)
+    return pass_windows(cg, type);
+  if (!is_aggregate(type) && !is_complex(type)) {
+    int *registers = is_floating(type) ? sses : ints;
+    if (!is_long_double(type) && *registers > 0)
+      (*registers)--;
+    return p;
+  }
+  int classes[2];
+  if (!classify_system_v(type, classes) || classes[0] == CLASS_X87) {
+    p.kind = PASS_MEMORY;
+    return p;
+  }
+  passing pieces = pieces_of(cg, type, classes);
+  int need_int = 0;
+  int need_sse = 0;
+  for (int i = 0; i < pieces.piece_count; i++) {
+    if (pieces.pieces[i][0] == 'i')
+      need_int++;
+    else
+      need_sse++;
+  }
+  if (need_int > *ints || need_sse > *sses) {
+    p.kind = PASS_MEMORY;
+    return p;
+  }
+  *ints -= need_int;
+  *sses -= need_sse;
+  return pieces;
+}
+
+static passing pass_result(codegen *cg, type_info *type) {
+  passing p = {PASS_DIRECT, {NULL, NULL}, 0, extension_of(type)};
+  if (target_current()->windows_abi)
+    return pass_windows(cg, type);
+  if (!is_aggregate(type) && !is_complex(type))
+    return p;
+  if (is_complex(type) && is_long_double(complex_part(type)))
+    return p;
+  int classes[2];
+  if (!classify_system_v(type, classes)) {
+    p.kind = PASS_POINTER;
+    return p;
+  }
+  return pieces_of(cg, type, classes);
+}
+
+static const char *piece_type(codegen *cg, passing p) {
+  if (p.piece_count == 1)
+    return p.pieces[0];
+  return formatted(cg, "{ %s, %s }", p.pieces[0], p.pieces[1]);
+}
+
+static const char *result_type(codegen *cg, type_info *type, passing r) {
+  if (r.kind == PASS_POINTER)
+    return "void";
+  if (r.kind == PASS_PIECES)
+    return piece_type(cg, r);
+  return llvm_type(cg, type);
+}
+
+static const char *memory_parameter(codegen *cg, type_info *type, const char *attribute) {
+  int alignment = alignment_of(type);
+  if (strcmp(attribute, "byval") == 0 && alignment < 8)
+    alignment = 8;
+  return formatted(cg, "ptr %s(%s) align %d", attribute, llvm_type(cg, type), alignment);
+}
+
+static const char *lowered_parameter(codegen *cg, type_info *type, passing p, int *next) {
+  const char *out = "";
+  int count = p.kind == PASS_PIECES ? p.piece_count : 1;
+  for (int i = 0; i < count; i++) {
+    const char *piece = p.kind == PASS_PIECES    ? p.pieces[i]
+                        : p.kind == PASS_POINTER ? "ptr"
+                        : p.kind == PASS_MEMORY
+                            ? memory_parameter(cg, type, "byval")
+                            : with_extension(cg, parameter_type(cg, type), p.extension, 0);
+    if (next)
+      piece = formatted(cg, "%s %%%d", piece, (*next)++);
+    out = joined(cg, out, ", ", piece);
+  }
+  return out;
+}
+
+static const char *temporary(codegen *cg, type_info *type) {
+  const char *slot = formatted(cg, "%%tmp.%d", cg->next_name++);
+  append(cg, &cg->allocas, "  %s = alloca %s, align %d\n", slot, llvm_type(cg, type),
+         alignment_of(type));
+  return slot;
+}
+
+static const char *in_memory(codegen *cg, type_info *type, const char *v) {
+  if (is_aggregate(type))
+    return v;
+  const char *slot = temporary(cg, type);
+  store(cg, type, v, slot);
+  return slot;
+}
+
+static int piece_alignment(type_info *type, int index) {
+  int alignment = alignment_of(type);
+  return index && alignment > 8 ? 8 : alignment;
+}
+
+static const char *load_piece(codegen *cg, type_info *type, passing p, const char *address,
+                              int index) {
+  const char *at = byte_address(cg, address, 8 * index);
+  return compute(cg, "load %s, ptr %s, align %d", p.pieces[index], at,
+                 piece_alignment(type, index));
+}
+
+static void store_piece(codegen *cg, type_info *type, passing p, const char *v, const char *address,
+                        int index) {
+  const char *at = byte_address(cg, address, 8 * index);
+  instruction(cg, "store %s %s, ptr %s, align %d", p.pieces[index], v, at,
+              piece_alignment(type, index));
+}
+
 static const char *emit_call(codegen *cg, ast_node *callable, ast_node **args, int count) {
   type_info *fn = resolved(resolved(callable->expr_type)->ptr_to);
+  type_info *result = fn->ptr_to;
   const char *callee = value(cg, callable);
+  passing r = pass_result(cg, result);
+  int ints = 6;
+  int sses = 8;
   const char *signature = "";
   const char *arguments = "";
+  const char *slot = NULL;
+  if (r.kind == PASS_POINTER) {
+    slot = temporary(cg, result);
+    signature = "ptr";
+    arguments = formatted(cg, "%s %s", memory_parameter(cg, result, "sret"), slot);
+    ints--;
+  }
   for (int i = 0; i < count; i++) {
+    type_info *type = args[i]->expr_type;
     const char *v = value(cg, args[i]);
-    const char *type = llvm_type(cg, args[i]->expr_type);
-    arguments = formatted(cg, "%s%s%s %s", arguments, i ? ", " : "", type, v);
+    passing p = pass_argument(cg, type, &ints, &sses);
+    const char *types = "";
+    const char *values = "";
+    if (p.kind == PASS_DIRECT) {
+      types = llvm_type(cg, type);
+      values = formatted(cg, "%s %s", with_extension(cg, types, p.extension, 0), v);
+    } else if (p.kind == PASS_PIECES) {
+      const char *address = in_memory(cg, type, v);
+      for (int k = 0; k < p.piece_count; k++) {
+        const char *piece = load_piece(cg, type, p, address, k);
+        types = joined(cg, types, ", ", p.pieces[k]);
+        values = joined(cg, values, ", ", formatted(cg, "%s %s", p.pieces[k], piece));
+      }
+    } else if (p.kind == PASS_POINTER) {
+      const char *copy = temporary(cg, type);
+      store(cg, type, v, copy);
+      types = "ptr";
+      values = formatted(cg, "ptr %s", copy);
+    } else {
+      types = "ptr";
+      values = formatted(cg, "%s %s", memory_parameter(cg, type, "byval"), in_memory(cg, type, v));
+    }
+    arguments = joined(cg, arguments, ", ", values);
     if (!fn->has_prototype || i < fn->param_count)
-      signature = formatted(cg, "%s%s%s", signature, i ? ", " : "", type);
+      signature = joined(cg, signature, ", ", types);
   }
   if (fn->has_prototype && fn->is_variadic)
-    signature = formatted(cg, "%s%s...", signature, fn->param_count ? ", " : "");
+    signature = joined(cg, signature, ", ", "...");
   ast_node *target = callable;
   while (target->type == AST_NODE_TYPE_CONVERSION)
     target = target->conversion.operand;
@@ -1449,12 +1785,31 @@ static const char *emit_call(codegen *cg, ast_node *callable, ast_node **args, i
     attributes = " #0";
     cg->uses_returns_twice = 1;
   }
-  const char *result = llvm_type(cg, fn->ptr_to);
-  if (is_void(fn->ptr_to)) {
-    instruction(cg, "call void (%s) %s(%s)%s", signature, callee, arguments, attributes);
+  const char *returned = result_type(cg, result, r);
+  const char *call =
+      formatted(cg, "call %s (%s) %s(%s)%s", with_extension(cg, returned, r.extension, 1),
+                signature, callee, arguments, attributes);
+  if (r.kind == PASS_POINTER) {
+    instruction(cg, "%s", call);
+    return load(cg, result, slot);
+  }
+  if (is_void(result)) {
+    instruction(cg, "%s", call);
     return "";
   }
-  return compute(cg, "call %s (%s) %s(%s)%s", result, signature, callee, arguments, attributes);
+  const char *v = compute(cg, "%s", call);
+  if (r.kind == PASS_DIRECT)
+    return v;
+  slot = temporary(cg, result);
+  if (r.piece_count == 1) {
+    store_piece(cg, result, r, v, slot, 0);
+  } else {
+    for (int k = 0; k < r.piece_count; k++) {
+      const char *piece = compute(cg, "extractvalue %s %s, %d", returned, v, k);
+      store_piece(cg, result, r, piece, slot, k);
+    }
+  }
+  return load(cg, result, slot);
 }
 
 static const char *call_value(codegen *cg, ast_node *node) {
@@ -1492,6 +1847,139 @@ static const char *sign_bit(codegen *cg, ast_node *argument) {
   const char *sign = compute(cg, "lshr i80 %s, 79", bits);
   const char *narrow = compute(cg, "trunc i80 %s to i32", sign);
   return compute(cg, "shl i32 %s, 9", narrow);
+}
+
+static const char *va_list_address(codegen *cg, ast_node *list) {
+  if (target_current()->windows_abi)
+    return address_of(cg, list);
+  return value(cg, list);
+}
+
+static const char *va_arg_windows(codegen *cg, type_info *type, const char *list) {
+  const char *current = compute(cg, "load ptr, ptr %s, align 8", list);
+  const char *next = compute(cg, "getelementptr inbounds i8, ptr %s, i64 8", current);
+  instruction(cg, "store ptr %s, ptr %s, align 8", next, list);
+  if (pass_windows(cg, type).kind == PASS_POINTER)
+    current = compute(cg, "load ptr, ptr %s, align 8", current);
+  return load(cg, type, current);
+}
+
+static const char *va_arg_registers(codegen *cg, type_info *type, passing p, const char *list,
+                                    const char *gp, const char *fp, int need_int, int need_sse) {
+  const char *save_slot = byte_address(cg, list, 16);
+  const char *save = compute(cg, "load ptr, ptr %s, align 8", save_slot);
+  const char *address;
+  if (p.kind == PASS_DIRECT || p.piece_count == 1 || need_sse == 0) {
+    address = compute(cg, "getelementptr i8, ptr %s, i32 %s", save, need_int ? gp : fp);
+  } else {
+    address = temporary(cg, type);
+    int ints = 0;
+    int sses = 0;
+    for (int k = 0; k < p.piece_count; k++) {
+      int integer = p.pieces[k][0] == 'i';
+      const char *base = compute(cg, "getelementptr i8, ptr %s, i32 %s", save, integer ? gp : fp);
+      const char *source = byte_address(cg, base, integer ? 8 * ints++ : 16 * sses++);
+      const char *piece = compute(cg, "load %s, ptr %s, align 8", p.pieces[k], source);
+      store_piece(cg, type, p, piece, address, k);
+    }
+  }
+  if (need_int) {
+    const char *moved = compute(cg, "add i32 %s, %d", gp, 8 * need_int);
+    instruction(cg, "store i32 %s, ptr %s, align 4", moved, list);
+  }
+  if (need_sse) {
+    const char *moved = compute(cg, "add i32 %s, %d", fp, 16 * need_sse);
+    instruction(cg, "store i32 %s, ptr %s, align 4", moved, byte_address(cg, list, 4));
+  }
+  return address;
+}
+
+static const char *va_arg_memory(codegen *cg, type_info *type, const char *list) {
+  const char *overflow_slot = byte_address(cg, list, 8);
+  const char *area = compute(cg, "load ptr, ptr %s, align 8", overflow_slot);
+  if (alignment_of(type) > 8) {
+    const char *bits = compute(cg, "ptrtoint ptr %s to i64", area);
+    const char *raised = compute(cg, "add i64 %s, 15", bits);
+    const char *aligned = compute(cg, "and i64 %s, -16", raised);
+    area = compute(cg, "inttoptr i64 %s to ptr", aligned);
+  }
+  long long size = (size_of(type) + 7) / 8 * 8;
+  const char *next = compute(cg, "getelementptr i8, ptr %s, i64 %lld", area, size);
+  instruction(cg, "store ptr %s, ptr %s, align 8", next, overflow_slot);
+  return area;
+}
+
+static const char *va_arg_system_v(codegen *cg, type_info *type, const char *list) {
+  int ints = 6;
+  int sses = 8;
+  passing p = pass_argument(cg, type, &ints, &sses);
+  int need_int = 6 - ints;
+  int need_sse = 8 - sses;
+  if (p.kind == PASS_MEMORY || (need_int == 0 && need_sse == 0))
+    return load(cg, type, va_arg_memory(cg, type, list));
+  const char *gp = NULL;
+  const char *fp = NULL;
+  const char *fits = NULL;
+  if (need_int) {
+    gp = compute(cg, "load i32, ptr %s, align 4", list);
+    fits = compute(cg, "icmp ule i32 %s, %d", gp, 48 - 8 * need_int);
+  }
+  if (need_sse) {
+    fp = compute(cg, "load i32, ptr %s, align 4", byte_address(cg, list, 4));
+    const char *room = compute(cg, "icmp ule i32 %s, %d", fp, 176 - 16 * need_sse);
+    fits = fits ? compute(cg, "and i1 %s, %s", fits, room) : room;
+  }
+  const char *in_registers = new_label(cg, "va.reg");
+  const char *in_memory_label = new_label(cg, "va.mem");
+  const char *end = new_label(cg, "va.end");
+  branch_if(cg, fits, in_registers, in_memory_label);
+  start_block(cg, in_registers);
+  const char *register_address = va_arg_registers(cg, type, p, list, gp, fp, need_int, need_sse);
+  const char *register_block = cg->block;
+  branch(cg, end);
+  start_block(cg, in_memory_label);
+  const char *memory_address = va_arg_memory(cg, type, list);
+  const char *memory_block = cg->block;
+  branch(cg, end);
+  start_block(cg, end);
+  const char *address = compute(cg, "phi ptr [ %s, %%%s ], [ %s, %%%s ]", register_address,
+                                register_block, memory_address, memory_block);
+  return load(cg, type, address);
+}
+
+static const char *va_builtin(codegen *cg, ast_node *node) {
+  ast_node **args = node->builtin.args;
+  switch (node->builtin.kind) {
+  case BUILTIN_VA_START: {
+    const char *list = va_list_address(cg, args[0]);
+    declare_once(cg, "declare void @llvm.va_start.p0(ptr)");
+    instruction(cg, "call void @llvm.va_start.p0(ptr %s)", list);
+    return "";
+  }
+  case BUILTIN_VA_END: {
+    const char *list = va_list_address(cg, args[0]);
+    declare_once(cg, "declare void @llvm.va_end.p0(ptr)");
+    instruction(cg, "call void @llvm.va_end.p0(ptr %s)", list);
+    return "";
+  }
+  case BUILTIN_VA_COPY: {
+    const char *to = va_list_address(cg, args[0]);
+    const char *from = value(cg, args[1]);
+    if (target_current()->windows_abi) {
+      instruction(cg, "store ptr %s, ptr %s, align 8", from, to);
+      return "";
+    }
+    declare_once(cg, "declare void @llvm.va_copy.p0(ptr, ptr)");
+    instruction(cg, "call void @llvm.va_copy.p0(ptr %s, ptr %s)", to, from);
+    return "";
+  }
+  default: {
+    const char *list = va_list_address(cg, args[0]);
+    if (target_current()->windows_abi)
+      return va_arg_windows(cg, node->expr_type, list);
+    return va_arg_system_v(cg, node->expr_type, list);
+  }
+  }
 }
 
 static const char *builtin_value(codegen *cg, ast_node *node) {
@@ -1540,6 +2028,11 @@ static const char *builtin_value(codegen *cg, ast_node *node) {
     const char *negated = compute(cg, "sub i64 0, %s", v);
     return compute(cg, "select i1 %s, i64 %s, i64 %s", negative, negated, v);
   }
+  case BUILTIN_VA_START:
+  case BUILTIN_VA_END:
+  case BUILTIN_VA_COPY:
+  case BUILTIN_VA_ARG:
+    return va_builtin(cg, node);
   case BUILTIN_TRAP:
     declare_once(cg, "declare void @llvm.trap()");
     instruction(cg, "call void @llvm.trap()");
@@ -1953,8 +2446,27 @@ static void return_statement(codegen *cg, ast_node *node) {
     terminate(cg, "ret void");
     return;
   }
+  type_info *type = result->expr_type;
   const char *v = value(cg, result);
-  terminate(cg, "ret %s %s", llvm_type(cg, result->expr_type), v);
+  passing r = cg->result;
+  if (r.kind == PASS_POINTER) {
+    store(cg, type, v, cg->result_slot);
+    terminate(cg, "ret void");
+    return;
+  }
+  if (r.kind == PASS_DIRECT) {
+    terminate(cg, "ret %s %s", llvm_type(cg, type), v);
+    return;
+  }
+  const char *address = in_memory(cg, type, v);
+  const char *returned = piece_type(cg, r);
+  const char *out = load_piece(cg, type, r, address, 0);
+  if (r.piece_count == 2) {
+    const char *second = load_piece(cg, type, r, address, 1);
+    const char *half = compute(cg, "insertvalue %s poison, %s %s, 0", returned, r.pieces[0], out);
+    out = compute(cg, "insertvalue %s %s, %s %s, 1", returned, half, r.pieces[1], second);
+  }
+  terminate(cg, "ret %s %s", returned, out);
 }
 
 static const char *asm_template(codegen *cg, ast_node *node) {
@@ -2208,9 +2720,26 @@ static void function_definition(codegen *cg, ast_node *fn) {
   type_info *type = fn->function_def.type;
   type_info *result = type->ptr_to;
   int count = type->param_count;
+  passing *passings = (passing *)calloc((size_t)count + 1, sizeof(passing));
+  if (!passings) {
+    cg->failed = 1;
+    return;
+  }
   clear(&cg->allocas);
   clear(&cg->body);
-  cg->next_temp = count;
+  cg->current_function = fn->symbol;
+  cg->result = pass_result(cg, result);
+  cg->result_slot = cg->result.kind == PASS_POINTER ? "%0" : NULL;
+  int ints = cg->result.kind == PASS_POINTER ? 5 : 6;
+  int sses = 8;
+  int lowered = cg->result.kind == PASS_POINTER;
+  for (int i = 0; i < count; i++) {
+    symbol *sym = fn->function_def.param_symbols[i];
+    type_info *passed = type->has_prototype ? sym->type : promoted_parameter(sym->type);
+    passings[i] = pass_argument(cg, passed, &ints, &sses);
+    lowered += passings[i].kind == PASS_PIECES ? passings[i].piece_count : 1;
+  }
+  cg->next_temp = lowered;
   cg->next_name = 0;
   cg->block = "entry";
   cg->terminated = 0;
@@ -2221,32 +2750,57 @@ static void function_definition(codegen *cg, ast_node *fn) {
   cg->function_name_global = NULL;
   scan_labels(cg, fn->function_def.body);
   cg->vla_count = 0;
-  const char *parameters = "";
+  const char *parameters =
+      cg->result_slot ? formatted(cg, "%s %%0", memory_parameter(cg, result, "sret")) : "";
+  int next = cg->result_slot != NULL;
   for (int i = 0; i < count; i++) {
     symbol *sym = fn->function_def.param_symbols[i];
     type_info *passed = type->has_prototype ? sym->type : promoted_parameter(sym->type);
-    parameters = formatted(cg, "%s%s%s %%%d", parameters, i ? ", " : "", llvm_type(cg, passed), i);
+    passing p = passings[i];
+    int first = next;
+    parameters = joined(cg, parameters, ", ", lowered_parameter(cg, passed, p, &next));
     sym->local_slot = cg->next_name++;
     const char *slot = slot_name(cg, sym);
     append(cg, &cg->allocas, "  %s = alloca %s, align %d\n", slot, llvm_type(cg, sym->type),
            alignment_of(sym->type));
-    const char *incoming = convert(cg, formatted(cg, "%%%d", i), passed, sym->type);
-    store(cg, sym->type, incoming, slot);
+    if (p.kind == PASS_DIRECT) {
+      const char *incoming = convert(cg, formatted(cg, "%%%d", first), passed, sym->type);
+      store(cg, sym->type, incoming, slot);
+    } else if (p.kind == PASS_PIECES) {
+      for (int k = 0; k < p.piece_count; k++)
+        store_piece(cg, sym->type, p, formatted(cg, "%%%d", first + k), slot, k);
+    } else {
+      const char *incoming = load(cg, sym->type, formatted(cg, "%%%d", first));
+      store(cg, sym->type, incoming, slot);
+    }
   }
+  free(passings);
   for (int i = 0; i < count; i++)
     evaluate_sizes(cg, type->param_types[i]);
   if (type->is_variadic)
-    parameters = formatted(cg, "%s%s...", parameters, count ? ", " : "");
+    parameters = joined(cg, parameters, ", ", "...");
   statement(cg, fn->function_def.body);
-  if (!cg->terminated && is_void(result))
+  if (!cg->terminated && (is_void(result) || cg->result.kind == PASS_POINTER))
     terminate(cg, "ret void");
   else if (!cg->terminated && is_main(fn))
     terminate(cg, "ret i32 0");
   else if (!cg->terminated)
-    terminate(cg, "ret %s poison", llvm_type(cg, result));
+    terminate(cg, "ret %s poison", result_type(cg, result, cg->result));
+  function_span span = {fn->symbol, cg->functions.length, 0};
   append(cg, &cg->functions, "define %s%s %s(%s) {\nentry:\n%s%s}\n\n",
-         fn->symbol->linkage == LINKAGE_INTERNAL ? "internal " : "", llvm_type(cg, result),
+         fn->symbol->linkage == LINKAGE_INTERNAL ? "internal " : "",
+         with_extension(cg, result_type(cg, result, cg->result), cg->result.extension, 1),
          global_name(cg, fn->symbol), parameters, contents(&cg->allocas), contents(&cg->body));
+  span.end = cg->functions.length;
+  cg->current_function = NULL;
+  function_span *grown =
+      (function_span *)realloc(cg->spans, sizeof(function_span) * (size_t)(cg->span_count + 1));
+  if (!grown) {
+    cg->failed = 1;
+    return;
+  }
+  cg->spans = grown;
+  grown[cg->span_count++] = span;
 }
 
 static int is_defined_here(codegen *cg, const char *name) {
@@ -2264,19 +2818,24 @@ static void declare_symbol(codegen *cg, text *out, symbol *sym) {
     append(cg, out, "%s = external %sglobal i8\n", global_name(cg, sym), import);
     return;
   }
-  const char *parameters = type->has_prototype ? "" : "...";
-  for (int i = 0; type->has_prototype && i < type->param_count; i++)
-    parameters = formatted(cg, "%s%s%s", parameters, i ? ", " : "",
-                           parameter_type(cg, type->param_types[i]));
-  if (type->has_prototype && type->is_variadic)
-    parameters = formatted(cg, "%s%s...", parameters, type->param_count ? ", " : "");
+  passing r = pass_result(cg, type->ptr_to);
+  int ints = r.kind == PASS_POINTER ? 5 : 6;
+  int sses = 8;
+  const char *parameters = r.kind == PASS_POINTER ? memory_parameter(cg, type->ptr_to, "sret") : "";
+  for (int i = 0; type->has_prototype && i < type->param_count; i++) {
+    passing p = pass_argument(cg, type->param_types[i], &ints, &sses);
+    parameters = joined(cg, parameters, ", ", lowered_parameter(cg, type->param_types[i], p, NULL));
+  }
+  if (!type->has_prototype || type->is_variadic)
+    parameters = joined(cg, parameters, ", ", "...");
   const char *attributes = "";
   if (sym->returns_twice) {
     attributes = " #0";
     cg->uses_returns_twice = 1;
   }
-  append(cg, out, "declare %s%s %s(%s)%s\n", import, llvm_type(cg, type->ptr_to),
-         global_name(cg, sym), parameters, attributes);
+  append(cg, out, "declare %s%s %s(%s)%s\n", import,
+         with_extension(cg, result_type(cg, type->ptr_to, r), r.extension, 1), global_name(cg, sym),
+         parameters, attributes);
 }
 
 static int is_emitted_function(ast_node *item) {
@@ -2318,6 +2877,36 @@ static void file_scope_item(codegen *cg, ast_node *item) {
   }
 }
 
+static void append_reachable(codegen *cg, text *out) {
+  int *kept = (int *)calloc((size_t)cg->span_count + 1, sizeof(int));
+  if (!kept) {
+    cg->failed = 1;
+    return;
+  }
+  for (int i = 0; i < cg->span_count; i++)
+    kept[i] = cg->spans[i].sym->linkage != LINKAGE_INTERNAL;
+  for (int changed = 1; changed;) {
+    changed = 0;
+    for (int u = 0; u < cg->use_count; u++) {
+      int from = cg->uses[u].from == NULL;
+      for (int i = 0; !from && i < cg->span_count; i++)
+        from = kept[i] && cg->spans[i].sym == cg->uses[u].from;
+      for (int i = 0; from && i < cg->span_count; i++) {
+        if (!kept[i] && cg->spans[i].sym == cg->uses[u].to) {
+          kept[i] = 1;
+          changed = 1;
+        }
+      }
+    }
+  }
+  for (int i = 0; i < cg->span_count; i++) {
+    if (kept[i])
+      append(cg, out, "%.*s", (int)(cg->spans[i].end - cg->spans[i].start),
+             cg->functions.data + cg->spans[i].start);
+  }
+  free(kept);
+}
+
 char *codegen_program(ast_node *program) {
   codegen cg;
   memset(&cg, 0, sizeof cg);
@@ -2333,7 +2922,7 @@ char *codegen_program(ast_node *program) {
          t->triple);
   if (cg.globals.length)
     append(&cg, &out, "%s\n", contents(&cg.globals));
-  append(&cg, &out, "%s", contents(&cg.functions));
+  append_reachable(&cg, &out);
   for (int i = 0; i < cg.referenced_count; i++) {
     if (!is_defined_here(&cg, global_name(&cg, cg.referenced[i])))
       declare_symbol(&cg, &out, cg.referenced[i]);
