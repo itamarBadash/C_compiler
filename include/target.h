@@ -11,6 +11,7 @@ typedef struct target {
   prim_kind size_type;
   prim_kind ptrdiff_type;
   int microsoft_bitfields;
+  int windows_abi;
   const char *predefines;
   const char *builtin_declarations;
   const char *triple;

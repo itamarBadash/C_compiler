@@ -1,0 +1,15 @@
+offsetof 7 40 60 52
+compatible 1 0 1
+choose 5 2.5
+lvalue 9 3.5 9
+inf 1.#INF 1.#INF 1.#INF 1.#INF
+nan 1
+order 1 1 0 1 1 0
+nan order 0 0 0 0 0 1
+mixed 1
+signbit -2147483648 0 -2147483648 1 0 512 0 -2147483648
+llabs 5 7
+tgmath 1.41421 1.41421 3.5 1024
+float sqrt 4
+done
+exit 0

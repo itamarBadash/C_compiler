@@ -2840,6 +2840,7 @@ static type_info *offsetof_type(sema *s, ast_node *node) {
   for (int i = 0; i < node->builtin.step_count; i++) {
     if (is_unknown(t))
       return NULL;
+    node->builtin.steps[i].scale = 0;
     const char *name = node->builtin.steps[i].member;
     if (name) {
       if (t->kind != TYPE_STRUCT && t->kind != TYPE_UNION) {
@@ -2874,10 +2875,12 @@ static type_info *offsetof_type(sema *s, ast_node *node) {
       }
       constant value = evaluate(s, index, 1);
       type_layout element = layout_of(t->ptr_to);
-      if (value.status == CONST_VALUE && element.known)
+      if (value.status == CONST_VALUE && element.known) {
         offset += (long long)value.value.bits * element.size;
-      else
+      } else {
         constant_offset = 0;
+        node->builtin.steps[i].scale = element.size;
+      }
       t = resolved_type(t->ptr_to);
     }
   }

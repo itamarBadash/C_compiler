@@ -1,0 +1,33 @@
+add 4 -2
+sub -2 6
+mul 11 2
+div -0.2 0.4
+neg -1 -2
+int 3 2
+scale 2 4
+real 7.25 0
+fmul -8.75 5
+fdiv 0.446154 -0.430769
+fadd 1 6
+lmul 4 -5.375
+ldiv 0.235294 -1.55882
+widen 1.5 2
+narrow 1 2
+long 1 2
+conv 1 3 1 0 1
+eq 1 0 1 1
+truth
+not
+compound 0.5 -6
+global 1.5 2.5
+fglobal 3 -1
+lglobal 2 0.5
+sample 1 3
+sum 4 5
+pick 1 2
+pick2 3 -4
+inf -1.#IND 1.#INF
+zero 1.#INF 1.#INF
+big 1 -1
+sizes 8 16 32
+exit 0

@@ -1980,6 +1980,7 @@ static ast_node *parse_asm_statement(parser *p) {
   }
   parser_advance(p);
   node->asm_stmt.template_text = parse_primary(p);
+  node->asm_stmt.is_basic = p->current_token.type != TOKEN_COLON;
   for (int section = 0; section < 3 && p->current_token.type == TOKEN_COLON; section++) {
     parser_advance(p);
     while (p->current_token.type == TOKEN_STRING) {
