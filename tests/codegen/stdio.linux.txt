@@ -1,0 +1,15 @@
+alpha   10   2.25
+beta    20   4.00
+gamma   30   0.50
+delta   40   1.50
+sprintf 15 [42-text-z-ff-10]
+vsnprintf 19 [clipped]
+long double 2.500 0.333333
+long long -1234567890123 18446744073709551615
+width [   42] [42   ] [00042] [+42]
+heap-copy 9 45
+-1234 99 7
+fputs line
+puts line
+!
+exit 0
