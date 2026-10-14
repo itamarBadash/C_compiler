@@ -1,0 +1,6 @@
+first 1
+from dive 2 3
+from main 3
+guarded 5 -1
+not zero
+exit 0

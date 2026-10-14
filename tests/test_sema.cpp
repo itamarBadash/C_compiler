@@ -5121,6 +5121,38 @@ TEST(BuiltinTest, OffsetofComputesTheConstantOffset) {
       << "a variable index is allowed, but the result is not a constant";
 }
 
+TEST(BuiltinTest, OffsetofRecordsTheScaleOfEachVariableIndex) {
+  const char *src = "struct In { int x[4]; };\n"
+                    "struct S { char c; struct In in[3]; };\n"
+                    "void g(int n) {\n"
+                    "  unsigned long long r = __builtin_offsetof(struct S, in[n].x[2]);\n"
+                    "  unsigned long long k = __builtin_offsetof(struct S, in[1].x[n]);\n"
+                    "}\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  std::vector<ast_node *> r = declarations(c, "r");
+  ASSERT_EQ(r.size(), 1u);
+  ast_node *node = r[0]->var_decl.init_value;
+  ASSERT_EQ(node->type, AST_NODE_TYPE_BUILTIN);
+  ASSERT_EQ(node->builtin.step_count, 4);
+  EXPECT_EQ(node->builtin.steps[0].scale, 0) << "a member has no scale";
+  EXPECT_EQ(node->builtin.steps[1].scale, 16) << "a variable index scales by its element";
+  EXPECT_EQ(node->builtin.steps[2].scale, 0);
+  EXPECT_EQ(node->builtin.steps[3].scale, 0) << "a constant index is already in the value";
+  EXPECT_EQ(node->builtin.value, 4 + 8) << "the member offsets and the constant index";
+  EXPECT_FALSE(node->builtin.has_value);
+  std::vector<ast_node *> k = declarations(c, "k");
+  ASSERT_EQ(k.size(), 1u);
+  node = k[0]->var_decl.init_value;
+  ASSERT_EQ(node->type, AST_NODE_TYPE_BUILTIN);
+  ASSERT_EQ(node->builtin.step_count, 4);
+  EXPECT_EQ(node->builtin.steps[1].scale, 0);
+  EXPECT_EQ(node->builtin.steps[3].scale, 4);
+  EXPECT_EQ(node->builtin.value, 4 + 16);
+}
+
 TEST(BuiltinTest, OffsetofMisuseIsReported) {
   const char *src = "struct S { int a[2]; int bf : 3; int *p; struct In { int x; } in; };\n"
                     "struct Inc;\n"

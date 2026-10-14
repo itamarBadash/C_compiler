@@ -4625,6 +4625,7 @@ TEST(GnuSyntaxTest, AnAsmStatementKeepsItsTextOperandsAndClobbers) {
   ASSERT_NE(full, nullptr);
   ASSERT_EQ(full->type, AST_NODE_TYPE_ASM);
   EXPECT_EQ(full->asm_stmt.is_volatile, 1);
+  EXPECT_EQ(full->asm_stmt.is_basic, 0);
   ASSERT_NE(full->asm_stmt.template_text, nullptr);
   EXPECT_EQ(std::string(full->asm_stmt.template_text->literal.bytes,
                         full->asm_stmt.template_text->literal.length),
@@ -4649,16 +4650,18 @@ TEST(GnuSyntaxTest, AnAsmStatementKeepsItsTextOperandsAndClobbers) {
   const struct {
     int statement;
     int is_volatile;
+    int is_basic;
     int operands;
     int outputs;
     int clobbers;
-  } rows[] = {{2, 0, 0, 0, 0}, {3, 0, 1, 0, 0}, {4, 0, 0, 0, 0}, {5, 0, 0, 0, 1}};
+  } rows[] = {{2, 0, 0, 0, 0, 0}, {3, 0, 0, 1, 0, 0}, {4, 0, 1, 0, 0, 0}, {5, 0, 0, 0, 0, 1}};
   for (const auto &row : rows) {
     SCOPED_TRACE(row.statement);
     ast_node *node = function_body_statement(program, 0, row.statement);
     ASSERT_NE(node, nullptr);
     ASSERT_EQ(node->type, AST_NODE_TYPE_ASM);
     EXPECT_EQ(node->asm_stmt.is_volatile, row.is_volatile);
+    EXPECT_EQ(node->asm_stmt.is_basic, row.is_basic) << "only an asm with no colon is basic";
     EXPECT_EQ(node->asm_stmt.operand_count, row.operands);
     EXPECT_EQ(node->asm_stmt.output_count, row.outputs);
     EXPECT_EQ(node->asm_stmt.clobber_count, row.clobbers);

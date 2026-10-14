@@ -371,6 +371,7 @@ typedef struct ast_node {
     struct {
       struct ast_node *template_text;
       int is_volatile;
+      int is_basic;
       struct ast_node **constraints;
       struct ast_node **operands;
       int output_count;
@@ -389,6 +390,7 @@ typedef struct ast_node {
       struct {
         char *member;
         struct ast_node *index;
+        long long scale;
       } *steps;
       int step_count;
       long long value;

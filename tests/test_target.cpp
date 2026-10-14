@@ -32,6 +32,7 @@ TEST(TargetTest, WindowsIsLlp64WithUtf16WideCharacters) {
   EXPECT_EQ(t->size_type, PRIM_ULLONG);
   EXPECT_EQ(t->ptrdiff_type, PRIM_LLONG);
   EXPECT_EQ(t->microsoft_bitfields, 1);
+  EXPECT_EQ(t->windows_abi, 1);
   EXPECT_EQ(
       defined_names(t),
       std::vector<std::string>(
@@ -51,6 +52,7 @@ TEST(TargetTest, LinuxIsLp64WithUtf32WideCharacters) {
   EXPECT_EQ(t->size_type, PRIM_ULONG);
   EXPECT_EQ(t->ptrdiff_type, PRIM_LONG);
   EXPECT_EQ(t->microsoft_bitfields, 0);
+  EXPECT_EQ(t->windows_abi, 0);
   EXPECT_EQ(defined_names(t),
             std::vector<std::string>({"__linux", "__linux__", "__gnu_linux__", "__unix", "__unix__",
                                       "__ELF__", "_LP64", "__LP64__", "__x86_64", "__x86_64__",

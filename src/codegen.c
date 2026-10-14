@@ -3,6 +3,7 @@
 #include "sema.h"
 #include "target.h"
 #include <ctype.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +47,7 @@ typedef struct codegen {
   text functions;
   text allocas;
   text body;
+  text declarations;
   char **strings;
   int string_count;
   int string_capacity;
@@ -57,6 +59,7 @@ typedef struct codegen {
   int uses_memset;
   int uses_memcpy;
   int uses_stacksave;
+  int uses_returns_twice;
   int next_string;
   int next_global;
   const char *function_name;
@@ -178,6 +181,7 @@ static void free_codegen(codegen *cg) {
   free(cg->functions.data);
   free(cg->allocas.data);
   free(cg->body.data);
+  free(cg->declarations.data);
   free(cg->defined);
   free(cg->referenced);
   free_labels(cg);
@@ -230,6 +234,11 @@ static int is_floating(type_info *type) {
   type_info *t = resolved(type);
   return t && t->kind == TYPE_PRIMITIVE && !t->is_complex &&
          (t->prim == PRIM_FLOAT || t->prim == PRIM_DOUBLE || t->prim == PRIM_LDOUBLE);
+}
+
+static int is_complex(type_info *type) {
+  type_info *t = resolved(type);
+  return t && t->kind == TYPE_PRIMITIVE && t->is_complex;
 }
 
 static int is_pointer(type_info *type) {
@@ -295,6 +304,10 @@ static type_info *primitive(prim_kind prim) {
   return &types[prim];
 }
 
+static type_info *complex_part(type_info *type) {
+  return primitive(resolved(type)->prim);
+}
+
 static type_info *promoted_parameter(type_info *type) {
   if (integer_kind(type) != PRIM_NONE && size_of(type) < 4)
     return primitive(PRIM_INT);
@@ -323,6 +336,10 @@ static const char *llvm_type(codegen *cg, type_info *type) {
     return formatted(cg, "[%lld x %s]", t->array_size, llvm_type(cg, t->ptr_to));
   if (is_aggregate(t))
     return formatted(cg, "[%lld x i8]", size_of(t));
+  if (is_complex(t)) {
+    const char *part = llvm_type(cg, complex_part(t));
+    return formatted(cg, "{ %s, %s }", part, part);
+  }
   if (is_floating(t))
     return t->prim == PRIM_FLOAT ? "float" : t->prim == PRIM_DOUBLE ? "double" : "x86_fp80";
   return "void";
@@ -427,6 +444,18 @@ static const char *compute(codegen *cg, const char *pattern, ...) {
   return result;
 }
 
+static void declare_once(codegen *cg, const char *line) {
+  const char *wanted = formatted(cg, "%s\n", line);
+  if (!strstr(contents(&cg->declarations), wanted))
+    append(cg, &cg->declarations, "%s", wanted);
+}
+
+static const char *joined(codegen *cg, const char *list, const char *separator, const char *item) {
+  if (!*item)
+    return list;
+  return formatted(cg, "%s%s%s", list, *list ? separator : "", item);
+}
+
 static void branch(codegen *cg, const char *label) {
   terminate(cg, "br label %%%s", label);
 }
@@ -509,13 +538,18 @@ static const char *float_constant(codegen *cg, type_info *type, long double v) {
 static const char *number_value(codegen *cg, ast_node *node) {
   const char *spelling = node->tok.value ? node->tok.value : "0";
   type_info *type = node->expr_type;
-  if (!is_floating(type))
+  if (!is_floating(type) && !is_complex(type))
     return integer_constant(cg, type, strtoull(spelling, NULL, 0));
   prim_kind prim = resolved(type)->prim;
   long double v = prim == PRIM_FLOAT    ? strtof(spelling, NULL)
                   : prim == PRIM_DOUBLE ? strtod(spelling, NULL)
                                         : strtold(spelling, NULL);
-  return float_constant(cg, type, v);
+  if (!is_complex(type))
+    return float_constant(cg, type, v);
+  type_info *part = complex_part(type);
+  const char *part_type = llvm_type(cg, part);
+  return formatted(cg, "{ %s %s, %s %s }", part_type, float_constant(cg, part, 0), part_type,
+                   float_constant(cg, part, v));
 }
 
 static const char *byte_string(codegen *cg, const unsigned char *bytes, long long count) {
@@ -539,7 +573,23 @@ static const char *string_literal(codegen *cg, ast_node *node) {
   return name;
 }
 
+static const char *part_of(codegen *cg, type_info *type, const char *v, int index) {
+  return compute(cg, "extractvalue %s %s, %d", llvm_type(cg, type), v, index);
+}
+
+static const char *make_complex(codegen *cg, type_info *type, const char *re, const char *im) {
+  const char *pair = llvm_type(cg, type);
+  const char *part = llvm_type(cg, complex_part(type));
+  const char *half = compute(cg, "insertvalue %s poison, %s %s, 0", pair, part, re);
+  return compute(cg, "insertvalue %s %s, %s %s, 1", pair, half, part, im);
+}
+
 static const char *truth_of(codegen *cg, const char *v, type_info *type) {
+  if (is_complex(type)) {
+    const char *re = truth_of(cg, part_of(cg, type, v, 0), complex_part(type));
+    const char *im = truth_of(cg, part_of(cg, type, v, 1), complex_part(type));
+    return compute(cg, "or i1 %s, %s", re, im);
+  }
   if (is_floating(type))
     return compute(cg, "fcmp une %s %s, %s", llvm_type(cg, type), v, float_constant(cg, type, 0));
   if (is_pointer(type))
@@ -548,6 +598,24 @@ static const char *truth_of(codegen *cg, const char *v, type_info *type) {
 }
 
 static const char *convert(codegen *cg, const char *v, type_info *from, type_info *to) {
+  if (is_complex(to) && !is_complex(from)) {
+    type_info *part = complex_part(to);
+    const char *re = convert(cg, v, from, part);
+    return make_complex(cg, to, re, float_constant(cg, part, 0));
+  }
+  if (is_complex(from) && !is_complex(to) && integer_kind(to) != PRIM_BOOL) {
+    const char *re = part_of(cg, from, v, 0);
+    return convert(cg, re, complex_part(from), to);
+  }
+  if (is_complex(from) && is_complex(to)) {
+    if (resolved(from)->prim == resolved(to)->prim)
+      return v;
+    const char *re = part_of(cg, from, v, 0);
+    re = convert(cg, re, complex_part(from), complex_part(to));
+    const char *im = part_of(cg, from, v, 1);
+    im = convert(cg, im, complex_part(from), complex_part(to));
+    return make_complex(cg, to, re, im);
+  }
   prim_kind source = integer_kind(from);
   prim_kind target = integer_kind(to);
   const char *from_type = llvm_type(cg, from);
@@ -801,6 +869,10 @@ static void fill_entry(codegen *cg, unsigned char *bytes, initializer_entry *ent
   } else if (c->kind == CONSTANT_INTEGER) {
     for (long long i = 0; i < size_of(entry->type); i++)
       at[i] = (unsigned char)(c->bits >> (8 * i));
+  } else if (c->kind == CONSTANT_FLOATING && is_complex(entry->type)) {
+    type_info *part = complex_part(entry->type);
+    write_floating(at, part, c->real);
+    write_floating(at + size_of(part), part, c->imag);
   } else if (c->kind == CONSTANT_FLOATING) {
     write_floating(at, entry->type, c->real);
   } else if (c->kind == CONSTANT_ADDRESS && (c->symbol || c->literal)) {
@@ -960,6 +1032,8 @@ static const char *address_of(codegen *cg, ast_node *node) {
   }
   case AST_NODE_TYPE_COMPOUND_LITERAL:
     return compound_object(cg, node);
+  case AST_NODE_TYPE_BUILTIN:
+    return address_of(cg, node->builtin.chosen);
   default:
     return "poison";
   }
@@ -1001,8 +1075,84 @@ static const char *sizeof_value(codegen *cg, ast_node *node) {
   return runtime_size(cg, type);
 }
 
+static const char *complex_call(codegen *cg, const char *operation, type_info *type, const char *a,
+                                const char *b) {
+  type_info *part = complex_part(type);
+  prim_kind prim = part->prim;
+  const char *name = formatted(cg, "@__%s%cc3", operation,
+                               prim == PRIM_FLOAT    ? 's'
+                               : prim == PRIM_DOUBLE ? 'd'
+                                                     : 'x');
+  const char *pair = llvm_type(cg, type);
+  const char *t = llvm_type(cg, part);
+  const char *parts[4];
+  parts[0] = part_of(cg, type, a, 0);
+  parts[1] = part_of(cg, type, a, 1);
+  parts[2] = part_of(cg, type, b, 0);
+  parts[3] = part_of(cg, type, b, 1);
+  int windows = target_current()->windows_abi;
+  if (windows && prim != PRIM_FLOAT) {
+    const char *result = formatted(cg, "%%complex.%d", cg->next_name++);
+    append(cg, &cg->allocas, "  %s = alloca %s, align %d\n", result, pair, alignment_of(part));
+    const char *signature = "ptr";
+    const char *arguments = formatted(cg, "ptr sret(%s) %s", pair, result);
+    for (int i = 0; i < 4; i++) {
+      const char *argument = parts[i];
+      const char *kind = t;
+      if (prim == PRIM_LDOUBLE) {
+        argument = formatted(cg, "%%complex.%d", cg->next_name++);
+        append(cg, &cg->allocas, "  %s = alloca x86_fp80, align 16\n", argument);
+        instruction(cg, "store x86_fp80 %s, ptr %s, align 16", parts[i], argument);
+        kind = "ptr";
+      }
+      signature = joined(cg, signature, ", ", kind);
+      arguments = joined(cg, arguments, ", ", formatted(cg, "%s %s", kind, argument));
+    }
+    declare_once(cg, formatted(cg, "declare void %s(%s)", name, signature));
+    instruction(cg, "call void %s(%s)", name, arguments);
+    return compute(cg, "load %s, ptr %s, align %d", pair, result, alignment_of(part));
+  }
+  const char *returned = prim != PRIM_FLOAT ? pair : windows ? "i64" : "<2 x float>";
+  declare_once(cg, formatted(cg, "declare %s %s(%s, %s, %s, %s)", returned, name, t, t, t, t));
+  const char *r = compute(cg, "call %s %s(%s %s, %s %s, %s %s, %s %s)", returned, name, t, parts[0],
+                          t, parts[1], t, parts[2], t, parts[3]);
+  if (prim != PRIM_FLOAT)
+    return r;
+  if (windows)
+    r = compute(cg, "bitcast i64 %s to <2 x float>", r);
+  const char *re = compute(cg, "extractelement <2 x float> %s, i32 0", r);
+  const char *im = compute(cg, "extractelement <2 x float> %s, i32 1", r);
+  return make_complex(cg, type, re, im);
+}
+
+static const char *complex_arithmetic(codegen *cg, token_type op, type_info *type, const char *a,
+                                      const char *b) {
+  if (op == TOKEN_STAR || op == TOKEN_SLASH)
+    return complex_call(cg, op == TOKEN_STAR ? "mul" : "div", type, a, b);
+  const char *name = op == TOKEN_PLUS ? "fadd" : "fsub";
+  const char *t = llvm_type(cg, complex_part(type));
+  const char *ar = part_of(cg, type, a, 0);
+  const char *ai = part_of(cg, type, a, 1);
+  const char *br = part_of(cg, type, b, 0);
+  const char *bi = part_of(cg, type, b, 1);
+  const char *re = compute(cg, "%s %s %s, %s", name, t, ar, br);
+  const char *im = compute(cg, "%s %s %s, %s", name, t, ai, bi);
+  return make_complex(cg, type, re, im);
+}
+
+static const char *complex_negate(codegen *cg, type_info *type, const char *v) {
+  const char *t = llvm_type(cg, complex_part(type));
+  const char *re = part_of(cg, type, v, 0);
+  const char *im = part_of(cg, type, v, 1);
+  re = compute(cg, "fneg %s %s", t, re);
+  im = compute(cg, "fneg %s %s", t, im);
+  return make_complex(cg, type, re, im);
+}
+
 static const char *arithmetic(codegen *cg, token_type op, type_info *type, const char *a,
                               const char *b, type_info *b_type) {
+  if (is_complex(type))
+    return complex_arithmetic(cg, op, type, a, b);
   int floating = is_floating(type);
   int is_signed_type = is_signed(integer_kind(type));
   const char *name;
@@ -1058,6 +1208,16 @@ static const char *compare(codegen *cg, token_type op, type_info *type, const ch
               : op == TOKEN_GTE ? 3
               : op == TOKEN_EQ  ? 4
                                 : 5;
+  if (is_complex(type)) {
+    const char *t = llvm_type(cg, complex_part(type));
+    const char *ar = part_of(cg, type, a, 0);
+    const char *ai = part_of(cg, type, a, 1);
+    const char *br = part_of(cg, type, b, 0);
+    const char *bi = part_of(cg, type, b, 1);
+    const char *re = compute(cg, "fcmp %s %s %s, %s", floating[index], t, ar, br);
+    const char *im = compute(cg, "fcmp %s %s %s, %s", floating[index], t, ai, bi);
+    return compute(cg, "%s i1 %s, %s", index == 4 ? "and" : "or", re, im);
+  }
   if (is_floating(type))
     return compute(cg, "fcmp %s %s %s, %s", floating[index], llvm_type(cg, type), a, b);
   const char *const *order = is_signed(integer_kind(type)) ? signed_order : unsigned_order;
@@ -1154,6 +1314,8 @@ static const char *unary_value(codegen *cg, ast_node *node) {
     return value(cg, operand);
   case TOKEN_MINUS: {
     const char *v = value(cg, operand);
+    if (is_complex(type))
+      return complex_negate(cg, type, v);
     if (is_floating(type))
       return compute(cg, "fneg %s %s", llvm_type(cg, type), v);
     return compute(cg, "sub %s 0, %s", llvm_type(cg, type), v);
@@ -1265,28 +1427,135 @@ static const char *cast_value(codegen *cg, ast_node *node) {
   return convert(cg, v, operand->expr_type, node->expr_type);
 }
 
-static const char *call_value(codegen *cg, ast_node *node) {
-  ast_node *callable = node->function_call.callable;
+static const char *emit_call(codegen *cg, ast_node *callable, ast_node **args, int count) {
   type_info *fn = resolved(resolved(callable->expr_type)->ptr_to);
   const char *callee = value(cg, callable);
   const char *signature = "";
   const char *arguments = "";
-  for (int i = 0; i < node->function_call.arg_count; i++) {
-    ast_node *argument = node->function_call.arguments[i];
-    const char *v = value(cg, argument);
-    const char *type = llvm_type(cg, argument->expr_type);
+  for (int i = 0; i < count; i++) {
+    const char *v = value(cg, args[i]);
+    const char *type = llvm_type(cg, args[i]->expr_type);
     arguments = formatted(cg, "%s%s%s %s", arguments, i ? ", " : "", type, v);
     if (!fn->has_prototype || i < fn->param_count)
       signature = formatted(cg, "%s%s%s", signature, i ? ", " : "", type);
   }
   if (fn->has_prototype && fn->is_variadic)
     signature = formatted(cg, "%s%s...", signature, fn->param_count ? ", " : "");
+  ast_node *target = callable;
+  while (target->type == AST_NODE_TYPE_CONVERSION)
+    target = target->conversion.operand;
+  const char *attributes = "";
+  if (target->type == AST_NODE_TYPE_IDENTIFIER && target->symbol->returns_twice) {
+    attributes = " #0";
+    cg->uses_returns_twice = 1;
+  }
   const char *result = llvm_type(cg, fn->ptr_to);
   if (is_void(fn->ptr_to)) {
-    instruction(cg, "call void (%s) %s(%s)", signature, callee, arguments);
+    instruction(cg, "call void (%s) %s(%s)%s", signature, callee, arguments, attributes);
     return "";
   }
-  return compute(cg, "call %s (%s) %s(%s)", result, signature, callee, arguments);
+  return compute(cg, "call %s (%s) %s(%s)%s", result, signature, callee, arguments, attributes);
+}
+
+static const char *call_value(codegen *cg, ast_node *node) {
+  return emit_call(cg, node->function_call.callable, node->function_call.arguments,
+                   node->function_call.arg_count);
+}
+
+static const char *offsetof_value(codegen *cg, ast_node *node) {
+  const char *type = llvm_type(cg, node->expr_type);
+  const char *total =
+      integer_constant(cg, node->expr_type, (unsigned long long)node->builtin.value);
+  for (int i = 0; i < node->builtin.step_count; i++) {
+    if (!node->builtin.steps[i].scale)
+      continue;
+    const char *index = value(cg, node->builtin.steps[i].index);
+    const char *bytes = compute(cg, "mul %s %s, %lld", type, index, node->builtin.steps[i].scale);
+    total = compute(cg, "add %s %s, %s", type, total, bytes);
+  }
+  return total;
+}
+
+static const char *sign_bit(codegen *cg, ast_node *argument) {
+  prim_kind prim = resolved(argument->expr_type)->prim;
+  const char *v = value(cg, argument);
+  if (prim == PRIM_FLOAT) {
+    const char *bits = compute(cg, "bitcast float %s to i32", v);
+    return compute(cg, "and i32 %s, -2147483648", bits);
+  }
+  if (prim == PRIM_DOUBLE) {
+    const char *bits = compute(cg, "bitcast double %s to i64", v);
+    const char *sign = compute(cg, "lshr i64 %s, 63", bits);
+    return compute(cg, "trunc i64 %s to i32", sign);
+  }
+  const char *bits = compute(cg, "bitcast x86_fp80 %s to i80", v);
+  const char *sign = compute(cg, "lshr i80 %s, 79", bits);
+  const char *narrow = compute(cg, "trunc i80 %s to i32", sign);
+  return compute(cg, "shl i32 %s, 9", narrow);
+}
+
+static const char *builtin_value(codegen *cg, ast_node *node) {
+  static const char *const orders[] = {"ogt", "oge", "olt", "ole", "one", "uno"};
+  ast_node **args = node->builtin.args;
+  type_info *type = node->expr_type;
+  switch (node->builtin.kind) {
+  case BUILTIN_OFFSETOF:
+    return offsetof_value(cg, node);
+  case BUILTIN_TYPES_COMPATIBLE_P:
+    return integer_constant(cg, type, (unsigned long long)node->builtin.value);
+  case BUILTIN_CHOOSE_EXPR:
+    if (is_void(type)) {
+      discard(cg, node->builtin.chosen);
+      return "";
+    }
+    return value(cg, node->builtin.chosen);
+  case BUILTIN_HUGE_VAL:
+  case BUILTIN_HUGE_VALF:
+  case BUILTIN_HUGE_VALL:
+  case BUILTIN_INFF:
+    return float_constant(cg, type, INFINITY);
+  case BUILTIN_NANF:
+    discard(cg, args[0]);
+    return float_constant(cg, type, NAN);
+  case BUILTIN_ISGREATER:
+  case BUILTIN_ISGREATEREQUAL:
+  case BUILTIN_ISLESS:
+  case BUILTIN_ISLESSEQUAL:
+  case BUILTIN_ISLESSGREATER:
+  case BUILTIN_ISUNORDERED: {
+    const char *a = value(cg, args[0]);
+    const char *b = value(cg, args[1]);
+    const char *result =
+        compute(cg, "fcmp %s %s %s, %s", orders[node->builtin.kind - BUILTIN_ISGREATER],
+                llvm_type(cg, args[0]->expr_type), a, b);
+    return compute(cg, "zext i1 %s to %s", result, llvm_type(cg, type));
+  }
+  case BUILTIN_SIGNBIT:
+  case BUILTIN_SIGNBITF:
+  case BUILTIN_SIGNBITL:
+    return sign_bit(cg, args[0]);
+  case BUILTIN_LLABS: {
+    const char *v = value(cg, args[0]);
+    const char *negative = compute(cg, "icmp slt i64 %s, 0", v);
+    const char *negated = compute(cg, "sub i64 0, %s", v);
+    return compute(cg, "select i1 %s, i64 %s, i64 %s", negative, negated, v);
+  }
+  case BUILTIN_TRAP:
+    declare_once(cg, "declare void @llvm.trap()");
+    instruction(cg, "call void @llvm.trap()");
+    terminate(cg, "unreachable");
+    return "";
+  case BUILTIN_UNREACHABLE:
+    terminate(cg, "unreachable");
+    return "";
+  case BUILTIN_TGMATH: {
+    int functions = (int)node->builtin.value;
+    return emit_call(cg, node->builtin.chosen, args + functions,
+                     node->builtin.arg_count - functions);
+  }
+  default:
+    return "poison";
+  }
 }
 
 static const char *value(codegen *cg, ast_node *node) {
@@ -1317,6 +1586,8 @@ static const char *value(codegen *cg, ast_node *node) {
     const char *address = address_of(cg, node);
     return read_object(cg, node, address);
   }
+  case AST_NODE_TYPE_BUILTIN:
+    return builtin_value(cg, node);
   default:
     return "poison";
   }
@@ -1686,6 +1957,177 @@ static void return_statement(codegen *cg, ast_node *node) {
   terminate(cg, "ret %s %s", llvm_type(cg, result->expr_type), v);
 }
 
+static const char *asm_template(codegen *cg, ast_node *node) {
+  const char *in = node->asm_stmt.template_text->literal.bytes;
+  int length = node->asm_stmt.template_text->literal.length;
+  const char *out = "";
+  for (int i = 0; i < length; i++) {
+    char c = in[i];
+    char next = i + 1 < length ? in[i + 1] : '\0';
+    char after = i + 2 < length ? in[i + 2] : '\0';
+    if (c == '$') {
+      out = formatted(cg, "%s$$", out);
+    } else if (c != '%' || node->asm_stmt.is_basic) {
+      out = formatted(cg, "%s%c", out, c);
+    } else if (next == '%') {
+      out = formatted(cg, "%s%%", out);
+      i++;
+    } else if (next == '=') {
+      out = formatted(cg, "%s${:uid}", out);
+      i++;
+    } else if (isdigit((unsigned char)next)) {
+      out = formatted(cg, "%s$%c", out, next);
+      for (i++; i + 1 < length && isdigit((unsigned char)in[i + 1]); i++)
+        out = formatted(cg, "%s%c", out, in[i + 1]);
+    } else if (isalpha((unsigned char)next) && isdigit((unsigned char)after)) {
+      out = formatted(cg, "%s${%c", out, after);
+      for (i += 2; i + 1 < length && isdigit((unsigned char)in[i + 1]); i++)
+        out = formatted(cg, "%s%c", out, in[i + 1]);
+      out = formatted(cg, "%s:%c}", out, next);
+    } else {
+      out = formatted(cg, "%s%%", out);
+    }
+  }
+  return byte_string(cg, (const unsigned char *)out, (long long)strlen(out)) + 1;
+}
+
+static const char *asm_constraint(codegen *cg, const char *text) {
+  const char *out = "";
+  for (; *text; text++) {
+    switch (*text) {
+    case 'g':
+      out = formatted(cg, "%simr", out);
+      break;
+    case 'a':
+      out = formatted(cg, "%s{ax}", out);
+      break;
+    case 'b':
+      out = formatted(cg, "%s{bx}", out);
+      break;
+    case 'c':
+      out = formatted(cg, "%s{cx}", out);
+      break;
+    case 'd':
+      out = formatted(cg, "%s{dx}", out);
+      break;
+    case 'S':
+      out = formatted(cg, "%s{si}", out);
+      break;
+    case 'D':
+      out = formatted(cg, "%s{di}", out);
+      break;
+    default:
+      out = formatted(cg, "%s%c", out, *text);
+      break;
+    }
+  }
+  return out;
+}
+
+static const char *asm_input(codegen *cg, ast_node *operand) {
+  type_info *t = resolved(operand->expr_type);
+  if (t->kind == TYPE_ARRAY || t->kind == TYPE_FUNCTION)
+    return address_of(cg, operand);
+  if (!operand->is_lvalue)
+    return value(cg, operand);
+  const char *address = address_of(cg, operand);
+  return read_object(cg, operand, address);
+}
+
+static void asm_statement(codegen *cg, ast_node *node) {
+  int outputs = node->asm_stmt.output_count;
+  const char **addresses = (const char **)calloc((size_t)outputs + 1, sizeof(const char *));
+  if (!addresses) {
+    cg->failed = 1;
+    return;
+  }
+  const char *constraints = "";
+  const char *arguments = "";
+  const char *results = "";
+  const char *tied = "";
+  const char *tied_arguments = "";
+  int result_count = 0;
+  for (int i = 0; i < outputs; i++) {
+    ast_node *operand = node->asm_stmt.operands[i];
+    const char *text = node->asm_stmt.constraints[i]->literal.bytes;
+    int in_out = *text == '+';
+    const char *early = "";
+    text++;
+    if (*text == '&') {
+      early = "&";
+      text++;
+    }
+    const char *type = llvm_type(cg, operand->expr_type);
+    const char *address = address_of(cg, operand);
+    if (strcmp(text, "m") == 0) {
+      const char *pointer = formatted(cg, "ptr elementtype(%s) %s", type, address);
+      constraints = joined(cg, constraints, ",", formatted(cg, "=%s*m", early));
+      arguments = joined(cg, arguments, ", ", pointer);
+      if (in_out) {
+        tied = joined(cg, tied, ",", "*m");
+        tied_arguments = joined(cg, tied_arguments, ", ", pointer);
+      }
+      continue;
+    }
+    addresses[i] = address;
+    constraints =
+        joined(cg, constraints, ",", formatted(cg, "=%s%s", early, asm_constraint(cg, text)));
+    results = joined(cg, results, ", ", type);
+    result_count++;
+    if (in_out) {
+      const char *v = read_object(cg, operand, address);
+      tied = joined(cg, tied, ",", formatted(cg, "%d", i));
+      tied_arguments = joined(cg, tied_arguments, ", ", formatted(cg, "%s %s", type, v));
+    }
+  }
+  for (int i = outputs; i < node->asm_stmt.operand_count; i++) {
+    ast_node *operand = node->asm_stmt.operands[i];
+    const char *text = node->asm_stmt.constraints[i]->literal.bytes;
+    if (strcmp(text, "m") == 0) {
+      const char *address = address_of(cg, operand);
+      constraints = joined(cg, constraints, ",", "*m");
+      arguments = joined(
+          cg, arguments, ", ",
+          formatted(cg, "ptr elementtype(%s) %s", llvm_type(cg, operand->expr_type), address));
+      continue;
+    }
+    const char *v = asm_input(cg, operand);
+    constraints = joined(cg, constraints, ",", asm_constraint(cg, text));
+    arguments = joined(cg, arguments, ", ",
+                       formatted(cg, "%s %s", parameter_type(cg, operand->expr_type), v));
+  }
+  constraints = joined(cg, constraints, ",", tied);
+  arguments = joined(cg, arguments, ", ", tied_arguments);
+  for (int i = 0; i < node->asm_stmt.clobber_count; i++) {
+    const char *name = node->asm_stmt.clobbers[i]->literal.bytes;
+    if (*name == '%')
+      name++;
+    constraints = joined(cg, constraints, ",", formatted(cg, "~{%s}", name));
+  }
+  constraints = joined(cg, constraints, ",", "~{dirflag},~{fpsr},~{flags}");
+  const char *returned = result_count == 0   ? "void"
+                         : result_count == 1 ? results
+                                             : formatted(cg, "{ %s }", results);
+  const char *call = formatted(cg, "call %s asm %s%s, \"%s\"(%s)", returned,
+                               node->asm_stmt.is_volatile || outputs == 0 ? "sideeffect " : "",
+                               asm_template(cg, node), constraints, arguments);
+  if (result_count == 0) {
+    instruction(cg, "%s", call);
+    free(addresses);
+    return;
+  }
+  const char *r = compute(cg, "%s", call);
+  int k = 0;
+  for (int i = 0; i < outputs; i++) {
+    if (!addresses[i])
+      continue;
+    const char *v = result_count == 1 ? r : compute(cg, "extractvalue %s %s, %d", returned, r, k);
+    write_object(cg, node->asm_stmt.operands[i], v, addresses[i]);
+    k++;
+  }
+  free(addresses);
+}
+
 static void statement(codegen *cg, ast_node *node) {
   if (!node)
     return;
@@ -1744,6 +2186,9 @@ static void statement(codegen *cg, ast_node *node) {
     break;
   case AST_NODE_TYPE_RETURN:
     return_statement(cg, node);
+    break;
+  case AST_NODE_TYPE_ASM:
+    asm_statement(cg, node);
     break;
   case AST_NODE_TYPE_EMPTY:
   case AST_NODE_TYPE_STRUCT_DEF:
@@ -1825,8 +2270,13 @@ static void declare_symbol(codegen *cg, text *out, symbol *sym) {
                            parameter_type(cg, type->param_types[i]));
   if (type->has_prototype && type->is_variadic)
     parameters = formatted(cg, "%s%s...", parameters, type->param_count ? ", " : "");
-  append(cg, out, "declare %s%s %s(%s)\n", import, llvm_type(cg, type->ptr_to),
-         global_name(cg, sym), parameters);
+  const char *attributes = "";
+  if (sym->returns_twice) {
+    attributes = " #0";
+    cg->uses_returns_twice = 1;
+  }
+  append(cg, out, "declare %s%s %s(%s)%s\n", import, llvm_type(cg, type->ptr_to),
+         global_name(cg, sym), parameters, attributes);
 }
 
 static int is_emitted_function(ast_node *item) {
@@ -1895,6 +2345,9 @@ char *codegen_program(ast_node *program) {
   if (cg.uses_stacksave)
     append(&cg, &out,
            "declare ptr @llvm.stacksave.p0()\ndeclare void @llvm.stackrestore.p0(ptr)\n");
+  append(&cg, &out, "%s", contents(&cg.declarations));
+  if (cg.uses_returns_twice)
+    append(&cg, &out, "\nattributes #0 = { returns_twice }\n");
   int failed = cg.failed;
   free_codegen(&cg);
   if (failed) {

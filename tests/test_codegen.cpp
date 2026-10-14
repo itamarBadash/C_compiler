@@ -14,11 +14,24 @@ extern "C" {
 #include "sema.h"
 }
 
-static std::string generate(const char *source, target_kind kind = TARGET_WINDOWS_X64) {
+static std::string generate(const char *source, target_kind kind = TARGET_WINDOWS_X64,
+                            bool system_headers = false) {
   TargetGuard guard(kind);
+  std::vector<std::string> dirs = {LIB_INCLUDE_DIR};
+  if (kind == TARGET_WINDOWS_X64) {
+    dirs.push_back(std::string(SYSROOT_DIR) + "/windows/include");
+  } else {
+    dirs.push_back(std::string(SYSROOT_DIR) + "/linux/include/x86_64-linux-gnu");
+    dirs.push_back(std::string(SYSROOT_DIR) + "/linux/include");
+  }
+  std::vector<const char *> system_dirs;
+  for (const std::string &dir : dirs)
+    system_dirs.push_back(dir.c_str());
   testing::internal::CaptureStderr();
   token_buf tb;
-  int errors = pp_run(&tb, source);
+  int errors = system_headers ? pp_run_ex(&tb, source, "program.c", nullptr, 0, system_dirs.data(),
+                                          (int)system_dirs.size())
+                              : pp_run(&tb, source);
   parser p;
   parser_init_from_buf(&p, &tb);
   ast_node *program = parse_program(&p);
@@ -1410,6 +1423,327 @@ TEST(CodegenVlaTest, GotoGivesBackOnlyTheScopesItLeaves) {
                                       "  ret void"}));
 }
 
+TEST(CodegenComplexTest, ComplexTypesArePairsAndImaginaryConstantsHaveNoRealPart) {
+  std::string body =
+      function(generate("void slots(void) { float _Complex f; double _Complex d;\n"
+                        "  long double _Complex l; f = 1.0iF; d = 2.0i; l = 3.0iL; }\n"),
+               "slots");
+  expect_lines(
+      body, {"%f.0 = alloca { float, float }, align 4", "%d.1 = alloca { double, double }, align 8",
+             "%l.2 = alloca { x86_fp80, x86_fp80 }, align 16",
+             "store { float, float } { float 0x0000000000000000, float 0x3FF0000000000000 }, "
+             "ptr %f.0, align 4",
+             "store { double, double } { double 0x0000000000000000, double "
+             "0x4000000000000000 }, ptr %d.1, align 8",
+             "store { x86_fp80, x86_fp80 } { x86_fp80 0xK00000000000000000000, x86_fp80 "
+             "0xK4000C000000000000000 }, ptr %l.2, align 16"});
+}
+
+TEST(CodegenComplexTest, AdditionAndNegationWorkPartByPart) {
+  std::string ir = generate("void add(double _Complex *a, double _Complex *b) { *a = *a + *b; }\n"
+                            "void sub(float _Complex *a) { *a = *a - *a; }\n"
+                            "void neg(float _Complex *f) { *f = -*f; }\n");
+  expect_lines(function(ir, "add"), {"%3 = load { double, double }, ptr %2, align 8",
+                                     "%5 = load { double, double }, ptr %4, align 8",
+                                     "%6 = extractvalue { double, double } %3, 0",
+                                     "%7 = extractvalue { double, double } %3, 1",
+                                     "%8 = extractvalue { double, double } %5, 0",
+                                     "%9 = extractvalue { double, double } %5, 1",
+                                     "%10 = fadd double %6, %8", "%11 = fadd double %7, %9",
+                                     "%12 = insertvalue { double, double } poison, double %10, 0",
+                                     "%13 = insertvalue { double, double } %12, double %11, 1",
+                                     "store { double, double } %13, ptr %14, align 8"});
+  expect_lines(function(ir, "sub"), {"%9 = fsub float %5, %7", "%10 = fsub float %6, %8"});
+  expect_lines(function(ir, "neg"),
+               {"%3 = extractvalue { float, float } %2, 0",
+                "%4 = extractvalue { float, float } %2, 1", "%5 = fneg float %3",
+                "%6 = fneg float %4", "%7 = insertvalue { float, float } poison, float %5, 0",
+                "%8 = insertvalue { float, float } %7, float %6, 1"});
+}
+
+static const char *complex_helpers =
+    "void mul(float _Complex *f, double _Complex *d, long double _Complex *l) {\n"
+    "  *f = *f * *f; *d = *d * *d; *l = *l * *l; *f = *f / *f; *d /= *d; *l = *l / *l; }\n"
+    "void twice(double _Complex *d) { *d = *d * *d; *d = *d * *d; }\n";
+
+TEST(CodegenComplexTest, MultiplicationAndDivisionCallLibgccOnWindows) {
+  std::string ir = generate(complex_helpers);
+  expect_lines(
+      function(ir, "mul"),
+      {"%complex.3 = alloca { double, double }, align 8",
+       "%complex.4 = alloca { x86_fp80, x86_fp80 }, align 16",
+       "%complex.5 = alloca x86_fp80, align 16", "%complex.8 = alloca x86_fp80, align 16",
+       "%11 = call i64 @__mulsc3(float %7, float %8, float %9, float %10)",
+       "%12 = bitcast i64 %11 to <2 x float>", "%13 = extractelement <2 x float> %12, i32 0",
+       "%14 = extractelement <2 x float> %12, i32 1",
+       "%15 = insertvalue { float, float } poison, float %13, 0",
+       "call void @__muldc3(ptr sret({ double, double }) %complex.3, double %22, double %23, "
+       "double %24, double %25)",
+       "%26 = load { double, double }, ptr %complex.3, align 8",
+       "store x86_fp80 %32, ptr %complex.5, align 16",
+       "store x86_fp80 %35, ptr %complex.8, align 16",
+       "call void @__mulxc3(ptr sret({ x86_fp80, x86_fp80 }) %complex.4, ptr %complex.5, "
+       "ptr %complex.6, ptr %complex.7, ptr %complex.8)",
+       "%36 = load { x86_fp80, x86_fp80 }, ptr %complex.4, align 16",
+       "%46 = call i64 @__divsc3(float %42, float %43, float %44, float %45)",
+       "call void @__divdc3(ptr sret({ double, double }) %complex.9, double %57, double "
+       "%58, double %59, double %60)",
+       "call void @__divxc3(ptr sret({ x86_fp80, x86_fp80 }) %complex.10, ptr %complex.11, "
+       "ptr %complex.12, ptr %complex.13, ptr %complex.14)"});
+  for (const char *line : {"declare i64 @__mulsc3(float, float, float, float)",
+                           "declare void @__muldc3(ptr, double, double, double, double)",
+                           "declare void @__mulxc3(ptr, ptr, ptr, ptr, ptr)",
+                           "declare i64 @__divsc3(float, float, float, float)",
+                           "declare void @__divdc3(ptr, double, double, double, double)",
+                           "declare void @__divxc3(ptr, ptr, ptr, ptr, ptr)"})
+    EXPECT_EQ(count(ir, std::string("\n") + line + "\n"), 1) << line << "\n" << ir;
+  expect_lines(function(ir, "twice"), {"%complex.1 = alloca { double, double }, align 8",
+                                       "%complex.2 = alloca { double, double }, align 8"});
+}
+
+TEST(CodegenComplexTest, MultiplicationAndDivisionCallLibgccOnLinux) {
+  std::string ir = generate(complex_helpers, TARGET_LINUX_X64);
+  std::string mul = function(ir, "mul");
+  expect_lines(mul, {"%11 = call <2 x float> @__mulsc3(float %7, float %8, float %9, float %10)",
+                     "%12 = extractelement <2 x float> %11, i32 0",
+                     "%13 = extractelement <2 x float> %11, i32 1",
+                     "%25 = call { double, double } @__muldc3(double %21, double %22, double %23, "
+                     "double %24)",
+                     "%35 = call { x86_fp80, x86_fp80 } @__mulxc3(x86_fp80 %31, x86_fp80 %32, "
+                     "x86_fp80 %33, x86_fp80 %34)",
+                     "%45 = call <2 x float> @__divsc3(float %41, float %42, float %43, float %44)",
+                     "%59 = call { double, double } @__divdc3(double %55, double %56, double %57, "
+                     "double %58)",
+                     "%68 = call { x86_fp80, x86_fp80 } @__divxc3(x86_fp80 %64, x86_fp80 %65, "
+                     "x86_fp80 %66, x86_fp80 %67)"});
+  EXPECT_EQ(count(mul, "alloca"), 3) << mul;
+  EXPECT_EQ(count(mul, "bitcast"), 0) << mul;
+  for (const char *line : {"declare <2 x float> @__mulsc3(float, float, float, float)",
+                           "declare { double, double } @__muldc3(double, double, double, double)",
+                           "declare { x86_fp80, x86_fp80 } @__mulxc3(x86_fp80, x86_fp80, "
+                           "x86_fp80, x86_fp80)",
+                           "declare <2 x float> @__divsc3(float, float, float, float)"})
+    EXPECT_EQ(count(ir, std::string("\n") + line + "\n"), 1) << line << "\n" << ir;
+}
+
+TEST(CodegenComplexTest, ConversionsTakeOrSupplyTheImaginaryPart) {
+  std::string body = function(
+      generate("void conv(double _Complex *z, float *f, int *i, _Bool *b, long double _Complex *l) "
+               "{ *f = *z; *i = *z; *b = *z; *l = *z; *z = *i; }\n"),
+      "conv");
+  expect_lines(
+      body, {"%7 = extractvalue { double, double } %6, 0", "%8 = fptrunc double %7 to float",
+             "%12 = extractvalue { double, double } %11, 0", "%13 = fptosi double %12 to i32",
+             "%17 = extractvalue { double, double } %16, 0",
+             "%18 = fcmp une double %17, 0x0000000000000000",
+             "%19 = extractvalue { double, double } %16, 1",
+             "%20 = fcmp une double %19, 0x0000000000000000", "%21 = or i1 %18, %20",
+             "%22 = zext i1 %21 to i8", "%26 = extractvalue { double, double } %25, 0",
+             "%27 = fpext double %26 to x86_fp80", "%28 = extractvalue { double, double } %25, 1",
+             "%29 = fpext double %28 to x86_fp80",
+             "%31 = insertvalue { x86_fp80, x86_fp80 } %30, x86_fp80 %29, 1",
+             "%35 = sitofp i32 %34 to double",
+             "%36 = insertvalue { double, double } poison, double %35, 0",
+             "%37 = insertvalue { double, double } %36, double 0x0000000000000000, 1"});
+}
+
+TEST(CodegenComplexTest, EqualityComparesBothPartsAndAConditionTestsEither) {
+  std::string ir = generate("int eq(double _Complex *a, double _Complex *b) {\n"
+                            "  return (*a == *b) + (*a != *b); }\n"
+                            "int cond(float _Complex *z) { if (*z) return 1; return 0; }\n");
+  expect_lines(function(ir, "eq"), {"%10 = fcmp oeq double %6, %8", "%11 = fcmp oeq double %7, %9",
+                                    "%12 = and i1 %10, %11", "%22 = fcmp une double %18, %20",
+                                    "%23 = fcmp une double %19, %21", "%24 = or i1 %22, %23"});
+  expect_lines(
+      function(ir, "cond"),
+      {"%3 = extractvalue { float, float } %2, 0", "%4 = fcmp une float %3, 0x0000000000000000",
+       "%5 = extractvalue { float, float } %2, 1", "%6 = fcmp une float %5, 0x0000000000000000",
+       "%7 = or i1 %4, %6", "br i1 %7, label %if.then.1, label %if.end.2"});
+}
+
+TEST(CodegenComplexTest, StaticComplexObjectsHoldBothParts) {
+  std::string ir = generate("double _Complex sd = 1.0 - 2.0i;\n"
+                            "float _Complex sf = 3.0f + 4.0iF;\n"
+                            "long double _Complex sl = 1.0L + 1.0iL;\n");
+  for (
+      const char *line :
+      {"@sd = global [16 x i8] c\"\\00\\00\\00\\00\\00\\00\\F0?\\00\\00\\00\\00\\00\\00\\00\\C0\", "
+       "align 8",
+       "@sf = global [8 x i8] c\"\\00\\00@@\\00\\00\\80@\", align 4",
+       "@sl = global [32 x i8] c\"\\00\\00\\00\\00\\00\\00\\00\\80\\FF?\\00\\00\\00\\00\\00\\00\\00"
+       "\\00\\00\\00\\00\\00\\00\\80\\FF?\\00\\00\\00\\00\\00\\00\", align 16"})
+    EXPECT_TRUE(has_line(ir, line)) << line << "\nin:\n" << ir;
+}
+
+TEST(CodegenBuiltinTest, OffsetofAddsEachVariableIndex) {
+  std::string ir = generate("struct r { int a; char b[10]; struct { int x[4]; } in[3]; };\n"
+                            "long off(int i) { return __builtin_offsetof(struct r, in[i].x[2]) +\n"
+                            "  __builtin_offsetof(struct r, b[3]); }\n"
+                            "int compat(void) { return __builtin_types_compatible_p(int, const int)"
+                            " + __builtin_types_compatible_p(int, long); }\n");
+  expect_lines(function(ir, "off"), {"%2 = sext i32 %1 to i64", "%3 = mul i64 %2, 16",
+                                     "%4 = add i64 24, %3", "%5 = add i64 %4, 7"});
+  expect_lines(function(ir, "compat"), {"%0 = add i32 1, 0"});
+}
+
+TEST(CodegenBuiltinTest, ChooseExprIsItsChosenOperand) {
+  std::string body = function(generate("int choose(void) { int x = 5; double y = 2.5;\n"
+                                       "  __builtin_choose_expr(1, x, y) = 9;\n"
+                                       "  return __builtin_choose_expr(0, x, y) > 1; }\n"),
+                              "choose");
+  expect_lines(body, {"store i32 5, ptr %x.0, align 4", "store i32 9, ptr %x.0, align 4",
+                      "%0 = load double, ptr %y.1, align 8", "%2 = fcmp ogt double %0, %1"});
+  expect_lines(
+      function(generate("int rv(int x) { return __builtin_choose_expr(1, x + 1, 2.0); }\n"), "rv"),
+      {"%1 = load i32, ptr %x.0, align 4", "%2 = add i32 %1, 1", "ret i32 %2"});
+}
+
+TEST(CodegenBuiltinTest, InfinityAndNanAreConstantsOfTheirType) {
+  std::string body = function(generate("void inf(double *d, float *f, long double *l) {\n"
+                                       "  *d = __builtin_huge_val(); *f = __builtin_inff();\n"
+                                       "  *l = __builtin_huge_vall(); *f = __builtin_nanf(\"\");\n"
+                                       "  *f = __builtin_huge_valf(); }\n"),
+                              "inf");
+  expect_lines(body, {"store double 0x7FF0000000000000, ptr %3, align 8",
+                      "store float 0x7FF0000000000000, ptr %4, align 4",
+                      "store x86_fp80 0xK7FFF8000000000000000, ptr %5, align 16",
+                      "store float 0x7FF8000000000000, ptr %6, align 4",
+                      "store float 0x7FF0000000000000, ptr %7, align 4"});
+}
+
+TEST(CodegenBuiltinTest, ClassificationComparisonsAreQuiet) {
+  std::string body =
+      function(generate("int order(double a, double b) { return __builtin_isgreater(a, b) +\n"
+                        "  __builtin_isgreaterequal(a, b) + __builtin_isless(a, b) +\n"
+                        "  __builtin_islessequal(a, b) + __builtin_islessgreater(a, b) +\n"
+                        "  __builtin_isunordered(a, b); }\n"),
+               "order");
+  expect_lines(body, {"%4 = fcmp ogt double %2, %3", "%5 = zext i1 %4 to i32",
+                      "%8 = fcmp oge double %6, %7", "%13 = fcmp olt double %11, %12",
+                      "%18 = fcmp ole double %16, %17", "%23 = fcmp one double %21, %22",
+                      "%28 = fcmp uno double %26, %27"});
+}
+
+TEST(CodegenBuiltinTest, SignbitAndLlabsMatchGcc) {
+  std::string ir = generate("int sign(float f, double d, long double *l) {\n"
+                            "  return __builtin_signbitf(f) + __builtin_signbit(d) +\n"
+                            "  __builtin_signbitl(*l); }\n"
+                            "long long ab(long long v) { return __builtin_llabs(v); }\n");
+  expect_lines(function(ir, "sign"),
+               {"%4 = bitcast float %3 to i32", "%5 = and i32 %4, -2147483648",
+                "%7 = bitcast double %6 to i64", "%8 = lshr i64 %7, 63", "%9 = trunc i64 %8 to i32",
+                "%13 = bitcast x86_fp80 %12 to i80", "%14 = lshr i80 %13, 79",
+                "%15 = trunc i80 %14 to i32", "%16 = shl i32 %15, 9"});
+  expect_lines(function(ir, "ab"), {"%2 = icmp slt i64 %1, 0", "%3 = sub i64 0, %1",
+                                    "%4 = select i1 %2, i64 %3, i64 %1", "ret i64 %4"});
+}
+
+TEST(CodegenBuiltinTest, TrapAndUnreachableEndTheirBlock) {
+  std::string ir = generate("int trap(int i) { if (i) __builtin_trap(); return 1; }\n"
+                            "int unr(int i) { if (i) __builtin_unreachable(); return 2; }\n");
+  expect_lines(function(ir, "trap"),
+               {"if.then.1:", "call void @llvm.trap()", "unreachable", "if.end.2:"});
+  std::string unr = function(ir, "unr");
+  expect_lines(unr, {"if.then.1:", "unreachable", "if.end.2:"});
+  EXPECT_EQ(count(unr, "trap"), 0) << unr;
+  EXPECT_EQ(count(ir, "declare void @llvm.trap()\n"), 1) << ir;
+  EXPECT_EQ(count(generate("int f(void) { return 0; }"), "trap"), 0);
+}
+
+TEST(CodegenBuiltinTest, TgmathCallsTheChosenFunction) {
+  std::string ir = generate("#include <tgmath.h>\n"
+                            "float f(float x) { return sqrt(x); }\n"
+                            "double g(int x) { return sqrt(x); }\n",
+                            TARGET_WINDOWS_X64, true);
+  expect_lines(function(ir, "f"), {"%2 = call float (float) @sqrtf(float %1)"});
+  expect_lines(function(ir, "g"), {"%3 = call double (double) @sqrt(double %2)"});
+  EXPECT_TRUE(has_line(ir, "declare float @sqrtf(float)")) << ir;
+}
+
+static const char *asm_source =
+    "int one(int x) { int r; __asm__(\"movl %1, %0\\n\\taddl $1, %0\" : \"=r\"(r) : \"r\"(x));\n"
+    "  return r; }\n"
+    "int two(int x) { int lo, hi; __asm__(\"movl %2, %0\\n\\tmovl %3, %1\" : \"=&r\"(lo),\n"
+    "  \"=r\"(hi) : \"g\"(x), \"0\"(5)); return lo + hi; }\n"
+    "int tied(int y) { __asm__ volatile(\"addl $5, %0\" : \"+r\"(y)); return y; }\n"
+    "long mem(long q) { __asm__(\"incq %q0 # 100%% %=\" : \"+m\"(q) : \"i\"(7)); return q; }\n"
+    "void basic(void) { __asm__(\"movl %eax, %eax\"); }\n"
+    "unsigned regs(unsigned a, unsigned d) { __asm__(\"xchgl %0, %1\" : \"+a\"(a), \"+d\"(d)\n"
+    "  : \"S\"(1), \"D\"(2), \"b\"(3), \"c\"(4) : \"%edx\", \"memory\", \"cc\"); return a; }\n"
+    "void memory(int *p) { __asm__(\"movl $7, %0\" : \"=m\"(*p) : \"m\"(*p)); }\n";
+
+TEST(CodegenAsmTest, RegisterOutputsAreTheCallsResult) {
+  std::string ir = generate(asm_source);
+  expect_lines(function(ir, "one"), {"%2 = call i32 asm \"movl $1, $0\\0A\\09addl $$1, $0\", "
+                                     "\"=r,r,~{dirflag},~{fpsr},~{flags}\"(i32 %1)",
+                                     "store i32 %2, ptr %r.1, align 4"});
+  expect_lines(function(ir, "two"),
+               {"%2 = call { i32, i32 } asm \"movl $2, $0\\0A\\09movl $3, $1\", "
+                "\"=&r,=r,imr,0,~{dirflag},~{fpsr},~{flags}\"(i32 %1, i32 5)",
+                "%3 = extractvalue { i32, i32 } %2, 0", "store i32 %3, ptr %lo.1, align 4",
+                "%4 = extractvalue { i32, i32 } %2, 1", "store i32 %4, ptr %hi.2, align 4"});
+}
+
+TEST(CodegenAsmTest, ReadWriteOperandsAreTiedAfterTheInputs) {
+  std::string ir = generate(asm_source);
+  expect_lines(function(ir, "tied"), {"%1 = load i32, ptr %y.0, align 4",
+                                      "%2 = call i32 asm sideeffect \"addl $$5, $0\", "
+                                      "\"=r,0,~{dirflag},~{fpsr},~{flags}\"(i32 %1)",
+                                      "store i32 %2, ptr %y.0, align 4"});
+  expect_lines(function(ir, "mem"),
+               {"call void asm \"incq ${0:q} # 100% ${:uid}\", "
+                "\"=*m,i,*m,~{dirflag},~{fpsr},~{flags}\"(ptr elementtype(i32) %q.0, i32 7, "
+                "ptr elementtype(i32) %q.0)"});
+  expect_lines(function(ir, "memory"),
+               {"call void asm \"movl $$7, $0\", \"=*m,*m,~{dirflag},~{fpsr},~{flags}\"(ptr "
+                "elementtype(i32) %1, ptr elementtype(i32) %2)"});
+}
+
+TEST(CodegenAsmTest, BasicAsmKeepsItsPercentSigns) {
+  expect_lines(function(generate(asm_source), "basic"),
+               {"call void asm sideeffect \"movl %eax, %eax\", "
+                "\"~{dirflag},~{fpsr},~{flags}\"()"});
+  expect_lines(function(generate("void percent(void) { __asm__(\"# 50%% %0 %=\"); }\n"), "percent"),
+               {"call void asm sideeffect \"# 50%% %0 %=\", \"~{dirflag},~{fpsr},~{flags}\"()"});
+}
+
+TEST(CodegenAsmTest, RegisterLettersAndClobbersAreTranslated) {
+  expect_lines(function(generate(asm_source), "regs"),
+               {"%4 = call { i32, i32 } asm \"xchgl $0, $1\", "
+                "\"={ax},={dx},{si},{di},{bx},{cx},0,1,~{edx},~{memory},~{cc},~{dirflag},~{fpsr},"
+                "~{flags}\"(i32 1, i32 2, i32 3, i32 4, i32 %2, i32 %3)",
+                "%5 = extractvalue { i32, i32 } %4, 0", "%6 = extractvalue { i32, i32 } %4, 1"});
+}
+
+TEST(CodegenSetjmpTest, ReturnsTwiceMarksTheCallAndTheDeclaration) {
+  const char *source = "#include <setjmp.h>\n"
+                       "static jmp_buf e;\n"
+                       "int f(void) { if (setjmp(e)) return 1; return 0; }\n";
+  std::string windows_ir = generate(source, TARGET_WINDOWS_X64, true);
+  expect_lines(function(windows_ir, "f"), {"%0 = call ptr () @mingw_getsp()",
+                                           "%1 = call i32 (ptr, ptr) @_setjmp(ptr @e, ptr %0) #0"});
+  EXPECT_TRUE(has_line(windows_ir, "declare i32 @_setjmp(ptr, ptr) #0")) << windows_ir;
+  EXPECT_TRUE(has_line(windows_ir, "declare ptr @mingw_getsp()")) << windows_ir;
+  EXPECT_EQ(count(windows_ir, "attributes #0 = { returns_twice }\n"), 1) << windows_ir;
+  std::string linux_ir = generate(source, TARGET_LINUX_X64, true);
+  expect_lines(function(linux_ir, "f"), {"%0 = call i32 (ptr) @_setjmp(ptr @e) #0"});
+  EXPECT_TRUE(has_line(linux_ir, "declare i32 @_setjmp(ptr) #0")) << linux_ir;
+  std::string referred = generate("int setjmp(void *);\nvoid *p = (void *)&setjmp;\n");
+  EXPECT_TRUE(has_line(referred, "declare i32 @setjmp(ptr) #0")) << referred;
+  EXPECT_TRUE(has_line(referred, "attributes #0 = { returns_twice }")) << referred;
+  EXPECT_EQ(count(generate("int f(void) { return 0; }"), "attributes"), 0);
+}
+
+TEST(CodegenPragmaTest, FpContractNeverFusesAMultiplyAndAnAdd) {
+  std::string body =
+      function(generate("#pragma STDC FP_CONTRACT ON\n"
+                        "double f(double a, double b, double c) { return a * b + c; }\n"),
+               "f");
+  expect_lines(body, {"%5 = fmul double %3, %4", "%7 = fadd double %5, %6"});
+  EXPECT_EQ(count(body, "fma"), 0) << body;
+  EXPECT_EQ(count(body, "contract"), 0) << body;
+}
+
 static std::string read_file(const std::string &path) {
   std::ifstream in(path, std::ios::binary);
   std::stringstream text;
@@ -1438,7 +1772,7 @@ TEST_P(CodegenProgramTest, RunsAndMatchesGcc) {
   bool windows = test.kind == TARGET_WINDOWS_X64;
   std::string base = std::string("codegen_") + test.name + (windows ? "_windows" : "_linux");
   std::string source = read_file(std::string(CODEGEN_PROGRAMS_DIR) + "/" + test.name + ".c");
-  std::string ir = generate(source.c_str(), test.kind);
+  std::string ir = generate(source.c_str(), test.kind, true);
   {
     std::ofstream out(base + ".ll", std::ios::binary);
     out << ir;
@@ -1458,7 +1792,7 @@ TEST_P(CodegenProgramTest, RunsAndMatchesGcc) {
     status = run(".\\" + base + ".exe > " + base + ".txt");
     _putenv_s("PATH", old_path.c_str());
   } else {
-    ASSERT_EQ(run("wsl gcc " + base + ".o -o " + base), 0);
+    ASSERT_EQ(run("wsl gcc " + base + ".o -o " + base + " -lm"), 0);
     status = run("wsl ./" + base + " > " + base + ".txt");
   }
   std::string actual = read_file(base + ".txt") + "exit " + std::to_string(status) + "\n";
@@ -1478,7 +1812,11 @@ INSTANTIATE_TEST_SUITE_P(
         ProgramCase{"records", TARGET_WINDOWS_X64}, ProgramCase{"records", TARGET_LINUX_X64},
         ProgramCase{"bitfields", TARGET_WINDOWS_X64}, ProgramCase{"bitfields", TARGET_LINUX_X64},
         ProgramCase{"globals", TARGET_WINDOWS_X64}, ProgramCase{"globals", TARGET_LINUX_X64},
-        ProgramCase{"vla", TARGET_WINDOWS_X64}, ProgramCase{"vla", TARGET_LINUX_X64}),
+        ProgramCase{"vla", TARGET_WINDOWS_X64}, ProgramCase{"vla", TARGET_LINUX_X64},
+        ProgramCase{"complex", TARGET_WINDOWS_X64}, ProgramCase{"complex", TARGET_LINUX_X64},
+        ProgramCase{"builtins", TARGET_WINDOWS_X64}, ProgramCase{"builtins", TARGET_LINUX_X64},
+        ProgramCase{"asm", TARGET_WINDOWS_X64}, ProgramCase{"asm", TARGET_LINUX_X64},
+        ProgramCase{"setjmp", TARGET_WINDOWS_X64}, ProgramCase{"setjmp", TARGET_LINUX_X64}),
     [](const testing::TestParamInfo<ProgramCase> &info) {
       return std::string(info.param.name) +
              (info.param.kind == TARGET_WINDOWS_X64 ? "Windows" : "Linux");

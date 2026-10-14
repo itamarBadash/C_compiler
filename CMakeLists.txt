@@ -107,6 +107,8 @@ add_executable(CodegenTests tests/test_codegen.cpp src/codegen.c src/preprocesso
 target_compile_definitions(CodegenTests PRIVATE
         CLANG_PATH="C:/Program Files/LLVM/bin/clang.exe"
         GCC_PATH="${CMAKE_C_COMPILER}"
-        CODEGEN_PROGRAMS_DIR="${CMAKE_SOURCE_DIR}/tests/codegen")
+        CODEGEN_PROGRAMS_DIR="${CMAKE_SOURCE_DIR}/tests/codegen"
+        LIB_INCLUDE_DIR="${CMAKE_SOURCE_DIR}/lib/include"
+        SYSROOT_DIR="${CMAKE_SOURCE_DIR}/tests/sysroot")
 target_link_libraries(CodegenTests gtest_main)
 gtest_discover_tests(CodegenTests)
