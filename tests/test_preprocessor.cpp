@@ -4614,3 +4614,164 @@ TEST_F(IncludeNextTest, PastTheLastFolderTheNameAsWrittenIsNotTried) {
   std::vector<std::string> expected = {"found_by_path"};
   EXPECT_EQ(spellings(), expected);
 }
+
+class ExpansionLocationTest : public ::testing::Test {
+protected:
+  token_buf tb;
+  bool initialised = false;
+  int rc = 0;
+
+  void run(const char *source) {
+    rc = pp_run_ex(&tb, source, "main.c", nullptr, 0, nullptr, 0);
+    initialised = true;
+  }
+
+  void TearDown() override {
+    if (initialised)
+      token_buf_free(&tb);
+  }
+
+  const token &nth(int index) {
+    return tb.tokens[index];
+  }
+
+  std::vector<std::string> spellings() {
+    std::vector<std::string> out;
+    for (int i = 0; i < tb.count; i++) {
+      if (tb.tokens[i].type != TOKEN_EOF)
+        out.push_back(tb.tokens[i].value ? tb.tokens[i].value : "<null>");
+    }
+    return out;
+  }
+};
+
+TEST_F(ExpansionLocationTest, TokensFromAnExpansionRecordWhereTheMacroWasInvoked) {
+  run("#define TWO 1 + 1\nint x = TWO;\n");
+  ASSERT_EQ(rc, 0);
+  std::vector<std::string> expected = {"int", "x", "=", "1", "+", "1", ";"};
+  ASSERT_EQ(spellings(), expected);
+  for (int i : {3, 4, 5}) {
+    EXPECT_STREQ(nth(i).expansion_file, "main.c") << i;
+    EXPECT_EQ(nth(i).expansion_file, nth(0).file) << "the interned name, not a copy";
+    EXPECT_EQ(nth(i).expansion_line, 2) << i;
+    EXPECT_EQ(nth(i).line, 1) << "the token still points into the #define for diagnostics";
+  }
+  for (int i : {0, 1, 2, 6}) {
+    EXPECT_EQ(nth(i).expansion_file, nullptr) << i;
+    EXPECT_EQ(nth(i).expansion_line, 0) << i;
+  }
+}
+
+TEST_F(ExpansionLocationTest, NestedExpansionsRecordTheOutermostInvocation) {
+  run("#define IN 7\n#define OUT IN\n\nOUT\n");
+  ASSERT_EQ(rc, 0);
+  ASSERT_EQ(spellings(), std::vector<std::string>{"7"});
+  EXPECT_EQ(nth(0).expansion_line, 4);
+  EXPECT_EQ(nth(0).line, 1);
+}
+
+TEST_F(ExpansionLocationTest, ArgumentsRecordTheInvocationOfTheirMacro) {
+  run("#define F(a) a\nF(\n  z) after\n");
+  ASSERT_EQ(rc, 0);
+  ASSERT_EQ(spellings(), (std::vector<std::string>{"z", "after"}));
+  EXPECT_EQ(nth(0).expansion_line, 2);
+  EXPECT_EQ(nth(0).line, 3);
+  EXPECT_EQ(nth(1).expansion_line, 0) << "a token read after the expansion is not part of it";
+}
+
+TEST_F(ExpansionLocationTest, ExpansionsInsideAHeaderRecordTheHeaderLine) {
+  run("#define V 5\n#line 40 \"other.h\"\nV\n");
+  ASSERT_EQ(rc, 0);
+  ASSERT_EQ(spellings(), std::vector<std::string>{"5"});
+  EXPECT_STREQ(nth(0).expansion_file, "other.h");
+  EXPECT_EQ(nth(0).expansion_line, 40);
+  EXPECT_STREQ(nth(0).file, "main.c");
+}
+
+TEST_F(ExpansionLocationTest, AnExpansionAtTheStartOfALineStartsTheLine) {
+  run("#define V 5\n#define E\nint a = V;\nV;\nE int b;\n");
+  ASSERT_EQ(rc, 0);
+  std::vector<std::string> expected = {"int", "a", "=", "5", ";", "5", ";", "int", "b", ";"};
+  ASSERT_EQ(spellings(), expected);
+  std::vector<int> starts;
+  for (int i = 0; i < 10; i++)
+    starts.push_back(nth(i).at_line_start);
+  EXPECT_EQ(starts, (std::vector<int>{1, 0, 0, 0, 0, 1, 0, 1, 0, 0}))
+      << "the first token out of a line-start expansion begins the line, even when the "
+         "expansion is empty and the token comes after it";
+}
+
+TEST_F(ExpansionLocationTest, ALineStartInsideAnExpansionDoesNotLeak) {
+  run("#define F(a) a\n#define W(x) x\nint F(\nz) F(\nW)(y);\n");
+  ASSERT_EQ(rc, 0);
+  std::vector<std::string> expected = {"int", "z", "y", ";"};
+  ASSERT_EQ(spellings(), expected);
+  EXPECT_EQ(nth(1).at_line_start, 0) << "z began a line only inside F's arguments";
+  EXPECT_EQ(nth(2).at_line_start, 0) << "W began a line inside F's arguments, not in the output";
+  EXPECT_EQ(nth(3).at_line_start, 0);
+}
+
+class CommandLineTest : public ::testing::Test {
+protected:
+  token_buf tb;
+  bool initialised = false;
+  int rc = 0;
+  std::string diagnostics;
+
+  void SetUp() override {
+    std::ofstream f("pp_command_line.c", std::ios::binary);
+    f << "CL _WIN32 __STDC_VERSION__ __FILE__\n";
+  }
+
+  void TearDown() override {
+    if (initialised)
+      token_buf_free(&tb);
+    remove("pp_command_line.c");
+  }
+
+  void run(const char *command_line) {
+    StderrCapture capture;
+    rc = pp_run_file_ex(&tb, "pp_command_line.c", command_line, nullptr, 0, nullptr, 0);
+    diagnostics = capture.finish();
+    initialised = true;
+  }
+
+  std::vector<std::string> spellings() {
+    std::vector<std::string> out;
+    for (int i = 0; i < tb.count; i++) {
+      if (tb.tokens[i].type != TOKEN_EOF)
+        out.push_back(tb.tokens[i].value ? tb.tokens[i].value : "<null>");
+    }
+    return out;
+  }
+};
+
+TEST_F(CommandLineTest, DefinitionsAndUndefinitionsComeBeforeTheFile) {
+  run("#define CL 3\n#undef _WIN32\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"3", "_WIN32", "199901L", "pp_command_line.c"};
+  EXPECT_EQ(spellings(), expected)
+      << "-U removes a target's predefined macro, and __FILE__ is still the main file";
+}
+
+TEST_F(CommandLineTest, WithoutACommandLineNothingChanges) {
+  run(nullptr);
+  EXPECT_EQ(rc, 0) << diagnostics;
+  std::vector<std::string> expected = {"CL", "1", "199901L", "pp_command_line.c"};
+  EXPECT_EQ(spellings(), expected);
+}
+
+TEST_F(CommandLineTest, ItsDiagnosticsNameTheCommandLine) {
+  run("#define CL 3\n#define\n");
+  EXPECT_EQ(rc, 1);
+  EXPECT_EQ(diagnostics.rfind("<command line>:2:", 0), 0u) << diagnostics;
+  EXPECT_EQ(spellings()[0], "3");
+}
+
+TEST_F(CommandLineTest, ItIsNotASystemHeader) {
+  run("#define CL 3\n");
+  EXPECT_EQ(rc, 0) << diagnostics;
+  ASSERT_EQ(spellings()[0], "3");
+  EXPECT_EQ(tb.tokens[0].system_header, 0);
+  EXPECT_EQ(tb.tokens[1].system_header, 1) << "_WIN32's value comes from <built-in>";
+}

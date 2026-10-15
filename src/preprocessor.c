@@ -112,7 +112,7 @@ static char *join_path(const char *dir, const char *name);
 static int source_push(pp *p, const char *text, const char *filename, int system_header);
 static void source_pop(pp *p);
 
-static int pp_init(pp *p, const char *source, const char *filename);
+static int pp_init(pp *p, const char *source, const char *filename, const char *command_line);
 static void pp_destroy(pp *p);
 
 static void pop_exhausted(pp *p);
@@ -393,12 +393,15 @@ static void source_pop(pp *p) {
   free(sf);
 }
 
-static int pp_init(pp *p, const char *source, const char *filename) {
+static int pp_init(pp *p, const char *source, const char *filename, const char *command_line) {
   *p = (pp){0};
   if (!source_push(p, source, filename, 0)) {
     return 0;
   }
   install_predefined_macros(p);
+  if (command_line && !source_push(p, command_line, "<command line>", 0)) {
+    return 0;
+  }
   return source_push(p, target_current()->predefines, "<built-in>", 1);
 }
 
@@ -436,7 +439,7 @@ static void pop_exhausted(pp *p) {
 
 static token pp_next(pp *p) {
   if (p == NULL || p->sources == NULL) {
-    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0, 0, 0};
+    token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0, 0, 0, NULL, 0};
     return t;
   }
   if (p->sources->has_pending) {
@@ -446,7 +449,7 @@ static token pp_next(pp *p) {
   pop_exhausted(p);
   if (p->stack != NULL) {
     if (p->stack->pos >= p->stack->count) {
-      token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0, 0, 0};
+      token t = {TOKEN_EOF, NULL, 1, 1, 0, NULL, 0, 0, 0, 0, NULL, 0};
       return t;
     }
     return clone_token(p->stack->tokens[p->stack->pos++]);
@@ -1062,6 +1065,8 @@ static void resolve_defined(pp *p, token *toks, int count, token **out, int *out
     n.leading_space = toks[i].leading_space;
     n.system_header = toks[i].system_header;
     n.pack = 0;
+    n.expansion_file = NULL;
+    n.expansion_line = 0;
     append_token(out, out_count, n);
     i += consumed;
   }
@@ -1158,6 +1163,8 @@ static token stringize(token hash, token *toks, int n) {
   out.leading_space = 0;
   out.system_header = from.system_header;
   out.pack = 0;
+  out.expansion_file = NULL;
+  out.expansion_line = 0;
 
   size_t cap = 32;
   size_t len = 0;
@@ -1430,7 +1437,7 @@ static void substitute(pp *p, macro *m, arg *args, int arg_count, int leading_sp
     int spaced = m->body[i].leading_space;
     token *piece = &m->body[i];
     int piece_count = 1;
-    token stringized = {TOKEN_EOF, NULL, 0, 0, 0, NULL, 0, 0, 0, 0};
+    token stringized = {TOKEN_EOF, NULL, 0, 0, 0, NULL, 0, 0, 0, 0, NULL, 0};
     int hashed = -1;
     if (m->is_function_like && m->body[i].type == TOKEN_HASH && i + 1 < m->body_count &&
         is_name(m->body[i + 1]))
@@ -1481,6 +1488,8 @@ static token make_dynamic_token(pp *p, dynamic_macro kind, token at) {
   out.leading_space = at.leading_space;
   out.system_header = at.system_header;
   out.pack = 0;
+  out.expansion_file = NULL;
+  out.expansion_line = 0;
 
   if (kind == DYNAMIC_LINE) {
     char buffer[32];
@@ -2448,9 +2457,9 @@ char *pp_splice_lines(const char *source) {
   return output;
 }
 
-int pp_run_ex(token_buf *out, const char *source, const char *filename, const char **include_dirs,
-              int include_dir_count, const char **system_dirs, int system_dir_count) {
-
+static int pp_run_all(token_buf *out, const char *source, const char *filename,
+                      const char *command_line, const char **include_dirs, int include_dir_count,
+                      const char **system_dirs, int system_dir_count) {
   if (out == NULL)
     return -1;
   token_buf_init(out);
@@ -2458,15 +2467,19 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
     return -1;
 
   pp p;
-  if (!pp_init(&p, source, filename)) {
+  if (!pp_init(&p, source, filename, command_line)) {
     return -1;
   }
   p.include_dirs = include_dirs;
   p.include_dir_count = include_dir_count;
   p.system_dirs = system_dirs;
   p.system_dir_count = system_dir_count;
+  const char *expansion_file = NULL;
+  int expansion_line = 0;
+  int line_start = 0;
   while (1) {
     token t = pp_next(&p);
+    int from_expansion = p.stack != NULL;
 
     if (t.type == TOKEN_EOF) {
       while (p.conds != file_conds(&p)) {
@@ -2494,7 +2507,13 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
       continue;
     }
 
+    if (!from_expansion) {
+      expansion_file = t.file;
+      expansion_line = t.line;
+    }
+    int at_line_start = t.at_line_start;
     if (try_expand(&p, &t)) {
+      line_start |= !from_expansion && at_line_start;
       continue;
     }
 
@@ -2505,6 +2524,13 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
     } else if (t.type == TOKEN_IDENTIFIER && strcmp(t.value, "__VA_ARGS__") == 0) {
       pp_error(&p, t.line, t.column, "__VA_ARGS__ can only appear in a variadic macro");
     }
+    if (from_expansion) {
+      t.expansion_file = expansion_file;
+      t.expansion_line = expansion_line;
+      t.at_line_start = 0;
+    }
+    t.at_line_start |= line_start;
+    line_start = 0;
     t.pack = p.pack;
     token_buf_push(out, t);
   }
@@ -2513,15 +2539,28 @@ int pp_run_ex(token_buf *out, const char *source, const char *filename, const ch
   return p.error_count;
 }
 
+int pp_run_ex(token_buf *out, const char *source, const char *filename, const char **include_dirs,
+              int include_dir_count, const char **system_dirs, int system_dir_count) {
+  return pp_run_all(out, source, filename, NULL, include_dirs, include_dir_count, system_dirs,
+                    system_dir_count);
+}
+
 int pp_run(token_buf *out, const char *source) {
   return pp_run_ex(out, source, NULL, NULL, 0, NULL, 0);
 }
 
 int pp_run_file(token_buf *out, const char *path, const char **include_dirs, int include_dir_count,
                 const char **system_dirs, int system_dir_count) {
+  return pp_run_file_ex(out, path, NULL, include_dirs, include_dir_count, system_dirs,
+                        system_dir_count);
+}
+
+int pp_run_file_ex(token_buf *out, const char *path, const char *command_line,
+                   const char **include_dirs, int include_dir_count, const char **system_dirs,
+                   int system_dir_count) {
   char *text = pp_read_file(path);
-  int result =
-      pp_run_ex(out, text, path, include_dirs, include_dir_count, system_dirs, system_dir_count);
+  int result = pp_run_all(out, text, path, command_line, include_dirs, include_dir_count,
+                          system_dirs, system_dir_count);
   free(text);
   return result;
 }

@@ -139,5 +139,7 @@ typedef struct token {
   int leading_space;
   int system_header;
   int pack;
+  const char *expansion_file;
+  int expansion_line;
 } token;
 #endif //_TOKEN_H_
