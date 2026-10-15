@@ -30,7 +30,13 @@ typedef struct options {
   target_kind target;
   const char *optimization;
   int verbose;
+  int gnu;
 } options;
+
+static const char *const optimizations[] = {"-O0", "-O1", "-O2", "-O3", "-Os", "-Oz", "-Og", NULL};
+
+static const char *const ignored_options[] = {
+    "-w", "-pedantic", "-pedantic-errors", "-fPIC", "-fpic", "-fPIE", "-fpie", NULL};
 
 static const char *const windows_libraries[] = {
     "-lmingw32", "-lgcc",      "-lgcc_eh",  "-lmoldname", "-lmingwex",  "-lmsvcrt",  "-lkernel32",
@@ -88,6 +94,20 @@ static void add_copy(list *l, const char *item) {
 static void add_all(list *l, const char *const *items) {
   for (int i = 0; items && items[i]; i++)
     add_copy(l, items[i]);
+}
+
+static void add_pieces(list *l, const char *text) {
+  char *copy = joined(text, "", "");
+  char *piece = copy;
+  while (piece) {
+    char *comma = strchr(piece, ',');
+    if (comma)
+      *comma = '\0';
+    if (*piece)
+      add_copy(l, piece);
+    piece = comma ? comma + 1 : NULL;
+  }
+  free(copy);
 }
 
 static void free_list(list *l) {
@@ -163,9 +183,30 @@ static void usage(void) {
          "  -U <name>        undefine a macro\n"
          "  -L <dir>         add a library search folder\n"
          "  -l <name>        link with library <name>\n"
-         "  -O0 ... -O3      optimization level\n"
+         "  -Wl,<a>,<b>      pass options to the linker\n"
+         "  -pthread         define _REENTRANT and link with -lpthread\n"
+         "  -std=c99         ISO C99 (the default)\n"
+         "  -std=gnu99       C99 without __STRICT_ANSI__\n"
+         "  -O0 ... -O3, -Os, -Oz, -Og\n"
+         "                   optimization level\n"
          "  --target=<t>     x86_64-w64-windows-gnu or x86_64-pc-linux-gnu\n"
-         "  -v               show the commands run\n");
+         "  -v               show the commands run\n"
+         "  -W..., -w, -pedantic, -g..., -fPIC, -fPIE\n"
+         "                   accepted, without effect\n");
+}
+
+static int listed(const char *arg, const char *const *names) {
+  for (int i = 0; names[i]; i++) {
+    if (strcmp(arg, names[i]) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+static int ignored(const char *arg) {
+  if (arg[1] == 'W')
+    return strncmp(arg, "-Wa,", 4) != 0 && strncmp(arg, "-Wp,", 4) != 0;
+  return arg[1] == 'g' || listed(arg, ignored_options);
 }
 
 static outcome parse_option(options *o, char **argv, int *i) {
@@ -191,14 +232,18 @@ static outcome parse_option(options *o, char **argv, int *i) {
     }
   } else if (strcmp(arg, "-O") == 0) {
     o->optimization = "-O1";
-  } else if (strcmp(arg, "-O0") == 0 || strcmp(arg, "-O1") == 0 || strcmp(arg, "-O2") == 0 ||
-             strcmp(arg, "-O3") == 0) {
+  } else if (listed(arg, optimizations)) {
     o->optimization = arg;
+  } else if (strcmp(arg, "-std=c99") == 0 || strcmp(arg, "-std=gnu99") == 0) {
+    o->gnu = arg[5] == 'g';
   } else if (strncmp(arg, "-std=", 5) == 0) {
-    if (strcmp(arg, "-std=c99") != 0) {
-      report("only -std=c99 is supported, not '%s'", arg);
-      return OUTCOME_FAILED;
-    }
+    report("only -std=c99 and -std=gnu99 are supported, not '%s'", arg);
+    return OUTCOME_FAILED;
+  } else if (strncmp(arg, "-Wl,", 4) == 0) {
+    add_copy(&o->inputs, arg);
+  } else if (strcmp(arg, "-pthread") == 0) {
+    add_define(o, "_REENTRANT", 0);
+    add_copy(&o->libraries, "-lpthread");
   } else if (arg[0] == '-' && arg[1] && strchr("oILlDU", arg[1])) {
     const char *value = arg[2] ? arg + 2 : argv[++*i];
     if (!value) {
@@ -216,8 +261,10 @@ static outcome parse_option(options *o, char **argv, int *i) {
     else
       add_define(o, value, arg[1] == 'U');
   } else if (arg[0] == '-' && arg[1]) {
-    report("unknown option '%s'", arg);
-    return OUTCOME_FAILED;
+    if (!ignored(arg)) {
+      report("unknown option '%s'", arg);
+      return OUTCOME_FAILED;
+    }
   } else {
     add_copy(&o->inputs, arg);
   }
@@ -230,16 +277,24 @@ static outcome parse_options(options *o, int argc, char **argv) {
     if (result != OUTCOME_CONTINUE)
       return result;
   }
-  if (o->inputs.count == 0) {
+  int files = 0;
+  int sources = 0;
+  for (int i = 0; i < o->inputs.count; i++) {
+    files += strncmp(o->inputs.items[i], "-Wl,", 4) != 0;
+    sources += ends_with(o->inputs.items[i], ".c");
+  }
+  if (files == 0) {
     report("no input files");
     return OUTCOME_FAILED;
   }
-  int sources = 0;
-  for (int i = 0; i < o->inputs.count; i++)
-    sources += ends_with(o->inputs.items[i], ".c");
   if (o->output && o->last != STAGE_LINK && sources > 1) {
     report("cannot specify '-o' with '-c', '-S' or '-E' with several files");
     return OUTCOME_FAILED;
+  }
+  if (o->gnu) {
+    char *defines = joined("#undef __STRICT_ANSI__\n", o->defines, "");
+    free(o->defines);
+    o->defines = defines;
   }
   return OUTCOME_CONTINUE;
 }
@@ -495,7 +550,9 @@ static int build(const options *o, const char *root) {
   int built = 1;
   for (int i = 0; i < o->inputs.count; i++) {
     const char *input = o->inputs.items[i];
-    if (!host_file_exists(input)) {
+    if (strncmp(input, "-Wl,", 4) == 0) {
+      add_pieces(&objects, input + 4);
+    } else if (!host_file_exists(input)) {
       report("cannot open '%s'", input);
       built = 0;
     } else if (ends_with(input, ".c")) {

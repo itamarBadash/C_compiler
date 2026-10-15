@@ -150,6 +150,15 @@ TEST_P(DriverProgramTest, WithoutDashOTheProgramIsNamedLikeGcc) {
   EXPECT_EQ(run_program(out, GetParam()), "hello world 1 1.414\nexit 3\n");
 }
 
+TEST_P(DriverProgramTest, ThreadedBuildsLink) {
+  TargetGuard guard(GetParam());
+  std::string out = program("threaded");
+  Outcome built = drive({target(), "-pthread", "-Wl,--no-gc-sections", source("data.c"),
+                         source("other.c"), "-o", out});
+  ASSERT_EQ(built.code, 0) << built.err;
+  EXPECT_EQ(run_program(out, GetParam()), "two 7 1\nexit 7\n");
+}
+
 TEST_P(DriverProgramTest, ToolsAreRunLikeGccRunsThem) {
   TargetGuard guard(GetParam());
   bool windows = GetParam() == TARGET_WINDOWS_X64;
@@ -331,6 +340,112 @@ TEST(DriverTest, BareDashOMeansLevelOne) {
   EXPECT_NE(command_of(built.err, "clang").find(" -O1 "), std::string::npos) << built.err;
 }
 
+TEST(DriverTest, FlagsFromBuildFilesAreAcceptedWithoutEffect) {
+  remove("driver_flags.exe");
+  Outcome built = drive({"-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter", "-w", "-pedantic",
+                         "-pedantic-errors", "-g", "-g3", "-ggdb", "-fPIC", "-fpic", "-fPIE",
+                         "-fpie", source("data.c"), source("other.c"), "-o", "driver_flags.exe"});
+  ASSERT_EQ(built.code, 0) << built.err;
+  EXPECT_EQ(built.err, "");
+  EXPECT_EQ(run_program("driver_flags.exe", TARGET_WINDOWS_X64), "two 7 1\nexit 7\n");
+}
+
+TEST(DriverTest, PreprocessorAndAssemblerPassThroughsAreStillRejected) {
+  Outcome preprocessor = drive({"-Wp,-DX=1", source("other.c")});
+  EXPECT_EQ(preprocessor.code, 1);
+  EXPECT_EQ(preprocessor.err, "error: unknown option '-Wp,-DX=1'\n");
+  Outcome assembler = drive({"-Wa,--noexecstack", source("other.c")});
+  EXPECT_EQ(assembler.code, 1);
+  EXPECT_EQ(assembler.err, "error: unknown option '-Wa,--noexecstack'\n");
+  Outcome other = drive({"-fwrapv", source("other.c")});
+  EXPECT_EQ(other.err, "error: unknown option '-fwrapv'\n")
+      << "an -f option that changes what code means is not ignored";
+}
+
+TEST(DriverTest, EveryOptimizationSpellingReachesClang) {
+  for (const char *level : {"-Os", "-Oz", "-Og", "-O3"}) {
+    Outcome built = drive({level, "-v", "-c", source("other.c"), "-o", "driver_level.o"});
+    ASSERT_EQ(built.code, 0) << built.err;
+    EXPECT_NE(command_of(built.err, "clang").find(std::string(" ") + level + " "),
+              std::string::npos)
+        << built.err;
+  }
+}
+
+TEST(DriverTest, LinkerOptionsReachTheLinkerInTheirPlace) {
+  Outcome object = drive({"-c", source("other.c"), "-o", "driver_wl_other.o"});
+  ASSERT_EQ(object.code, 0) << object.err;
+  remove("driver_map.txt");
+  Outcome built = drive({"-v", "driver_wl_other.o", "-Wl,-Map,driver_map.txt,,--no-gc-sections",
+                         source("data.c"), "-o", "driver_wl.exe"});
+  ASSERT_EQ(built.code, 0) << built.err;
+  std::string link = command_of(built.err, "ld.lld");
+  EXPECT_NE(link.find(" driver_wl_other.o -Map driver_map.txt --no-gc-sections "),
+            std::string::npos)
+      << link;
+  EXPECT_LT(link.find(" -Map "), link.find("cc99-")) << "data.c's object comes after the option";
+  EXPECT_TRUE(exists("driver_map.txt"));
+}
+
+TEST(DriverTest, LinkerOptionsAreNotInputs) {
+  Outcome alone = drive({"-Wl,--no-gc-sections"});
+  EXPECT_EQ(alone.code, 1);
+  EXPECT_EQ(alone.err, "error: no input files\n");
+  Outcome compiled =
+      drive({"-c", "-Wl,--no-such-linker-option", source("other.c"), "-o", "driver_wl_unused.o"});
+  EXPECT_EQ(compiled.code, 0) << "without linking, linker options are unused";
+  EXPECT_EQ(compiled.err, "");
+}
+
+TEST(DriverTest, PthreadDefinesReentrantAndLinksThePthreadLibrary) {
+  Outcome plain = drive({"-E", source("strict.c")});
+  ASSERT_EQ(plain.code, 0) << plain.err;
+  EXPECT_NE(plain.out.find("\n_REENTRANT\n"), std::string::npos) << plain.out;
+  Outcome threaded = drive({"-pthread", "-E", source("strict.c")});
+  ASSERT_EQ(threaded.code, 0) << threaded.err;
+  EXPECT_NE(threaded.out.find("\n1\n"), std::string::npos) << threaded.out;
+  Outcome linked =
+      drive({"-pthread", "-v", source("data.c"), source("other.c"), "-o", "driver_pthread.exe"});
+  ASSERT_EQ(linked.code, 0) << linked.err;
+  EXPECT_NE(command_of(linked.err, "ld.lld").find(" -lpthread -lmingw32 "), std::string::npos)
+      << linked.err;
+}
+
+TEST(DriverTest, Gnu99LeavesStrictAnsiUndefinedUnlessTheUserDefinesIt) {
+  struct Case {
+    std::vector<std::string> flags;
+    const char *mode;
+  };
+  std::vector<Case> cases = {
+      {{}, "strict"},
+      {{"-std=c99"}, "strict"},
+      {{"-std=gnu99"}, "gnu"},
+      {{"-std=gnu99", "-std=c99"}, "strict"},
+      {{"-std=c99", "-std=gnu99"}, "gnu"},
+      {{"-std=gnu99", "-D__STRICT_ANSI__"}, "strict"},
+  };
+  for (Case &c : cases) {
+    std::vector<std::string> args = c.flags;
+    args.push_back("-E");
+    args.push_back(source("strict.c"));
+    Outcome result = drive(args);
+    ASSERT_EQ(result.code, 0) << result.err;
+    EXPECT_NE(result.out.find(std::string("\n") + c.mode + "\n"), std::string::npos)
+        << c.mode << ":\n"
+        << result.out;
+  }
+}
+
+TEST(DriverTest, Gnu99ProgramsSeeTheSystemsExtensions) {
+  Outcome strict = drive({source("pi.c"), "-o", "driver_pi.exe"});
+  EXPECT_EQ(strict.code, 1);
+  EXPECT_NE(strict.err.find("use of undeclared identifier 'M_PI'"), std::string::npos)
+      << strict.err;
+  Outcome gnu = drive({"-std=gnu99", source("pi.c"), "-o", "driver_pi.exe"});
+  ASSERT_EQ(gnu.code, 0) << gnu.err;
+  EXPECT_EQ(run_program("driver_pi.exe", TARGET_WINDOWS_X64), "3.1416\nexit 0\n");
+}
+
 TEST(DriverTest, ArgumentsWithSpacesQuotesAndBackslashesReachToolsWhole) {
   std::string out = "driver spaced program.exe";
   remove(out.c_str());
@@ -378,7 +493,7 @@ TEST(DriverTest, BadCommandLinesAreRejected) {
       {{"x.c", "-o"}, "error: missing argument to '-o'\n"},
       {{"-I"}, "error: missing argument to '-I'\n"},
       {{"--target=arm-none-eabi", "x.c"}, "error: unknown target 'arm-none-eabi'\n"},
-      {{"-std=c11", "x.c"}, "error: only -std=c99 is supported, not '-std=c11'\n"},
+      {{"-std=c11", "x.c"}, "error: only -std=c99 and -std=gnu99 are supported, not '-std=c11'\n"},
       {{"-c", "-o", "x.o", "a.c", "b.c"},
        "error: cannot specify '-o' with '-c', '-S' or '-E' with several files\n"},
       {{"no_such_file.c"}, "error: cannot open 'no_such_file.c'\n"},
