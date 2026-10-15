@@ -23,7 +23,7 @@ struct Outcome {
 };
 
 static Outcome drive_from(const char *root, std::vector<std::string> args) {
-  std::string name = "C_compiler";
+  std::string name = "MMC99";
   std::vector<char *> argv = {&name[0]};
   for (std::string &arg : args)
     argv.push_back(&arg[0]);
@@ -519,11 +519,14 @@ TEST(DriverTest, OneErrorIsSingular) {
 TEST(DriverTest, HelpAndVersionPrintAndStop) {
   Outcome help = drive({"--help", "no_such_file.c"});
   EXPECT_EQ(help.code, 0);
-  EXPECT_EQ(help.out.rfind("usage: C_compiler [options] file...\n", 0), 0u) << help.out;
+  EXPECT_EQ(help.out.rfind("usage: MMC99 [options] file...\n", 0), 0u) << help.out;
   EXPECT_EQ(help.err, "");
   Outcome version = drive({"--version", "no_such_file.c"});
   EXPECT_EQ(version.code, 0);
-  EXPECT_NE(version.out.find("C99"), std::string::npos);
+  EXPECT_EQ(version.out.rfind("MMC99 " MMC99_VERSION ", a C99 compiler for ", 0), 0u)
+      << version.out;
+  EXPECT_NE(version.out.find("\nTheir licenses are in the licenses folder.\n"), std::string::npos)
+      << version.out;
   EXPECT_EQ(version.err, "");
 }
 
@@ -582,9 +585,9 @@ TEST(HostTest, TemporaryFilesHaveDistinctNames) {
 
 TEST(DriverTest, TheExecutableFindsItsToolchainFromItsOwnFolder) {
   remove("driver_main.exe");
-  ASSERT_EQ(run("\"" TOOLCHAIN_DIR "/bin/C_compiler.exe\" -DNUM=5 \"" + source("hello.c") +
+  ASSERT_EQ(run("\"" TOOLCHAIN_DIR "/bin/MMC99.exe\" -DNUM=5 \"" + source("hello.c") +
                 "\" -o driver_main.exe"),
             0);
   EXPECT_EQ(run_program("driver_main.exe", TARGET_WINDOWS_X64), "hello world 5 1.414\nexit 3\n");
-  EXPECT_EQ(run("\"" TOOLCHAIN_DIR "/bin/C_compiler.exe\" no_such_file.c 2> driver_main.txt"), 1);
+  EXPECT_EQ(run("\"" TOOLCHAIN_DIR "/bin/MMC99.exe\" no_such_file.c 2> driver_main.txt"), 1);
 }

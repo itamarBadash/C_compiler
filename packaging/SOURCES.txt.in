@@ -1,0 +1,49 @@
+MMC99 @MMC99_VERSION@ - where every file in this folder comes from
+
+@COMPILER_FILE@
+    Built from the MMC99 sources.
+
+include/
+    MMC99's own headers.
+
+@LLVM_FILES@
+    LLVM @LLVM_VERSION@, from @LLVM_ORIGIN@.
+    Source: https://github.com/llvm/llvm-project/releases/tag/llvmorg-@LLVM_VERSION@
+    License: licenses/LLVM (Apache License 2.0 with LLVM Exceptions)
+
+targets/x86_64-w64-windows-gnu/include
+targets/x86_64-w64-windows-gnu/lib, except the four GCC files below
+    MinGW-w64 @MINGW_VERSION@ headers and runtime, winpthreads included, unmodified,
+    from the MinGW-w64 build that ships with CLion.
+    Source: https://sourceforge.net/projects/mingw-w64/files/mingw-w64/mingw-w64-release/
+            (mingw-w64-v@MINGW_VERSION@)
+    License: licenses/MinGW-w64
+    default-manifest.o is windows-default-manifest; its license is
+    licenses/MinGW-w64/manifest/COPYING.
+    Left out because they are not part of MinGW-w64: libz.a, zlib.h, zconf.h
+    and libiconv.a.
+
+targets/x86_64-w64-windows-gnu/lib/crtbegin.o, crtend.o, libgcc.a, libgcc_eh.a
+    GCC @GCC_VERSION@'s runtime support, from the same MinGW-w64 build.
+    Source: https://ftp.gnu.org/gnu/gcc/gcc-@GCC_VERSION@/
+    License: licenses/GCC (GPL 3 with the GCC Runtime Library Exception; the
+    exception means programs you build with them owe nothing to the GPL)
+
+targets/x86_64-pc-linux-gnu/include
+    Ubuntu's libc6-dev @GLIBC_VERSION@ (glibc) and linux-libc-dev @LINUX_VERSION@
+    (Linux's headers), unmodified. The x86_64-linux-gnu folder is merged into
+    include. Where two Linux headers differ only in letter case, which a Windows
+    folder cannot hold, only the one that sorts first is kept.
+    Sources: https://launchpad.net/ubuntu/+source/@LINUX_LIBC_SOURCE@/@GLIBC_VERSION@
+             https://launchpad.net/ubuntu/+source/@LINUX_HEADERS_SOURCE@/@LINUX_VERSION@
+    Licenses: licenses/glibc/copyright, licenses/linux-libc-dev/copyright
+
+targets/x86_64-pc-linux-gnu/lib
+    glibc's link files, from libc6-dev and libc6 @GLIBC_VERSION@, and its dynamic
+    loader ld-linux-x86-64.so.2. libc.so and libm.so are copies of libc.so.6 and
+    libm.so.6, because Ubuntu's are linker scripts naming paths on a Linux
+    machine; libm.a, also a script, is left out.
+    libgcc.a, libgcc_eh.a and the crt*.o files from Ubuntu's @LIBGCC_PACKAGE@ @LIBGCC_VERSION@.
+    Sources: https://launchpad.net/ubuntu/+source/@LINUX_LIBC_SOURCE@/@GLIBC_VERSION@
+             https://launchpad.net/ubuntu/+source/@LINUX_GCC_SOURCE@/@LIBGCC_VERSION@
+    Licenses: licenses/glibc/copyright, licenses/libgcc-linux/copyright
