@@ -489,6 +489,8 @@ static token lexer_make_token(lexer *lex, token_type type, const char *value) {
   tok.leading_space = 0;
   tok.system_header = lex->system_header;
   tok.pack = 0;
+  tok.expansion_file = NULL;
+  tok.expansion_line = 0;
   if (value) {
     tok.value = strdup(value);
   } else {
@@ -606,7 +608,7 @@ static token lexer_collect_identifier(lexer *lex) {
 
 token lexer_next_token(lexer *lex) {
   if (!lex || !lex->source) {
-    token tok = {TOKEN_UNKNOWN, NULL, 0, 0, 0, NULL, 0, 0, 0, 0};
+    token tok = {TOKEN_UNKNOWN, NULL, 0, 0, 0, NULL, 0, 0, 0, 0, NULL, 0};
     return tok;
   }
 
