@@ -1,0 +1,28 @@
+MMC99 @MMC99_VERSION@ - a C99 compiler for Linux and Windows programs
+
+Unpack this folder anywhere. Nothing else needs to be installed:
+
+    tar -xzf MMC99-@MMC99_VERSION@-linux-x86_64.tar.gz
+
+Compile and run a program:
+
+    MMC99/bin/MMC99 hello.c -o hello
+    ./hello
+
+Build the same program for Windows:
+
+    MMC99/bin/MMC99 --target=x86_64-w64-windows-gnu hello.c -o hello.exe
+
+MMC99 runs on x86-64 Linux with glibc 2.34 or newer, libstdc++ and zlib:
+Ubuntu 22.04, Debian 12 and later have all three. The Linux programs it
+builds need glibc 2.34 or newer too.
+
+To type MMC99 from any folder, add MMC99/bin to PATH.
+"MMC99 --help" lists every option.
+
+MMC99 compiles all of C99 and uses each system's own C library: glibc on
+Linux, MinGW-w64's on Windows. Headers beyond C99 are included too, but some
+of them use extensions MMC99 does not support yet (windows.h is one). Those
+fail with an error message; MMC99 never builds a wrong program from them.
+
+SOURCES.txt says where every file comes from; licenses holds their licenses.

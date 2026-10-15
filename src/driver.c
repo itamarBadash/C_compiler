@@ -173,7 +173,7 @@ static void add_define(options *o, const char *value, int undefine) {
 }
 
 static void usage(void) {
-  printf("usage: C_compiler [options] file...\n"
+  printf("usage: MMC99 [options] file...\n"
          "  -o <file>        write the output to <file>\n"
          "  -c               compile to an object file, do not link\n"
          "  -S               compile to LLVM IR (.ll), do not assemble\n"
@@ -223,7 +223,10 @@ static outcome parse_option(options *o, char **argv, int *i) {
     usage();
     return OUTCOME_DONE;
   } else if (strcmp(arg, "--version") == 0) {
-    printf("C_compiler, a C99 compiler for x86_64-w64-windows-gnu and x86_64-pc-linux-gnu\n");
+    printf("MMC99 " MMC99_VERSION ", a C99 compiler for x86_64-w64-windows-gnu and "
+           "x86_64-pc-linux-gnu\n"
+           "It runs LLVM's clang and ld.lld, and links MinGW-w64's and glibc's files.\n"
+           "Their licenses are in the licenses folder.\n");
     return OUTCOME_DONE;
   } else if (strncmp(arg, "--target=", 9) == 0) {
     if (!parse_target(arg + 9, &o->target)) {
