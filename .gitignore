@@ -40,6 +40,9 @@ CTestTestfile.cmake
 _deps
 CMakeLists.txt.user
 
+# Release archives (built by the `release` target; published, never committed)
+release/
+
 # Build directories
 build/
 build-*/

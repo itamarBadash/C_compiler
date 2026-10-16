@@ -1,0 +1,16 @@
+# c-testsuite programs MMC99 is not expected to pass, one per line:
+#   <name> <windows|linux|both> <reason>
+# ConformanceTests fails if an excluded program starts passing, so this list cannot go stale.
+00046 both C11 anonymous structures and unions; C99 6.7.2.1 needs a declarator in each member declaration
+00050 both C11 anonymous structures and unions; C99 6.7.2.1 needs a declarator in each member declaration
+00095 both returns a function pointer as void *, which the assignment rules of C99 6.5.16.1 do not allow (6.8.6.4p3)
+00144 both assigns away a const qualifier, a constraint violation by C99 6.5.16.1p1
+00170 both forward-declared enum, which C99 6.7.2.3p2 forbids
+00206 both #pragma push_macro and pop_macro, a GCC extension
+00209 both forward-declared enum, which C99 6.7.2.3p2 forbids
+00210 both __attribute__((packed)), a GCC extension
+00212 windows expects one of __LP64__, __LLP64__ or __ILP32__, and GCC defines none of them for Windows
+00213 both statement expressions ({ ... }), a GCC extension
+00214 both statement expressions ({ ... }), a GCC extension
+00216 both an empty structure, which C99 6.7.2.1 does not allow
+00219 both _Generic, which is C11

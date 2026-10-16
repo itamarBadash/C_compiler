@@ -42,6 +42,8 @@ typedef struct symbol {
   int local_slot;
   source_loc loc;
   struct symbol *next;
+  struct symbol *bucket_next;
+  struct symbol *linked_next;
   struct symbol *all_next;
 } symbol;
 
@@ -51,6 +53,8 @@ typedef struct scope {
   symbol *ordinary_symbols;
   symbol *tag_symbols;
   symbol *label_symbols;
+  int ordinary_count;
+  symbol **ordinary_index;
 } scope;
 
 typedef struct symbol_table {

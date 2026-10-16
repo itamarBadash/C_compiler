@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define LINKED_BUCKETS 1024
+#define MEMBER_PATH_MAX 64
+
 typedef struct vm_scope {
   scope *scope;
   struct vm_scope *outer;
@@ -36,9 +39,11 @@ typedef struct sema {
   int in_sizeof;
   int variadic;
   type_info *va_list;
+  symbol *linked[LINKED_BUCKETS];
 } sema;
 
 static void resolve(sema *s, ast_node *node);
+static void convert_operands(sema *s, ast_node *node);
 static void resolve_type(sema *s, type_info *type, source_loc loc);
 static long long initialize_declared(sema *s, type_info *type, ast_node *value, int is_static,
                                      source_loc loc, initializer_layout *layout);
@@ -236,13 +241,13 @@ typedef struct constant {
 } constant;
 
 static constant constant_of(int_value value) {
-  constant out = {CONST_VALUE, value, NULL, {0, 0, NULL}};
+  constant out = {CONST_VALUE, value, NULL, {0, 0, NULL, 0}};
   return out;
 }
 
 static constant unknown_constant(prim_kind type) {
   int_value value = {type, 0};
-  constant out = {CONST_NO_VALUE, value, NULL, {0, 0, NULL}};
+  constant out = {CONST_NO_VALUE, value, NULL, {0, 0, NULL, 0}};
   return out;
 }
 
@@ -254,7 +259,7 @@ static constant failed_constant(prim_kind type, const char *problem, source_loc 
 
 static constant non_constant(void) {
   int_value value = {PRIM_INT, 0};
-  constant out = {CONST_NOT_CONSTANT, value, NULL, {0, 0, NULL}};
+  constant out = {CONST_NOT_CONSTANT, value, NULL, {0, 0, NULL, 0}};
   return out;
 }
 
@@ -825,7 +830,8 @@ static constant evaluate(sema *s, ast_node *node, int evaluated) {
       return non_constant();
     if (!node->symbol->has_value)
       return unknown_constant(PRIM_INT);
-    return constant_of(convert_value((unsigned long long)node->symbol->value, PRIM_INT));
+    return constant_of(convert_value((unsigned long long)node->symbol->value,
+                                     node->symbol->type ? PRIM_UINT : PRIM_INT));
   case AST_NODE_TYPE_UNARY_OP:
     return evaluate_unary(s, node, evaluated);
   case AST_NODE_TYPE_BINARY_OP:
@@ -1157,9 +1163,16 @@ static void check_variably_modified(sema *s, ast_node *decl, linkage_kind linkag
     report(s, decl->loc, "variable length array with static storage duration for", name);
 }
 
+static symbol **linked_bucket(sema *s, const char *name) {
+  unsigned long hash = 5381;
+  for (const unsigned char *c = (const unsigned char *)name; *c; c++)
+    hash = hash * 33 + *c;
+  return &s->linked[hash % LINKED_BUCKETS];
+}
+
 static symbol *linked_symbol(sema *s, const char *name) {
-  for (symbol *sym = s->table->all_symbols; sym; sym = sym->all_next) {
-    if (sym->linkage != LINKAGE_NONE && strcmp(sym->name, name) == 0)
+  for (symbol *sym = *linked_bucket(s, name); sym; sym = sym->linked_next) {
+    if (strcmp(sym->name, name) == 0)
       return sym;
   }
   return NULL;
@@ -1190,6 +1203,9 @@ static symbol *declare(sema *s, const char *name, symbol_kind kind, type_info *t
     return prior;
   }
   symbol *linked = NULL;
+  if (prior && kind == SYMBOL_TYPEDEF && prior->kind == SYMBOL_TYPEDEF && loc.system_header &&
+      compatible_types(prior->type, 0, type, 0))
+    return prior;
   if (prior) {
     report(s, loc, "redeclaration of", name);
     note_previous(prior->loc, name);
@@ -1205,6 +1221,11 @@ static symbol *declare(sema *s, const char *name, symbol_kind kind, type_info *t
   symbol *sym = symbol_table_insert_ordinary(s->table, name, kind, type, loc);
   if (sym)
     sym->linkage = linkage;
+  if (sym && linkage != LINKAGE_NONE) {
+    symbol **bucket = linked_bucket(s, name);
+    sym->linked_next = *bucket;
+    *bucket = sym;
+  }
   if (sym && linked) {
     sym->asm_label = linked->asm_label;
     sym->dllimport = linked->dllimport;
@@ -1418,11 +1439,8 @@ static void evaluate_array_size(sema *s, type_info *type, source_loc loc) {
   }
   if (size.status != CONST_VALUE)
     return;
-  if (!is_unsigned(size.value.type) && (long long)size.value.bits <= 0) {
-    report_at(s, loc, "array size must be greater than zero");
-    return;
-  }
-  if (size.value.bits == 0) {
+  int negative = !is_unsigned(size.value.type) && (long long)size.value.bits < 0;
+  if (negative || (size.value.bits == 0 && !loc.system_header)) {
     report_at(s, loc, "array size must be greater than zero");
     return;
   }
@@ -1705,6 +1723,7 @@ static void resolve_enum(sema *s, ast_node *def) {
     const char *name = def->enum_def.enumerators[i];
     long long value = 0;
     int known = 0;
+    int wide = 0;
 
     resolve(s, expr);
     if (expr) {
@@ -1713,7 +1732,12 @@ static void resolve_enum(sema *s, ast_node *def) {
       if (result.status == CONST_NOT_CONSTANT) {
         report(s, expr->loc, "enumerator value is not an integer constant expression", name);
       } else if (result.status == CONST_VALUE) {
-        if (!value_fits(result.value, PRIM_INT)) {
+        if (!value_fits(result.value, PRIM_INT) && expr->loc.system_header &&
+            value_fits(result.value, PRIM_UINT)) {
+          value = (long long)convert_value(result.value.bits, PRIM_UINT).bits;
+          known = 1;
+          wide = 1;
+        } else if (!value_fits(result.value, PRIM_INT)) {
           report(s, expr->loc, "enumerator value is not representable as an int", name);
         } else {
           value = (long long)convert_value(result.value.bits, PRIM_INT).bits;
@@ -1734,6 +1758,8 @@ static void resolve_enum(sema *s, ast_node *def) {
       sym->has_value = 1;
       sym->value = value;
     }
+    if (sym && wide)
+      sym->type = arithmetic_type(PRIM_UINT, 0);
     if (known && value < 0)
       has_negative = 1;
     next_known = known;
@@ -1965,6 +1991,96 @@ static int collect_members(ast_node *def, ast_node **out) {
   return count;
 }
 
+static int is_anonymous_member(ast_node *member) {
+  if (member->type != AST_NODE_TYPE_VAR_DECL || member->var_decl.var_name ||
+      member->var_decl.bitfield_width)
+    return 0;
+  type_info *t = resolved_type(member->var_decl.type);
+  return (t->kind == TYPE_STRUCT || t->kind == TYPE_UNION) && t->symbol && t->symbol->definition;
+}
+
+static ast_node *anonymous_definition(ast_node *member) {
+  return resolved_type(member->var_decl.type)->symbol->definition;
+}
+
+static int member_path(type_info *record, const char *name, ast_node **path, int depth) {
+  ast_node *def = record->symbol->definition;
+  if (!def || depth >= MEMBER_PATH_MAX)
+    return 0;
+  for (int i = 0; i < def->struct_def.member_count; i++) {
+    ast_node *item = def->struct_def.members[i];
+    int group = item->type == AST_NODE_TYPE_DECL_GROUP;
+    for (int j = 0; j < (group ? item->block.count : 1); j++) {
+      ast_node *member = group ? item->block.statements[j] : item;
+      if (member->type != AST_NODE_TYPE_VAR_DECL)
+        continue;
+      path[depth] = member;
+      if (member->var_decl.var_name && strcmp(member->var_decl.var_name, name) == 0)
+        return depth + 1;
+      if (is_anonymous_member(member)) {
+        int found = member_path(resolved_type(member->var_decl.type), name, path, depth + 1);
+        if (found)
+          return found;
+      }
+    }
+  }
+  return 0;
+}
+
+static ast_node *visible_member(ast_node **members, int count, const char *name) {
+  for (int i = 0; i < count; i++) {
+    if (members[i]->var_decl.var_name && strcmp(members[i]->var_decl.var_name, name) == 0)
+      return members[i];
+    ast_node *path[MEMBER_PATH_MAX];
+    int found = is_anonymous_member(members[i])
+                    ? member_path(resolved_type(members[i]->var_decl.type), name, path, 0)
+                    : 0;
+    if (found)
+      return path[found - 1];
+  }
+  return NULL;
+}
+
+static int names_a_member(ast_node *member) {
+  if (member->var_decl.var_name)
+    return 1;
+  if (!is_anonymous_member(member))
+    return 0;
+  ast_node *def = anonymous_definition(member);
+  int count = collect_members(def, NULL);
+  ast_node **inner = (ast_node **)malloc(sizeof(ast_node *) * (size_t)(count + 1));
+  if (!inner)
+    return 0;
+  collect_members(def, inner);
+  int named = 0;
+  for (int i = 0; !named && i < count; i++)
+    named = names_a_member(inner[i]);
+  free(inner);
+  return named;
+}
+
+static void check_duplicate(sema *s, ast_node **earlier, int count, ast_node *member) {
+  if (member->var_decl.var_name) {
+    ast_node *previous = visible_member(earlier, count, member->var_decl.var_name);
+    if (previous) {
+      report(s, member->loc, "duplicate member", member->var_decl.var_name);
+      note_previous(previous->loc, member->var_decl.var_name);
+    }
+    return;
+  }
+  if (!is_anonymous_member(member))
+    return;
+  ast_node *def = anonymous_definition(member);
+  int inner_count = collect_members(def, NULL);
+  ast_node **inner = (ast_node **)malloc(sizeof(ast_node *) * (size_t)(inner_count + 1));
+  if (!inner)
+    return;
+  collect_members(def, inner);
+  for (int i = 0; i < inner_count; i++)
+    check_duplicate(s, earlier, count, inner[i]);
+  free(inner);
+}
+
 static void lay_out_record(sema *s, ast_node *def) {
   int count = collect_members(def, NULL);
   ast_node **members = (ast_node **)malloc(sizeof(ast_node *) * (size_t)(count + 1));
@@ -1979,19 +2095,12 @@ static void lay_out_record(sema *s, ast_node *def) {
   int named = 0;
   for (int i = 0; i < count; i++) {
     ast_node *member = members[i];
-    const char *name = member->var_decl.var_name;
-    for (int j = 0; name && j < i; j++) {
-      if (members[j]->var_decl.var_name && strcmp(members[j]->var_decl.var_name, name) == 0) {
-        report(s, member->loc, "duplicate member", name);
-        note_previous(members[j]->loc, name);
-        break;
-      }
-    }
+    check_duplicate(s, members, i, member);
     int placed = member->var_decl.bitfield_width
                      ? lay_out_bitfield(s, &layout, member)
                      : lay_out_field(s, &layout, member, i == count - 1, named);
     known = known && placed;
-    if (name)
+    if (names_a_member(member))
       named++;
   }
   if (def->struct_def.aligned > layout.alignment)
@@ -2215,6 +2324,8 @@ static type_info *number_type(sema *s, ast_node *node) {
     report_at(s, node->loc, "floating constant is out of range for its type");
   int is_imaginary;
   prim_kind type = floating_constant_type(text, &is_imaginary);
+  if (is_imaginary && !node->loc.system_header)
+    report_at(s, node->loc, "imaginary constants are not part of C99");
   return arithmetic_type(type, is_imaginary);
 }
 
@@ -2232,7 +2343,7 @@ static type_info *identifier_type(ast_node *node) {
   if (!node->symbol)
     return NULL;
   if (node->symbol->kind == SYMBOL_ENUM_CONSTANT)
-    return arithmetic_type(PRIM_INT, 0);
+    return node->symbol->type ? node->symbol->type : arithmetic_type(PRIM_INT, 0);
   node->is_lvalue = node->symbol->kind == SYMBOL_VAR;
   if (node->symbol->kind == SYMBOL_VAR || node->symbol->kind == SYMBOL_FUNC)
     return node->symbol->type;
@@ -2548,21 +2659,6 @@ static type_info *cast_type(sema *s, ast_node *node) {
   return unqualified(s, target);
 }
 
-static ast_node *member_named(type_info *record, const char *name) {
-  ast_node *def = record->symbol->definition;
-  for (int i = 0; i < def->struct_def.member_count; i++) {
-    ast_node *item = def->struct_def.members[i];
-    int group = item->type == AST_NODE_TYPE_DECL_GROUP;
-    for (int j = 0; j < (group ? item->block.count : 1); j++) {
-      ast_node *member = group ? item->block.statements[j] : item;
-      if (member->type == AST_NODE_TYPE_VAR_DECL && member->var_decl.var_name &&
-          strcmp(member->var_decl.var_name, name) == 0)
-        return member;
-    }
-  }
-  return NULL;
-}
-
 static type_info *member_type(sema *s, ast_node *node) {
   ast_node *left = node->member_access.left;
   type_info *record = left ? left->expr_type : NULL;
@@ -2591,11 +2687,29 @@ static type_info *member_type(sema *s, ast_node *node) {
     report_at(s, node->loc, "member access into an incomplete structure or union");
     return NULL;
   }
-  ast_node *member = member_named(t, node->member_access.member_name);
-  if (!member) {
+  ast_node *path[MEMBER_PATH_MAX];
+  int length = member_path(t, node->member_access.member_name, path, 0);
+  if (!length) {
     report(s, node->loc, "no member named", node->member_access.member_name);
     return NULL;
   }
+  for (int i = 0; i + 1 < length; i++) {
+    ast_node *inner = create_ast_node(AST_NODE_TYPE_MEMBER_ACCESS);
+    inner->loc = node->loc;
+    inner->member_access.left = node->member_access.left;
+    inner->member_access.is_pointer = node->member_access.is_pointer;
+    inner->member_access.member = path[i];
+    inner->is_lvalue = inner->member_access.is_pointer || inner->member_access.left->is_lvalue;
+    qualifiers |= qualifiers_of(t);
+    inner->expr_type = qualified(s, path[i]->var_decl.type, qualifiers);
+    if (inner->member_access.is_pointer)
+      convert_operands(s, inner);
+    node->member_access.left = inner;
+    node->member_access.is_pointer = 0;
+    left = inner;
+    t = resolved_type(path[i]->var_decl.type);
+  }
+  ast_node *member = path[length - 1];
   node->member_access.member = member;
   node->is_lvalue = node->member_access.is_pointer || left->is_lvalue;
   return qualified(s, member->var_decl.type, qualifiers | qualifiers_of(t));
@@ -2786,6 +2900,8 @@ static int builtin_arity(builtin_kind kind) {
   case BUILTIN_INFF:
   case BUILTIN_TRAP:
   case BUILTIN_UNREACHABLE:
+  case BUILTIN_SYNC_SYNCHRONIZE:
+  case BUILTIN_IA32_SFENCE:
     return 0;
   case BUILTIN_VA_ARG:
   case BUILTIN_VA_END:
@@ -2794,8 +2910,11 @@ static int builtin_arity(builtin_kind kind) {
   case BUILTIN_SIGNBITF:
   case BUILTIN_SIGNBITL:
   case BUILTIN_LLABS:
+  case BUILTIN_SYNC_LOCK_RELEASE:
     return 1;
   case BUILTIN_CHOOSE_EXPR:
+  case BUILTIN_SYNC_BOOL_COMPARE_AND_SWAP:
+  case BUILTIN_SYNC_VAL_COMPARE_AND_SWAP:
     return 3;
   default:
     return 2;
@@ -2853,16 +2972,19 @@ static type_info *offsetof_type(sema *s, ast_node *node) {
       }
       if (!t->symbol->alignment)
         return NULL;
-      ast_node *member = member_named(t, name);
-      if (!member) {
+      ast_node *path[MEMBER_PATH_MAX];
+      int length = member_path(t, name, path, 0);
+      if (!length) {
         report(s, node->loc, "no member named", name);
         return NULL;
       }
+      ast_node *member = path[length - 1];
       if (member->var_decl.bitfield_width) {
         report(s, node->loc, "offsetof cannot name bit-field", name);
         return NULL;
       }
-      offset += member->var_decl.offset;
+      for (int j = 0; j < length; j++)
+        offset += path[j]->var_decl.offset;
       t = resolved_type(member->var_decl.type);
     } else {
       ast_node *index = node->builtin.steps[i].index;
@@ -3061,6 +3183,56 @@ static type_info *tgmath_type(sema *s, ast_node *node) {
   return unqualified(s, result);
 }
 
+static int is_sync_arithmetic(builtin_kind kind) {
+  return kind >= BUILTIN_SYNC_FETCH_AND_ADD && kind <= BUILTIN_SYNC_NAND_AND_FETCH;
+}
+
+static int is_sync(builtin_kind kind) {
+  return kind >= BUILTIN_SYNC_FETCH_AND_ADD && kind <= BUILTIN_SYNC_SYNCHRONIZE;
+}
+
+static type_info *sync_target(type_info *pointer) {
+  if (!pointer || !is_pointer(pointer))
+    return NULL;
+  int qualifiers;
+  type_info *target = strip_typedefs(pointee(pointer), &qualifiers);
+  return target && !((qualifiers | qualifiers_of(target)) & 1) ? target : NULL;
+}
+
+static type_info *sync_type(sema *s, ast_node *node) {
+  builtin_kind kind = node->builtin.kind;
+  ast_node **args = node->builtin.args;
+  if (kind == BUILTIN_SYNC_SYNCHRONIZE)
+    return arithmetic_type(PRIM_VOID, 0);
+  type_info *pointer = value_type(s, args[0]);
+  if (!pointer)
+    return NULL;
+  type_info *target = sync_target(pointer);
+  type_layout size = target ? layout_of(target) : (type_layout){0};
+  int fits = size.known && (size.size == 1 || size.size == 2 || size.size == 4 || size.size == 8);
+  if (!target || !fits ||
+      !(is_integer(target) || (!is_sync_arithmetic(kind) && is_pointer(target)))) {
+    report(
+        s, node->loc,
+        is_sync_arithmetic(kind)
+            ? "the first argument must point to a modifiable 1, 2, 4 or 8-byte integer for"
+            : "the first argument must point to a modifiable 1, 2, 4 or 8-byte integer or pointer "
+              "for",
+        node->tok.value);
+    return NULL;
+  }
+  type_info *value = unqualified(s, target);
+  for (int i = 1; i < node->builtin.arg_count; i++) {
+    if (!converted_argument(s, args[i], value))
+      return NULL;
+  }
+  if (kind == BUILTIN_SYNC_BOOL_COMPARE_AND_SWAP)
+    return arithmetic_type(PRIM_BOOL, 0);
+  if (kind == BUILTIN_SYNC_LOCK_RELEASE)
+    return arithmetic_type(PRIM_VOID, 0);
+  return value;
+}
+
 static type_info *builtin_type(sema *s, ast_node *node) {
   builtin_kind kind = node->builtin.kind;
   ast_node **args = node->builtin.args;
@@ -3071,6 +3243,8 @@ static type_info *builtin_type(sema *s, ast_node *node) {
     report(s, node->loc, "wrong number of arguments to", node->tok.value);
     return NULL;
   }
+  if (is_sync(kind))
+    return sync_type(s, node);
   switch (kind) {
   case BUILTIN_VA_START:
     if (!s->variadic) {
@@ -3107,8 +3281,16 @@ static type_info *builtin_type(sema *s, ast_node *node) {
     return converted_argument(s, args[0], arithmetic_type(PRIM_LLONG, 0))
                ? arithmetic_type(PRIM_LLONG, 0)
                : NULL;
+  case BUILTIN_UMULH:
+  case BUILTIN_MULH: {
+    type_info *operand = arithmetic_type(kind == BUILTIN_UMULH ? PRIM_ULLONG : PRIM_LLONG, 0);
+    return converted_argument(s, args[0], operand) && converted_argument(s, args[1], operand)
+               ? operand
+               : NULL;
+  }
   case BUILTIN_TRAP:
   case BUILTIN_UNREACHABLE:
+  case BUILTIN_IA32_SFENCE:
     return nothing;
   default:
     return floating_arguments(s, node) ? arithmetic_type(PRIM_INT, 0) : NULL;
@@ -3635,7 +3817,8 @@ static int push_frame(initializer *init, type_info *type) {
     frame.length = 0;
     for (int i = 0; i < count; i++) {
       ast_node *member = frame.members[i];
-      if (member->var_decl.var_name && !is_incomplete(member->var_decl.type))
+      if ((member->var_decl.var_name || is_anonymous_member(member)) &&
+          !is_incomplete(member->var_decl.type))
         frame.members[frame.length++] = member;
     }
   }
@@ -3780,9 +3963,17 @@ static int designate(initializer *init, ast_node *list, const char *name, ast_no
     return 0;
   }
   for (long long i = 0; i < frame->length; i++) {
-    if (strcmp(frame->members[i]->var_decl.var_name, name) == 0) {
+    ast_node *member = frame->members[i];
+    if (member->var_decl.var_name && strcmp(member->var_decl.var_name, name) == 0) {
       frame->position = i;
       return 1;
+    }
+    ast_node *path[MEMBER_PATH_MAX];
+    if (!member->var_decl.var_name &&
+        member_path(resolved_type(member->var_decl.type), name, path, 0)) {
+      frame->position = i;
+      return push_frame(init, resolved_type(member->var_decl.type)) &&
+             designate(init, list, name, NULL);
     }
   }
   report(init->s, list->loc, "no member named", name);
@@ -4032,6 +4223,15 @@ static void convert_va_list(sema *s, ast_node *arg, int written) {
 
 static void convert_builtin_operands(sema *s, ast_node *node) {
   ast_node **args = node->builtin.args;
+  if (is_sync(node->builtin.kind)) {
+    if (node->builtin.arg_count == 0)
+      return;
+    type_info *value = unqualified(s, sync_target(args[0]->expr_type));
+    convert_to_value(s, args[0]);
+    for (int i = 1; i < node->builtin.arg_count; i++)
+      convert_to(s, args[i], value);
+    return;
+  }
   switch (node->builtin.kind) {
   case BUILTIN_VA_START:
   case BUILTIN_VA_END:
@@ -4054,6 +4254,11 @@ static void convert_builtin_operands(sema *s, ast_node *node) {
     break;
   case BUILTIN_LLABS:
     convert_to(s, args[0], arithmetic_type(PRIM_LLONG, 0));
+    break;
+  case BUILTIN_UMULH:
+  case BUILTIN_MULH:
+    convert_to(s, args[0], node->expr_type);
+    convert_to(s, args[1], node->expr_type);
     break;
   case BUILTIN_SIGNBIT:
     convert_to_value(s, args[0]);

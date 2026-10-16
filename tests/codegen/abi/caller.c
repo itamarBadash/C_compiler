@@ -1,4 +1,5 @@
 #include "abi.h"
+#include <complex.h>
 #include <stdarg.h>
 
 int printf(const char *format, ...);
@@ -145,9 +146,9 @@ int main(void) {
 
   printf("small %d %d %d %d %d %d %d\n", next_char(-5), next_schar(-128 + 1), next_uchar(254),
          next_short(-32767), next_ushort(65534), flip(0), flip(1));
-  float _Complex zf = 1.5f + 2.0iF;
-  double _Complex zd = 3.0 + 4.0i;
-  long double _Complex zl = 5.0L + 6.0iL;
+  float _Complex zf = 1.5f + 2.0f * I;
+  double _Complex zd = 3.0 + 4.0 * I;
+  long double _Complex zl = 5.0L + 6.0L * I;
   zf = next_cf(zf);
   zd = next_cd(zd);
   zl = next_cl(zl);

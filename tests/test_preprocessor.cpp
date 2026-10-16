@@ -2271,6 +2271,36 @@ TEST_F(PreprocessorTest, DefinedFollowsUndef) {
   EXPECT_EQ(rc, 0);
 }
 
+TEST_F(PreprocessorTest, DefinedProducedByAMacroInsideIfIsTheOperator) {
+  run("#define D defined\n#define X\n#if D(X) && !D Y && D X\nA\n#endif\n"
+      "#if 0\n#elif D(X)\nB\n#endif\n");
+  std::vector<std::string> expected = {"A", "B"};
+  EXPECT_EQ(spellings(), expected) << "as in GCC; C99 6.10.1p4 leaves it undefined";
+  EXPECT_EQ(rc, 0);
+}
+
+TEST_F(PreprocessorTest, TheNameAfterAProducedDefinedIsNotExpanded) {
+  run("#define NAME OTHER\n#define D defined\n#if D(NAME) && D NAME\nA\n#endif\n");
+  std::vector<std::string> expected = {"A"};
+  EXPECT_EQ(spellings(), expected) << "NAME is a macro; expanding it first would ask about OTHER";
+  EXPECT_EQ(rc, 0);
+}
+
+TEST_F(PreprocessorTest, MinGWsIntrinsicPrologWorks) {
+  run("#define PROLOG(n) (!defined(DONE_##n))\n#define DONE_a\n"
+      "#if PROLOG(a)\nbad\n#endif\n#if PROLOG(b)\ngood\n#endif\n");
+  std::vector<std::string> expected = {"good"};
+  EXPECT_EQ(spellings(), expected);
+  EXPECT_EQ(rc, 0);
+}
+
+TEST_F(PreprocessorTest, OutsideIfAProducedDefinedIsJustAName) {
+  run("#define D defined\n#define X 1\n#define ID(a) a\n#if 1\n#endif\nD(X) D X ID(D X)\n");
+  std::vector<std::string> expected = {"defined", "(", "1", ")", "defined", "1", "defined", "1"};
+  EXPECT_EQ(spellings(), expected);
+  EXPECT_EQ(rc, 0);
+}
+
 TEST_F(PreprocessorTest, DefinedWithoutAnIdentifierIsAnError) {
   run("#if defined 1\nA\n#endif");
   EXPECT_GT(rc, 0);
@@ -2696,6 +2726,11 @@ protected:
                                       "#define STR(x) #x\n"
                                       "#define GLUE(b) sys_ ## b\n"
                                       "#define HERE __LINE__\n");
+    write_file("pp_sys_sys/gcc.h",
+               "#ifdef __GNUC__\nsys_ifdef\n#endif\n"
+               "#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ == 2 && "
+               "__GNUC_PATCHLEVEL__ == 1\nsys_if\n#endif\n"
+               "#define SYS_GCC __GNUC__\n");
   }
 
   void TearDown() override {
@@ -2704,7 +2739,7 @@ protected:
     for (const char *f :
          {"pp_sys_sys/sys.h", "pp_sys_user/user.h", "pp_sys_user/both.h", "pp_sys_sys/both.h",
           "pp_sys_sys/outer.h", "pp_sys_sys/inner.h", "pp_sys_user/u_outer.h",
-          "pp_sys_user/u_inner.h", "pp_sys_src/local.h", "pp_sys_sys/macros.h"})
+          "pp_sys_user/u_inner.h", "pp_sys_src/local.h", "pp_sys_sys/macros.h", "pp_sys_sys/gcc.h"})
       remove(f);
     _rmdir("pp_sys_user");
     _rmdir("pp_sys_sys");
@@ -2727,6 +2762,27 @@ protected:
     return out;
   }
 };
+
+TEST_F(SystemHeaderTest, OnlySystemHeadersSeeTheGccVersion) {
+  run("#include <gcc.h>\n"
+      "#ifdef __GNUC__\nuser_ifdef\n#endif\n"
+      "#ifndef __GNUC__\nuser_ifndef\n#endif\n"
+      "#if defined(__GNUC__) || __GNUC__ || __GNUC_MINOR__ || "
+      "__GNUC_PATCHLEVEL__\nuser_if\n#endif\n"
+      "#define USER_GCC __GNUC__\n"
+      "SYS_GCC USER_GCC __GNUC__ __GNUC_MINOR__ __GNUC_PATCHLEVEL__ __GNUC_STDC_INLINE__\n");
+  EXPECT_EQ(rc, 0);
+  std::vector<std::string> spelled;
+  for (int i = 0; i < tb.count; i++) {
+    if (tb.tokens[i].type != TOKEN_EOF)
+      spelled.push_back(tb.tokens[i].value);
+  }
+  std::vector<std::string> expected = {
+      "sys_ifdef", "sys_if",         "user_ifndef",         "4", "__GNUC__",
+      "__GNUC__",  "__GNUC_MINOR__", "__GNUC_PATCHLEVEL__", "1"};
+  EXPECT_EQ(spelled, expected)
+      << "a system header's own macro keeps its view, even when expanded in user code";
+}
 
 TEST_F(SystemHeaderTest, AFileFromASystemFolderIsASystemHeader) {
   run("#include <sys.h>\n#include <user.h>\nint main_token;\n");
@@ -2930,22 +2986,21 @@ TEST_F(PredefinedTest, ASystemNameMayBeUndefined) {
   EXPECT_EQ(spellings(), expected);
 }
 
-TEST_F(PredefinedTest, BothTargetsClaimToBeGcc42) {
+TEST_F(PredefinedTest, UserCodeSeesGccsMacrosButNotItsVersion) {
   for (target_kind kind : {TARGET_WINDOWS_X64, TARGET_LINUX_X64}) {
     TargetGuard guard(kind);
     SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
     const struct {
       const char *name;
       const char *value;
-    } rows[] = {{"__GNUC__", "4"},
-                {"__GNUC_MINOR__", "2"},
-                {"__GNUC_PATCHLEVEL__", "1"},
-                {"__GNUC_STDC_INLINE__", "1"},
+    } rows[] = {{"__GNUC_STDC_INLINE__", "1"},
                 {"__STRICT_ANSI__", "1"},
                 {"__NO_INLINE__", "1"},
                 {"__FLT_EVAL_METHOD__", "0"}};
     for (const auto &row : rows)
       EXPECT_EQ(expand(row.name), std::vector<std::string>({row.value})) << row.name;
+    for (const char *name : {"__GNUC__", "__GNUC_MINOR__", "__GNUC_PATCHLEVEL__"})
+      EXPECT_EQ(expand(name), std::vector<std::string>({name})) << name << " is for system headers";
     EXPECT_EQ(expand("a __USER_LABEL_PREFIX__ b"), std::vector<std::string>({"a", "b"}))
         << "symbol names get no prefix";
     for (const char *name : {"__SIZEOF_INT128__", "__has_builtin", "__has_attribute",
@@ -2990,7 +3045,7 @@ TEST_F(PredefinedTest, WindowsSpellsItsCallingConventionsAsAttributes) {
 }
 
 TEST_F(PredefinedTest, TheBuiltInTextIsReadBeforeTheMainFile) {
-  run("#ifdef _WIN32\nA\n#endif\n#if __GNUC__ == 4\nB\n#endif\n");
+  run("#ifdef _WIN32\nA\n#endif\n#if __GNUC_STDC_INLINE__ == 1\nB\n#endif\n");
   EXPECT_EQ(rc, 0);
   std::vector<std::string> expected = {"A", "B"};
   EXPECT_EQ(spellings(), expected);

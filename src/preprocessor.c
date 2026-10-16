@@ -11,6 +11,7 @@
 #include <time.h>
 
 #define PP_MAX_INCLUDE_DEPTH 64
+#define MACRO_BUCKETS 4096
 
 typedef enum dynamic_macro { DYNAMIC_NONE = 0, DYNAMIC_FILE, DYNAMIC_LINE } dynamic_macro;
 
@@ -21,6 +22,7 @@ typedef struct macro {
   int is_function_like;
   int is_variadic;
   dynamic_macro dynamic;
+  int system_only;
   token *body;
   int body_count;
   struct macro *next;
@@ -65,10 +67,11 @@ typedef struct source_file {
 
 typedef struct pp {
   source_file *sources;
-  macro *macros;
+  macro *macros[MACRO_BUCKETS];
   expansion *stack;
   int error_count;
   int invocation_line;
+  int in_condition;
   cond *conds;
   const char **include_dirs;
   int include_dir_count;
@@ -120,13 +123,17 @@ static token pp_next(pp *p);
 static void pp_unget(pp *p, token t);
 static void push_token_list(pp *p, const char *disable_name, token *toks, int count);
 
+static macro **macro_bucket(pp *p, const char *name);
+static void macro_insert(pp *p, macro *m);
 static macro *macro_find(pp *p, const char *name);
+static macro *macro_visible(pp *p, token name);
 static int macro_disabled(pp *p, const char *name);
 static void macro_remove(pp *p, const char *name);
 static int param_index(macro *m, const char *name);
 static int is_reserved_macro_name(const char *name);
 static void predefine(pp *p, const char *name, const char *body_text);
 static void predefine_dynamic(pp *p, const char *name, dynamic_macro kind);
+static void predefine_for_system_headers(pp *p, const char *name, const char *body_text);
 static void install_predefined_macros(pp *p);
 
 static int pp_emitting(pp *p);
@@ -166,6 +173,8 @@ static void report_arguments(pp *p, macro *m, token name, const char *problem);
 static int collect_args(pp *p, macro *m, token name, arg **out, int *out_count);
 static void free_args(arg *args, int n);
 static void expand_token_list(pp *p, token *in, int count, token **out, int *out_count);
+static int keep_defined_operand(pp *p, token **out, int *out_count);
+static int is_word(const token *t, const char *word);
 static void expand_arg(pp *p, arg *a);
 static void substitute(pp *p, macro *m, arg *args, int arg_count, int leading_space);
 static token make_dynamic_token(pp *p, dynamic_macro kind, token at);
@@ -419,10 +428,12 @@ static void pp_destroy(pp *p) {
   while (p->conds != NULL) {
     cond_pop(p);
   }
-  while (p->macros != NULL) {
-    macro *m = p->macros;
-    p->macros = m->next;
-    free_macro(m);
+  for (int i = 0; i < MACRO_BUCKETS; i++) {
+    while (p->macros[i] != NULL) {
+      macro *m = p->macros[i];
+      p->macros[i] = m->next;
+      free_macro(m);
+    }
   }
   free(p->pack_stack);
 }
@@ -480,10 +491,23 @@ static void push_token_list(pp *p, const char *disable_name, token *toks, int co
   p->stack = exp;
 }
 
+static macro **macro_bucket(pp *p, const char *name) {
+  unsigned long hash = 5381;
+  for (const unsigned char *c = (const unsigned char *)name; *c; c++)
+    hash = hash * 33 + *c;
+  return &p->macros[hash % MACRO_BUCKETS];
+}
+
+static void macro_insert(pp *p, macro *m) {
+  macro **bucket = macro_bucket(p, m->name);
+  m->next = *bucket;
+  *bucket = m;
+}
+
 static macro *macro_find(pp *p, const char *name) {
   if (p == NULL || name == NULL)
     return NULL;
-  macro *m = p->macros;
+  macro *m = *macro_bucket(p, name);
   while (m != NULL) {
     if (strcmp(m->name, name) == 0) {
       return m;
@@ -491,6 +515,13 @@ static macro *macro_find(pp *p, const char *name) {
     m = m->next;
   }
   return NULL;
+}
+
+static macro *macro_visible(pp *p, token name) {
+  macro *m = macro_find(p, name.value);
+  if (m != NULL && m->system_only && !name.system_header)
+    return NULL;
+  return m;
 }
 
 static int macro_disabled(pp *p, const char *name) {
@@ -509,8 +540,8 @@ static int macro_disabled(pp *p, const char *name) {
 static void macro_remove(pp *p, const char *name) {
   if (p == NULL || name == NULL)
     return;
-  macro **prev = &p->macros;
-  macro *m = p->macros;
+  macro **prev = macro_bucket(p, name);
+  macro *m = *prev;
   while (m != NULL) {
     if (strcmp(m->name, name) == 0) {
       *prev = m->next;
@@ -572,8 +603,7 @@ static void predefine(pp *p, const char *name, const char *body_text) {
   m->name = strdup(name);
   m->body = body;
   m->body_count = body_count;
-  m->next = p->macros;
-  p->macros = m;
+  macro_insert(p, m);
 }
 
 static void predefine_dynamic(pp *p, const char *name, dynamic_macro kind) {
@@ -584,13 +614,20 @@ static void predefine_dynamic(pp *p, const char *name, dynamic_macro kind) {
   }
 }
 
+static void predefine_for_system_headers(pp *p, const char *name, const char *body_text) {
+  predefine(p, name, body_text);
+  macro *m = macro_find(p, name);
+  if (m != NULL)
+    m->system_only = 1;
+}
+
 static void install_predefined_macros(pp *p) {
   predefine(p, "__STDC__", "1");
   predefine(p, "__STDC_VERSION__", "199901L");
   predefine(p, "__STDC_HOSTED__", "1");
-  predefine(p, "__GNUC__", "4");
-  predefine(p, "__GNUC_MINOR__", "2");
-  predefine(p, "__GNUC_PATCHLEVEL__", "1");
+  predefine_for_system_headers(p, "__GNUC__", "4");
+  predefine_for_system_headers(p, "__GNUC_MINOR__", "2");
+  predefine_for_system_headers(p, "__GNUC_PATCHLEVEL__", "1");
   predefine(p, "__GNUC_STDC_INLINE__", "1");
   predefine(p, "__STRICT_ANSI__", "1");
   predefine(p, "__NO_INLINE__", "1");
@@ -1056,7 +1093,7 @@ static void resolve_defined(pp *p, token *toks, int count, token **out, int *out
 
     token n;
     n.type = TOKEN_NUMBER;
-    n.value = strdup(macro_find(p, toks[name_index].value) != NULL ? "1" : "0");
+    n.value = strdup(macro_visible(p, toks[name_index]) != NULL ? "1" : "0");
     n.line = toks[i].line;
     n.column = toks[i].column;
     n.at_line_start = 0;
@@ -1098,10 +1135,17 @@ static int eval_condition(pp *p, int line, int column) {
   free_tokens(raw, raw_count);
 
   p->invocation_line = line;
+  token *produced = NULL;
+  int produced_count = 0;
+  p->in_condition = 1;
+  expand_token_list(p, resolved, resolved_count, &produced, &produced_count);
+  p->in_condition = 0;
+  free_tokens(resolved, resolved_count);
+
   token *expanded = NULL;
   int expanded_count = 0;
-  expand_token_list(p, resolved, resolved_count, &expanded, &expanded_count);
-  free_tokens(resolved, resolved_count);
+  resolve_defined(p, produced, produced_count, &expanded, &expanded_count);
+  free_tokens(produced, produced_count);
 
   eval e;
   e.p = p;
@@ -1395,6 +1439,12 @@ static void expand_token_list(pp *p, token *in, int count, token **out, int *out
       free_token(t);
       break;
     }
+    if (p->in_condition && is_word(&t, "defined")) {
+      append_token(out, out_count, t);
+      if (!keep_defined_operand(p, out, out_count))
+        break;
+      continue;
+    }
     if (try_expand(p, &t))
       continue;
     append_token(out, out_count, t);
@@ -1414,6 +1464,20 @@ static void expand_token_list(pp *p, token *in, int count, token **out, int *out
     p->stack = mine->next;
     free_expansion(mine);
   }
+}
+
+static int keep_defined_operand(pp *p, token **out, int *out_count) {
+  token t = pp_next(p);
+  if (t.type == TOKEN_LPAREN) {
+    append_token(out, out_count, t);
+    t = pp_next(p);
+  }
+  if (t.type == TOKEN_EOF) {
+    free_token(t);
+    return 0;
+  }
+  append_token(out, out_count, t);
+  return 1;
 }
 
 static void expand_arg(pp *p, arg *a) {
@@ -1563,7 +1627,7 @@ static int try_expand(pp *p, token *t) {
     return 1;
   }
 
-  macro *m = macro_find(p, t->value);
+  macro *m = macro_visible(p, *t);
   if (m == NULL) {
     return 0;
   }
@@ -1852,8 +1916,7 @@ static void do_define(pp *p, int line, int column) {
   m->name = strdup(name.value);
   m->body = body;
   m->body_count = body_count;
-  m->next = p->macros;
-  p->macros = m;
+  macro_insert(p, m);
   free_token(name);
 }
 
@@ -1884,7 +1947,7 @@ static void do_ifdef(pp *p, int line, int column, int negate) {
     return;
   }
 
-  int defined = (macro_find(p, name.value) != NULL);
+  int defined = (macro_visible(p, name) != NULL);
   cond_push(p, negate ? !defined : defined, line, column);
   free_token(name);
   end_directive(p, negate ? "extra tokens after #ifndef" : "extra tokens after #ifdef");
@@ -1999,9 +2062,9 @@ static void do_line(pp *p, int line, int column) {
     }
   }
 
-  long value = strtol(digits, NULL, 10);
-  if (value < 1) {
-    pp_error(p, line, column, "#line requires a positive line number");
+  long long value = strtoll(digits, NULL, 10);
+  if (value < 1 || value > 2147483647) {
+    pp_error(p, line, column, "#line requires a line number from 1 to 2147483647");
     free_tokens(expanded, expanded_count);
     pp_unget(p, terminator);
     return;

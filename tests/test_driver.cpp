@@ -446,6 +446,15 @@ TEST(DriverTest, Gnu99ProgramsSeeTheSystemsExtensions) {
   EXPECT_EQ(run_program("driver_pi.exe", TARGET_WINDOWS_X64), "3.1416\nexit 0\n");
 }
 
+TEST(DriverTest, AWindowsApiProgramBuildsAndRuns) {
+  Outcome built = drive({source("winapi.c"), "-o", "driver_winapi.exe"});
+  ASSERT_EQ(built.code, 0) << built.err;
+  EXPECT_EQ(built.err, "");
+  EXPECT_EQ(run_program("driver_winapi.exe", TARGET_WINDOWS_X64),
+            "large 1 2\nquad 8589934597\nlast error 42\nlength 7\nwide 4 98\npage 4096\n"
+            "exchange 3 9\nthreads 2000 4000 exit 7\nexit 0\n");
+}
+
 TEST(DriverTest, ArgumentsWithSpacesQuotesAndBackslashesReachToolsWhole) {
   std::string out = "driver spaced program.exe";
   remove(out.c_str());

@@ -248,9 +248,12 @@ void free_ast(ast_node *node) {
     for (int i = 0; i < node->asm_stmt.operand_count; i++) {
       free_ast(node->asm_stmt.constraints[i]);
       free_ast(node->asm_stmt.operands[i]);
+      if (node->asm_stmt.operand_names)
+        free(node->asm_stmt.operand_names[i]);
     }
     free(node->asm_stmt.constraints);
     free(node->asm_stmt.operands);
+    free(node->asm_stmt.operand_names);
     for (int i = 0; i < node->asm_stmt.clobber_count; i++)
       free_ast(node->asm_stmt.clobbers[i]);
     free(node->asm_stmt.clobbers);

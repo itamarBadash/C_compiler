@@ -21,8 +21,10 @@ To type MMC99 from any folder, add MMC99/bin to PATH.
 "MMC99 --help" lists every option.
 
 MMC99 compiles all of C99 and uses each system's own C library: glibc on
-Linux, MinGW-w64's on Windows. Headers beyond C99 are included too, but some
-of them use extensions MMC99 does not support yet (windows.h is one). Those
-fail with an error message; MMC99 never builds a wrong program from them.
+Linux, MinGW-w64's on Windows, with all of their headers, windows.h included.
+A header that needs an extension MMC99 does not support fails with an error
+message; MMC99 never builds a wrong program from it.
 
-SOURCES.txt says where every file comes from; licenses holds their licenses.
+CONFORMANCE.md documents every choice C99 leaves to the compiler, and every
+extension. SOURCES.txt says where every file comes from; licenses holds their
+licenses.

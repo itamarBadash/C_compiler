@@ -1,8 +1,12 @@
 #include "parser.h"
 #include "target.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define SCOPE_INDEX_BUCKETS 1024
+#define SCOPE_INDEX_THRESHOLD 64
 
 static int is_type_token(parser *p);
 typedef enum declaration_context {
@@ -72,7 +76,7 @@ static token clone_token(token t) {
 }
 
 static source_loc loc_of(token t) {
-  source_loc loc = {t.line, t.column, t.file};
+  source_loc loc = {t.line, t.column, t.file, t.system_header};
   return loc;
 }
 
@@ -1060,6 +1064,16 @@ static ast_node *declaration_without_declarators(parser *p, type_info *base_type
                         !definition->struct_def.tag_name;
   if (declares_tags && definition && !untagged_record)
     return finish_group(group);
+  if (context == DECLARATION_MEMBER && definition && !untagged_record &&
+      p->current_token.system_header)
+    return finish_group(group);
+  if (context == DECLARATION_MEMBER && untagged_record && p->current_token.system_header) {
+    ast_node *anonymous = create_ast_node(AST_NODE_TYPE_VAR_DECL);
+    anonymous->loc = start;
+    anonymous->var_decl.type = clone_type_info(base_type);
+    append_item(group, anonymous);
+    return finish_group(group);
+  }
   if (declares_tags && base_type->tag_name &&
       (base_type->kind == TYPE_STRUCT || base_type->kind == TYPE_UNION)) {
     free_ast(group);
@@ -1297,30 +1311,56 @@ void parser_leave_scope(parser *p) {
     free(curr);
     curr = next;
   }
+  free(old->index);
   free(old);
 }
 
+static parser_symbol **scope_bucket(parser_scope *scope, const char *name) {
+  unsigned long hash = 5381;
+  for (const unsigned char *c = (const unsigned char *)name; *c; c++)
+    hash = hash * 33 + *c;
+  return &scope->index[hash % SCOPE_INDEX_BUCKETS];
+}
+
+static void build_scope_index(parser_scope *scope) {
+  scope->index = (parser_symbol **)calloc(SCOPE_INDEX_BUCKETS, sizeof(parser_symbol *));
+  if (!scope->index)
+    return;
+  for (parser_symbol *sym = scope->symbols; sym; sym = sym->next) {
+    parser_symbol **end = scope_bucket(scope, sym->name);
+    while (*end)
+      end = &(*end)->bucket_next;
+    sym->bucket_next = NULL;
+    *end = sym;
+  }
+}
+
 void parser_define_symbol(parser *p, const char *name, parser_symbol_kind kind) {
-  if (!p->current_scope)
+  parser_scope *scope = p->current_scope;
+  if (!scope)
     return;
   parser_symbol *sym = (parser_symbol *)calloc(1, sizeof(parser_symbol));
   sym->name = strdup(name);
   sym->kind = kind;
-  sym->next = p->current_scope->symbols;
-  p->current_scope->symbols = sym;
+  sym->next = scope->symbols;
+  scope->symbols = sym;
+  scope->count++;
+  if (scope->index) {
+    parser_symbol **bucket = scope_bucket(scope, name);
+    sym->bucket_next = *bucket;
+    *bucket = sym;
+  } else if (scope->count >= SCOPE_INDEX_THRESHOLD) {
+    build_scope_index(scope);
+  }
 }
 
 parser_symbol *parser_lookup_symbol(parser *p, const char *name) {
-  parser_scope *curr_scope = p->current_scope;
-  while (curr_scope) {
-    parser_symbol *curr_sym = curr_scope->symbols;
-    while (curr_sym) {
-      if (strcmp(curr_sym->name, name) == 0) {
-        return curr_sym;
-      }
-      curr_sym = curr_sym->next;
+  for (parser_scope *scope = p->current_scope; scope; scope = scope->parent) {
+    parser_symbol *sym = scope->index ? *scope_bucket(scope, name) : scope->symbols;
+    for (; sym; sym = scope->index ? sym->bucket_next : sym->next) {
+      if (strcmp(sym->name, name) == 0)
+        return sym;
     }
-    curr_scope = curr_scope->parent;
   }
   return NULL;
 }
@@ -1460,6 +1500,26 @@ static const struct {
     {"__builtin_trap", BUILTIN_TRAP},
     {"__builtin_unreachable", BUILTIN_UNREACHABLE},
     {"__builtin_tgmath", BUILTIN_TGMATH},
+    {"__sync_fetch_and_add", BUILTIN_SYNC_FETCH_AND_ADD},
+    {"__sync_fetch_and_sub", BUILTIN_SYNC_FETCH_AND_SUB},
+    {"__sync_fetch_and_or", BUILTIN_SYNC_FETCH_AND_OR},
+    {"__sync_fetch_and_and", BUILTIN_SYNC_FETCH_AND_AND},
+    {"__sync_fetch_and_xor", BUILTIN_SYNC_FETCH_AND_XOR},
+    {"__sync_fetch_and_nand", BUILTIN_SYNC_FETCH_AND_NAND},
+    {"__sync_add_and_fetch", BUILTIN_SYNC_ADD_AND_FETCH},
+    {"__sync_sub_and_fetch", BUILTIN_SYNC_SUB_AND_FETCH},
+    {"__sync_or_and_fetch", BUILTIN_SYNC_OR_AND_FETCH},
+    {"__sync_and_and_fetch", BUILTIN_SYNC_AND_AND_FETCH},
+    {"__sync_xor_and_fetch", BUILTIN_SYNC_XOR_AND_FETCH},
+    {"__sync_nand_and_fetch", BUILTIN_SYNC_NAND_AND_FETCH},
+    {"__sync_bool_compare_and_swap", BUILTIN_SYNC_BOOL_COMPARE_AND_SWAP},
+    {"__sync_val_compare_and_swap", BUILTIN_SYNC_VAL_COMPARE_AND_SWAP},
+    {"__sync_lock_test_and_set", BUILTIN_SYNC_LOCK_TEST_AND_SET},
+    {"__sync_lock_release", BUILTIN_SYNC_LOCK_RELEASE},
+    {"__sync_synchronize", BUILTIN_SYNC_SYNCHRONIZE},
+    {"__builtin_ia32_sfence", BUILTIN_IA32_SFENCE},
+    {"__umulh", BUILTIN_UMULH},
+    {"__mulh", BUILTIN_MULH},
 };
 
 static int find_builtin(const char *name, builtin_kind *kind) {
@@ -1949,12 +2009,15 @@ ast_node *parse_statement(parser *p) {
   return node;
 }
 
-static void append_asm_operand(ast_node *node, ast_node *constraint, ast_node *operand) {
+static void append_asm_operand(ast_node *node, char *name, ast_node *constraint,
+                               ast_node *operand) {
   int n = node->asm_stmt.operand_count + 1;
   node->asm_stmt.constraints = realloc(node->asm_stmt.constraints, sizeof(ast_node *) * n);
   node->asm_stmt.operands = realloc(node->asm_stmt.operands, sizeof(ast_node *) * n);
+  node->asm_stmt.operand_names = realloc(node->asm_stmt.operand_names, sizeof(char *) * n);
   node->asm_stmt.constraints[n - 1] = constraint;
   node->asm_stmt.operands[n - 1] = operand;
+  node->asm_stmt.operand_names[n - 1] = name;
   node->asm_stmt.operand_count = n;
 }
 
@@ -1963,6 +2026,56 @@ static void append_asm_clobber(ast_node *node, ast_node *clobber) {
   node->asm_stmt.clobbers = realloc(node->asm_stmt.clobbers, sizeof(ast_node *) * n);
   node->asm_stmt.clobbers[n - 1] = clobber;
   node->asm_stmt.clobber_count = n;
+}
+
+static int asm_operand_named(ast_node *node, const char *name, size_t length) {
+  for (int i = 0; i < node->asm_stmt.operand_count; i++) {
+    const char *candidate = node->asm_stmt.operand_names[i];
+    if (candidate && strlen(candidate) == length && strncmp(candidate, name, length) == 0)
+      return i;
+  }
+  return -1;
+}
+
+static int resolve_asm_names(parser *p, ast_node *node) {
+  ast_node *text = node->asm_stmt.template_text;
+  const char *in = text->literal.bytes;
+  int length = text->literal.length;
+  char *out = malloc((size_t)length + 1);
+  if (!out)
+    return 0;
+  int written = 0;
+  for (int i = 0; i < length; i++) {
+    if (in[i] == '%' && i + 1 < length && in[i + 1] == '%') {
+      out[written++] = in[i++];
+      out[written++] = in[i];
+      continue;
+    }
+    int bracket = i + 1;
+    if (in[i] == '%' && bracket < length && isalpha((unsigned char)in[bracket]))
+      bracket++;
+    if (in[i] != '%' || bracket >= length || in[bracket] != '[') {
+      out[written++] = in[i];
+      continue;
+    }
+    const char *close = memchr(in + bracket, ']', (size_t)(length - bracket));
+    int index =
+        close ? asm_operand_named(node, in + bracket + 1, (size_t)(close - in - bracket - 1)) : -1;
+    if (index < 0) {
+      parser_error(p, "no asm operand has the name used in the template");
+      free(out);
+      return 0;
+    }
+    for (int k = i; k < bracket; k++)
+      out[written++] = in[k];
+    written += sprintf(out + written, "%d", index);
+    i = (int)(close - in);
+  }
+  out[written] = '\0';
+  free(text->literal.bytes);
+  text->literal.bytes = out;
+  text->literal.length = written;
+  return 1;
 }
 
 static ast_node *parse_asm_statement(parser *p) {
@@ -1981,15 +2094,37 @@ static ast_node *parse_asm_statement(parser *p) {
   parser_advance(p);
   node->asm_stmt.template_text = parse_primary(p);
   node->asm_stmt.is_basic = p->current_token.type != TOKEN_COLON;
+  int named = 0;
   for (int section = 0; section < 3 && p->current_token.type == TOKEN_COLON; section++) {
     parser_advance(p);
-    while (p->current_token.type == TOKEN_STRING) {
+    while (p->current_token.type == TOKEN_STRING ||
+           (section < 2 && p->current_token.type == TOKEN_LBRACKET)) {
+      char *name = NULL;
+      if (p->current_token.type == TOKEN_LBRACKET) {
+        parser_advance(p);
+        if (p->current_token.type != TOKEN_IDENTIFIER || p->next_token.type != TOKEN_RBRACKET) {
+          parser_error(p, "expected a name and ']' before an asm operand");
+          free_ast(node);
+          return NULL;
+        }
+        name = strdup(p->current_token.value);
+        named = 1;
+        parser_advance(p);
+        parser_advance(p);
+        if (p->current_token.type != TOKEN_STRING) {
+          parser_error(p, "expected an asm constraint after the operand's name");
+          free(name);
+          free_ast(node);
+          return NULL;
+        }
+      }
       ast_node *text = parse_primary(p);
       if (section == 2) {
         append_asm_clobber(node, text);
       } else {
         if (p->current_token.type != TOKEN_LPAREN) {
           parser_error(p, "expected '(' and an operand after an asm constraint");
+          free(name);
           free_ast(text);
           free_ast(node);
           return NULL;
@@ -1998,13 +2133,14 @@ static ast_node *parse_asm_statement(parser *p) {
         ast_node *operand = parse_expression(p);
         if (!operand || p->current_token.type != TOKEN_RPAREN) {
           parser_error(p, "expected ')' after an asm operand");
+          free(name);
           free_ast(text);
           free_ast(operand);
           free_ast(node);
           return NULL;
         }
         parser_advance(p);
-        append_asm_operand(node, text, operand);
+        append_asm_operand(node, name, text, operand);
       }
       if (p->current_token.type != TOKEN_COMMA)
         break;
@@ -2015,6 +2151,10 @@ static ast_node *parse_asm_statement(parser *p) {
   }
   if (p->current_token.type != TOKEN_RPAREN) {
     parser_error(p, "expected ')' to close the __asm__ statement");
+    free_ast(node);
+    return NULL;
+  }
+  if (named && !resolve_asm_names(p, node)) {
     free_ast(node);
     return NULL;
   }

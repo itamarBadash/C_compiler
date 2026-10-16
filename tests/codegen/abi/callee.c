@@ -1,4 +1,5 @@
 #include "abi.h"
+#include <complex.h>
 #include <stdarg.h>
 
 struct s1 next_s1(struct s1 x) {
@@ -183,7 +184,7 @@ float _Complex next_cf(float _Complex x) {
   return x * 2.0f;
 }
 double _Complex next_cd(double _Complex x) {
-  return x + 1.0i;
+  return x + I;
 }
 long double _Complex next_cl(long double _Complex x) {
   return x - 1.0L;

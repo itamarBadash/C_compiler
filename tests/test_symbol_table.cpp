@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <map>
 #include <string>
+#include <vector>
 extern "C" {
 #include "parser.h"
 #include "symbol_table.h"
@@ -12,7 +13,8 @@ extern "C" {
 int st_free_calls = 0;
 void __real_free(void *p);
 void __wrap_free(void *p) {
-  st_free_calls++;
+  if (p != nullptr)
+    st_free_calls++;
   if (tracked_frees != nullptr && p != nullptr) {
     auto it = tracked_frees->find(p);
     if (it != tracked_frees->end()) {
@@ -424,6 +426,62 @@ TEST(SymbolLifetimeTest, LeavingAScopeFreesTheScopeAndNothingElse) {
     symbol_table_destroy(table);
   }
 
+  EXPECT_EQ(not_freed_exactly_once(frees), 0);
+}
+
+TEST_F(SymbolTableTest, AScopeWithManyNamesFindsEveryOneNewestFirst) {
+  symbol *early_old = symbol_table_insert_ordinary(table, "early", SYMBOL_VAR, nullptr, at(1, 1));
+  symbol *early_new = symbol_table_insert_ordinary(table, "early", SYMBOL_VAR, nullptr, at(2, 1));
+  symbol *late_old = symbol_table_insert_ordinary(table, "late", SYMBOL_VAR, nullptr, at(3, 1));
+  std::vector<symbol *> filler;
+  for (int i = 0; i < 300; i++) {
+    std::string name = "n" + std::to_string(i);
+    filler.push_back(
+        symbol_table_insert_ordinary(table, name.c_str(), SYMBOL_VAR, nullptr, at(10 + i, 1)));
+  }
+  symbol *late_new = symbol_table_insert_ordinary(table, "late", SYMBOL_VAR, nullptr, at(400, 1));
+  ASSERT_NE(early_old, early_new);
+  EXPECT_EQ(symbol_table_lookup_ordinary(table, "early"), early_new)
+      << "two entries from before the index was built keep their order";
+  EXPECT_EQ(symbol_table_lookup_ordinary(table, "late"), late_new)
+      << "an entry added after the index was built hides the older one";
+  EXPECT_EQ(symbol_table_lookup_ordinary_current(table, "early"), early_new);
+  EXPECT_EQ(symbol_table_lookup_ordinary_current(table, "late"), late_new);
+  EXPECT_NE(late_old, late_new);
+  for (int i = 0; i < 300; i++) {
+    std::string name = "n" + std::to_string(i);
+    ASSERT_EQ(symbol_table_lookup_ordinary(table, name.c_str()), filler[i]) << name;
+    ASSERT_EQ(symbol_table_lookup_ordinary_current(table, name.c_str()), filler[i]) << name;
+  }
+  EXPECT_EQ(symbol_table_lookup_ordinary(table, "n300"), nullptr);
+  EXPECT_EQ(symbol_table_lookup_ordinary(table, "n"), nullptr);
+
+  symbol_table_enter_scope(table, SCOPE_BLOCK);
+  symbol *inner = symbol_table_insert_ordinary(table, "n7", SYMBOL_VAR, nullptr, at(500, 1));
+  EXPECT_EQ(symbol_table_lookup_ordinary(table, "n7"), inner);
+  EXPECT_EQ(symbol_table_lookup_ordinary(table, "n8"), filler[8]);
+  EXPECT_EQ(symbol_table_lookup_ordinary_current(table, "n8"), nullptr);
+  symbol_table_leave_scope(table);
+  EXPECT_EQ(symbol_table_lookup_ordinary(table, "n7"), filler[7]);
+}
+
+TEST(SymbolLifetimeTest, LeavingALargeScopeAlsoFreesItsIndex) {
+  symbol_table *table = symbol_table_create();
+  symbol_table_enter_scope(table, SCOPE_FILE);
+  symbol_table_enter_scope(table, SCOPE_BLOCK);
+  std::map<void *, int> frees;
+  for (int i = 0; i < 100; i++) {
+    std::string name = "v" + std::to_string(i);
+    track_symbol(frees,
+                 symbol_table_insert_ordinary(table, name.c_str(), SYMBOL_VAR, nullptr, at(i, 1)));
+  }
+  {
+    TrackFrees track(frees);
+    st_free_calls = 0;
+    symbol_table_leave_scope(table);
+    EXPECT_EQ(st_free_calls, 2) << "the scope and its index; the symbols belong to the table";
+    symbol_table_destroy(table);
+  }
   EXPECT_EQ(not_freed_exactly_once(frees), 0);
 }
 

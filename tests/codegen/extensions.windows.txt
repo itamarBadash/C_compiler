@@ -1,0 +1,15 @@
+pair 1 4294967295 -1 -1
+pair 8589934601 3 5 size 16
+list 6 4 5
+fetch_and_add 10 now 15
+add_and_fetch 16
+fetch_and_sub 16 sub_and_fetch 12
+or 255 and 60 xor 195 nand 252
+fetch or 252 and 253 xor 5 nand 7 now 249
+cas 1 0 value 200
+val cas 200 400 value 400
+tas 0 1
+pointer cas 1 lock 0
+csr 1f80 9f80
+asm 42 591751049
+exit 0

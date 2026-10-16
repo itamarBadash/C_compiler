@@ -25,6 +25,7 @@ static std::string generate(const char *source, target_kind kind = TARGET_WINDOW
     dirs.push_back(std::string(SYSROOT_DIR) + "/linux/include/x86_64-linux-gnu");
     dirs.push_back(std::string(SYSROOT_DIR) + "/linux/include");
   }
+  dirs.push_back(std::string(CODEGEN_PROGRAMS_DIR) + "/system");
   std::vector<const char *> system_dirs;
   for (const std::string &dir : dirs)
     system_dirs.push_back(dir.c_str());
@@ -899,6 +900,19 @@ TEST(CodegenRecordTest, ConditionalOfStructuresJoinsTheirAddresses) {
                 "ret i32 %5"});
 }
 
+TEST(CodegenRecordTest, AnAnonymousMemberAddsItsOffsetOnTheWay) {
+  std::string ir = generate("#include <anon.h>\n"
+                            "int high(struct pair *p) { return p->high; }\n"
+                            "unsigned low(struct pair p) { return p.low; }\n",
+                            TARGET_WINDOWS_X64, true);
+  expect_lines(function(ir, "high"),
+               {"%1 = load ptr, ptr %p.0, align 8", "%2 = getelementptr inbounds i8, ptr %1, i64 8",
+                "%3 = getelementptr inbounds i8, ptr %2, i64 4", "%4 = load i32, ptr %3, align 4",
+                "ret i32 %4"});
+  expect_lines(function(ir, "low"), {"%1 = getelementptr inbounds i8, ptr %p.0, i64 8",
+                                     "%2 = load i32, ptr %1, align 4", "ret i32 %2"});
+}
+
 static const char *flags =
     "struct flags { unsigned ready : 1; int delta : 5; unsigned mode : 3; };\n"
     "struct full { int x : 32; _Bool b : 1; };\n";
@@ -1431,8 +1445,10 @@ TEST(CodegenVlaTest, GotoGivesBackOnlyTheScopesItLeaves) {
 
 TEST(CodegenComplexTest, ComplexTypesArePairsAndImaginaryConstantsHaveNoRealPart) {
   std::string body =
-      function(generate("void slots(void) { float _Complex f; double _Complex d;\n"
-                        "  long double _Complex l; f = 1.0iF; d = 2.0i; l = 3.0iL; }\n"),
+      function(generate("#include <imaginary.h>\n"
+                        "void slots(void) { float _Complex f; double _Complex d;\n"
+                        "  long double _Complex l; f = IMAG_F; d = IMAG_D; l = IMAG_L; }\n",
+                        TARGET_WINDOWS_X64, true),
                "slots");
   expect_lines(
       body, {"%f.0 = alloca { float, float }, align 4", "%d.1 = alloca { double, double }, align 8",
@@ -1568,9 +1584,11 @@ TEST(CodegenComplexTest, EqualityComparesBothPartsAndAConditionTestsEither) {
 }
 
 TEST(CodegenComplexTest, StaticComplexObjectsHoldBothParts) {
-  std::string ir = generate("double _Complex sd = 1.0 - 2.0i;\n"
-                            "float _Complex sf = 3.0f + 4.0iF;\n"
-                            "long double _Complex sl = 1.0L + 1.0iL;\n");
+  std::string ir = generate("#include <imaginary.h>\n"
+                            "double _Complex sd = 1.0 - IMAG_D;\n"
+                            "float _Complex sf = 3.0f + IMAG_F4;\n"
+                            "long double _Complex sl = 1.0L + IMAG_L1;\n",
+                            TARGET_WINDOWS_X64, true);
   for (
       const char *line :
       {"@sd = global [16 x i8] c\"\\00\\00\\00\\00\\00\\00\\F0?\\00\\00\\00\\00\\00\\00\\00\\C0\", "
@@ -1644,6 +1662,55 @@ TEST(CodegenBuiltinTest, SignbitAndLlabsMatchGcc) {
                                     "%4 = select i1 %2, i64 %3, i64 %1", "ret i64 %4"});
 }
 
+static const char *sync_source =
+    "int add(int *p, int v) { return __sync_fetch_and_add(p, v); }\n"
+    "unsigned char nand(unsigned char *p) { return __sync_nand_and_fetch(p, 3); }\n"
+    "long long sub(long long *p) { return __sync_sub_and_fetch(p, 2); }\n"
+    "_Bool cas(int *p, int o, int n) { return __sync_bool_compare_and_swap(p, o, n); }\n"
+    "char *vcas(char **p, char *n) { return __sync_val_compare_and_swap(p, 0, n); }\n"
+    "short tas(short *p) { return __sync_lock_test_and_set(p, 1); }\n"
+    "void rel(char **p) { __sync_lock_release(p); }\n"
+    "void rel2(int *p) { __sync_lock_release(p); }\n"
+    "void fence(void) { __sync_synchronize(); __builtin_ia32_sfence(); }\n"
+    "unsigned long long hi(unsigned long long a, unsigned long long b) { return __umulh(a, b); }\n"
+    "long long shi(long long a, int b) { return __mulh(a, b); }\n";
+
+TEST(CodegenBuiltinTest, SyncArithmeticIsAnAtomicReadModifyWrite) {
+  std::string ir = generate(sync_source);
+  expect_lines(function(ir, "add"), {"%4 = atomicrmw add ptr %2, i32 %3 seq_cst", "ret i32 %4"});
+  expect_lines(function(ir, "nand"),
+               {"%2 = trunc i32 3 to i8", "%3 = atomicrmw nand ptr %1, i8 %2 seq_cst",
+                "%4 = and i8 %3, %2", "%5 = xor i8 %4, -1", "ret i8 %5"});
+  expect_lines(function(ir, "sub"),
+               {"%3 = atomicrmw sub ptr %1, i64 %2 seq_cst", "%4 = sub i64 %3, %2", "ret i64 %4"});
+}
+
+TEST(CodegenBuiltinTest, SyncSwapsLocksAndFences) {
+  std::string ir = generate(sync_source);
+  expect_lines(function(ir, "cas"),
+               {"%6 = cmpxchg ptr %3, i32 %4, i32 %5 seq_cst seq_cst",
+                "%7 = extractvalue { i32, i1 } %6, 1", "%8 = zext i1 %7 to i8", "ret i8 %8"});
+  expect_lines(function(ir, "vcas"), {"%4 = cmpxchg ptr %2, ptr null, ptr %3 seq_cst seq_cst",
+                                      "%5 = extractvalue { ptr, i1 } %4, 0", "ret ptr %5"});
+  expect_lines(function(ir, "tas"), {"%3 = atomicrmw xchg ptr %1, i16 %2 acquire", "ret i16 %3"});
+  expect_lines(function(ir, "rel"), {"store atomic ptr null, ptr %1 release, align 8"});
+  expect_lines(function(ir, "rel2"), {"store atomic i32 0, ptr %1 release, align 4"});
+  expect_lines(function(ir, "fence"),
+               {"fence seq_cst", "call void @llvm.x86.sse.sfence()", "ret void"});
+  EXPECT_EQ(count(ir, "declare void @llvm.x86.sse.sfence()\n"), 1) << ir;
+  EXPECT_EQ(count(generate("int f(void) { return 0; }"), "sfence"), 0);
+}
+
+TEST(CodegenBuiltinTest, MultiplyHighKeepsTheUpperHalf) {
+  std::string ir = generate(sync_source);
+  expect_lines(function(ir, "hi"),
+               {"%3 = zext i64 %2 to i128", "%5 = zext i64 %4 to i128", "%6 = mul i128 %3, %5",
+                "%7 = lshr i128 %6, 64", "%8 = trunc i128 %7 to i64", "ret i64 %8"});
+  expect_lines(function(ir, "shi"),
+               {"%3 = sext i64 %2 to i128", "%5 = sext i32 %4 to i64", "%6 = sext i64 %5 to i128",
+                "%7 = mul i128 %3, %6", "%8 = lshr i128 %7, 64", "%9 = trunc i128 %8 to i64"});
+}
+
 TEST(CodegenBuiltinTest, TrapAndUnreachableEndTheirBlock) {
   std::string ir = generate("int trap(int i) { if (i) __builtin_trap(); return 1; }\n"
                             "int unr(int i) { if (i) __builtin_unreachable(); return 2; }\n");
@@ -1711,6 +1778,15 @@ TEST(CodegenAsmTest, BasicAsmKeepsItsPercentSigns) {
                 "\"~{dirflag},~{fpsr},~{flags}\"()"});
   expect_lines(function(generate("void percent(void) { __asm__(\"# 50%% %0 %=\"); }\n"), "percent"),
                {"call void asm sideeffect \"# 50%% %0 %=\", \"~{dirflag},~{fpsr},~{flags}\"()"});
+}
+
+TEST(CodegenAsmTest, NamedOperandsAreNumbered) {
+  expect_lines(function(generate("int named(int a, int b) {\n"
+                                 "  __asm__(\"addl %[b], %[a]\" : [a] \"+r\"(a) : [b] \"r\"(b));\n"
+                                 "  return a; }\n"),
+                        "named"),
+               {"%4 = call i32 asm \"addl $1, $0\", \"=r,r,0,~{dirflag},~{fpsr},~{flags}\"(i32 %3, "
+                "i32 %2)"});
 }
 
 TEST(CodegenAsmTest, RegisterLettersAndClobbersAreTranslated) {
@@ -2162,7 +2238,8 @@ INSTANTIATE_TEST_SUITE_P(
         ProgramCase{"builtins", TARGET_WINDOWS_X64}, ProgramCase{"builtins", TARGET_LINUX_X64},
         ProgramCase{"asm", TARGET_WINDOWS_X64}, ProgramCase{"asm", TARGET_LINUX_X64},
         ProgramCase{"setjmp", TARGET_WINDOWS_X64}, ProgramCase{"setjmp", TARGET_LINUX_X64},
-        ProgramCase{"stdio", TARGET_WINDOWS_X64}, ProgramCase{"stdio", TARGET_LINUX_X64}),
+        ProgramCase{"stdio", TARGET_WINDOWS_X64}, ProgramCase{"stdio", TARGET_LINUX_X64},
+        ProgramCase{"extensions", TARGET_WINDOWS_X64}, ProgramCase{"extensions", TARGET_LINUX_X64}),
     [](const testing::TestParamInfo<ProgramCase> &info) {
       return std::string(info.param.name) +
              (info.param.kind == TARGET_WINDOWS_X64 ? "Windows" : "Linux");

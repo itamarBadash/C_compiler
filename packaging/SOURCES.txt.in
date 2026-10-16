@@ -2,9 +2,11 @@ MMC99 @MMC99_VERSION@ - where every file in this folder comes from
 
 @COMPILER_FILE@
     Built from the MMC99 sources.
+    License: licenses/MMC99 (MIT)
 
 include/
     MMC99's own headers.
+    License: licenses/MMC99 (MIT)
 
 @LLVM_FILES@
     LLVM @LLVM_VERSION@, from @LLVM_ORIGIN@.
