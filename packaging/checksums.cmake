@@ -1,0 +1,8 @@
+file(GLOB archives RELATIVE "${DIR}" "${DIR}/*.zip" "${DIR}/*.tar.gz")
+list(SORT archives)
+set(sums "")
+foreach(archive ${archives})
+    file(SHA256 "${DIR}/${archive}" hash)
+    string(APPEND sums "${hash}  ${archive}\n")
+endforeach()
+file(WRITE "${DIR}/SHA256SUMS" "${sums}")
