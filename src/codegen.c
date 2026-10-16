@@ -1982,6 +1982,43 @@ static const char *va_builtin(codegen *cg, ast_node *node) {
   }
 }
 
+static const char *sync_builtin(codegen *cg, ast_node *node) {
+  static const char *const operations[] = {"add", "sub", "or", "and", "xor", "nand"};
+  builtin_kind kind = node->builtin.kind;
+  ast_node **args = node->builtin.args;
+  if (kind == BUILTIN_SYNC_SYNCHRONIZE) {
+    instruction(cg, "fence seq_cst");
+    return "";
+  }
+  type_info *target = resolved(resolved(args[0]->expr_type)->ptr_to);
+  const char *type = llvm_type(cg, target);
+  const char *address = value(cg, args[0]);
+  if (kind == BUILTIN_SYNC_LOCK_RELEASE) {
+    instruction(cg, "store atomic %s %s, ptr %s release, align %lld", type,
+                is_pointer(target) ? "null" : "0", address, size_of(target));
+    return "";
+  }
+  const char *operand = value(cg, args[1]);
+  if (kind <= BUILTIN_SYNC_NAND_AND_FETCH) {
+    int index = (int)(kind - BUILTIN_SYNC_FETCH_AND_ADD) % 6;
+    const char *old = compute(cg, "atomicrmw %s ptr %s, %s %s seq_cst", operations[index], address,
+                              type, operand);
+    if (kind < BUILTIN_SYNC_ADD_AND_FETCH)
+      return old;
+    if (kind == BUILTIN_SYNC_NAND_AND_FETCH)
+      return compute(cg, "xor %s %s, -1", type, compute(cg, "and %s %s, %s", type, old, operand));
+    return compute(cg, "%s %s %s, %s", operations[index], type, old, operand);
+  }
+  if (kind == BUILTIN_SYNC_LOCK_TEST_AND_SET)
+    return compute(cg, "atomicrmw xchg ptr %s, %s %s acquire", address, type, operand);
+  const char *replacement = value(cg, args[2]);
+  const char *pair = compute(cg, "cmpxchg ptr %s, %s %s, %s %s seq_cst seq_cst", address, type,
+                             operand, type, replacement);
+  if (kind == BUILTIN_SYNC_VAL_COMPARE_AND_SWAP)
+    return compute(cg, "extractvalue { %s, i1 } %s, 0", type, pair);
+  return compute(cg, "zext i1 %s to i8", compute(cg, "extractvalue { %s, i1 } %s, 1", type, pair));
+}
+
 static const char *builtin_value(codegen *cg, ast_node *node) {
   static const char *const orders[] = {"ogt", "oge", "olt", "ole", "one", "uno"};
   ast_node **args = node->builtin.args;
@@ -2046,6 +2083,36 @@ static const char *builtin_value(codegen *cg, ast_node *node) {
     return emit_call(cg, node->builtin.chosen, args + functions,
                      node->builtin.arg_count - functions);
   }
+  case BUILTIN_SYNC_FETCH_AND_ADD:
+  case BUILTIN_SYNC_FETCH_AND_SUB:
+  case BUILTIN_SYNC_FETCH_AND_OR:
+  case BUILTIN_SYNC_FETCH_AND_AND:
+  case BUILTIN_SYNC_FETCH_AND_XOR:
+  case BUILTIN_SYNC_FETCH_AND_NAND:
+  case BUILTIN_SYNC_ADD_AND_FETCH:
+  case BUILTIN_SYNC_SUB_AND_FETCH:
+  case BUILTIN_SYNC_OR_AND_FETCH:
+  case BUILTIN_SYNC_AND_AND_FETCH:
+  case BUILTIN_SYNC_XOR_AND_FETCH:
+  case BUILTIN_SYNC_NAND_AND_FETCH:
+  case BUILTIN_SYNC_BOOL_COMPARE_AND_SWAP:
+  case BUILTIN_SYNC_VAL_COMPARE_AND_SWAP:
+  case BUILTIN_SYNC_LOCK_TEST_AND_SET:
+  case BUILTIN_SYNC_LOCK_RELEASE:
+  case BUILTIN_SYNC_SYNCHRONIZE:
+    return sync_builtin(cg, node);
+  case BUILTIN_UMULH:
+  case BUILTIN_MULH: {
+    const char *widen = node->builtin.kind == BUILTIN_UMULH ? "zext" : "sext";
+    const char *a = compute(cg, "%s i64 %s to i128", widen, value(cg, args[0]));
+    const char *b = compute(cg, "%s i64 %s to i128", widen, value(cg, args[1]));
+    const char *product = compute(cg, "mul i128 %s, %s", a, b);
+    return compute(cg, "trunc i128 %s to i64", compute(cg, "lshr i128 %s, 64", product));
+  }
+  case BUILTIN_IA32_SFENCE:
+    declare_once(cg, "declare void @llvm.x86.sse.sfence()");
+    instruction(cg, "call void @llvm.x86.sse.sfence()");
+    return "";
   default:
     return "poison";
   }

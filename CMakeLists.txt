@@ -14,6 +14,7 @@ set(FRONT_END src/preprocessor.c src/lexer.c src/parser.c src/ast.c src/sema.c s
 # 1. קובץ ההרצה המקורי שלנו - רק קבצי המקור, נקי לחלוטין מטסטים!
 set(COMPILER_SOURCES src/main.c src/driver.c src/host.c src/codegen.c ${FRONT_END})
 add_executable(MMC99 ${COMPILER_SOURCES})
+target_compile_options(MMC99 PRIVATE -O2)
 
 file(STRINGS "${CMAKE_SOURCE_DIR}/include/driver.h" MMC99_VERSION REGEX "#define MMC99_VERSION ")
 string(REGEX REPLACE ".*\"(.*)\".*" "\\1" MMC99_VERSION "${MMC99_VERSION}")
@@ -87,6 +88,8 @@ set(LLVM_FILES "bin/clang.exe, bin/ld.lld.exe")
 set(LLVM_ORIGIN "LLVM's Windows installer, unmodified")
 configure_file("${CMAKE_SOURCE_DIR}/packaging/README.txt.in" "${TOOLCHAIN_DIR}/README.txt" @ONLY)
 configure_file("${CMAKE_SOURCE_DIR}/packaging/SOURCES.txt.in" "${TOOLCHAIN_DIR}/SOURCES.txt" @ONLY)
+configure_file("${CMAKE_SOURCE_DIR}/CONFORMANCE.md" "${TOOLCHAIN_DIR}/CONFORMANCE.md" COPYONLY)
+configure_file("${CMAKE_SOURCE_DIR}/LICENSE" "${TOOLCHAIN_DIR}/licenses/MMC99/LICENSE" COPYONLY)
 
 add_custom_target(toolchain_headers
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/lib/include"
@@ -104,7 +107,8 @@ add_custom_command(OUTPUT "${PACKAGE_ZIP}"
         COMMAND ${CMAKE_COMMAND} -E tar cf "${PACKAGE_ZIP}" --format=zip MMC99
         WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
         DEPENDS MMC99 ${OWN_HEADERS} "${TOOLCHAIN_STAMP}" "${TOOLCHAIN_DIR}/README.txt"
-        "${TOOLCHAIN_DIR}/SOURCES.txt"
+        "${TOOLCHAIN_DIR}/SOURCES.txt" "${TOOLCHAIN_DIR}/CONFORMANCE.md"
+        "${TOOLCHAIN_DIR}/licenses/MMC99/LICENSE"
         VERBATIM)
 add_custom_target(dist ALL DEPENDS "${PACKAGE_ZIP}")
 
@@ -145,6 +149,7 @@ if(EXISTS "${LINUX_LLVM_DIR}/bin/clang" AND EXISTS "${LINUX_LLVM_DIR}/bin/ld.lld
             ${WSL_BINARY_DIR}/MMC99-${MMC99_VERSION}-linux-x86_64.tar.gz
             DEPENDS "${LINUX_PACKAGE_DIR}/MMC99" ${OWN_HEADERS} "${TOOLCHAIN_STAMP}"
             "${LINUX_PACKAGE_DIR}/README.txt" "${LINUX_PACKAGE_DIR}/SOURCES.txt"
+            "${TOOLCHAIN_DIR}/CONFORMANCE.md" "${TOOLCHAIN_DIR}/licenses/MMC99/LICENSE"
             "${LINUX_LLVM_DIR}/bin/clang" "${LINUX_LLVM_DIR}/bin/ld.lld"
             VERBATIM)
     add_custom_target(dist_linux ALL DEPENDS "${LINUX_PACKAGE}")
@@ -152,6 +157,18 @@ else()
     message(STATUS "The Linux download is not built: run "
             "\"python packaging/fetch_linux_llvm.py ${LINUX_LLVM_DIR}\" once, then reload CMake")
     set(LINUX_PACKAGE "")
+endif()
+
+set(RELEASE_DIR "${CMAKE_SOURCE_DIR}/release/${MMC99_VERSION}")
+add_custom_target(release
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${RELEASE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${RELEASE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy "${PACKAGE_ZIP}" ${LINUX_PACKAGE} "${RELEASE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -DDIR=${RELEASE_DIR} -P "${CMAKE_SOURCE_DIR}/packaging/checksums.cmake"
+        VERBATIM)
+add_dependencies(release dist)
+if(TARGET dist_linux)
+    add_dependencies(release dist_linux)
 endif()
 
 # ==========================================
@@ -239,6 +256,15 @@ target_compile_definitions(DriverTests PRIVATE
 target_link_libraries(DriverTests gtest_main)
 add_dependencies(DriverTests MMC99)
 gtest_discover_tests(DriverTests)
+
+add_executable(ConformanceTests tests/test_conformance.cpp)
+target_compile_definitions(ConformanceTests PRIVATE
+        TOOLCHAIN_DIR="${TOOLCHAIN_DIR}"
+        CORPUS_DIR="${CMAKE_BINARY_DIR}/corpus"
+        CONFORMANCE_DIR="${CMAKE_SOURCE_DIR}/tests/conformance")
+target_link_libraries(ConformanceTests gtest_main)
+add_dependencies(ConformanceTests MMC99)
+gtest_discover_tests(ConformanceTests)
 
 add_executable(PackageTests tests/test_package.cpp)
 target_compile_definitions(PackageTests PRIVATE

@@ -95,8 +95,8 @@ std::string PackageTest::folder;
 std::string PackageTest::root;
 
 TEST_F(PackageTest, TheZipHoldsExactlyTheLayout) {
-  std::set<std::string> top = {"README.txt", "SOURCES.txt", "bin",
-                               "include",    "licenses",    "targets"};
+  std::set<std::string> top = {"CONFORMANCE.md", "README.txt", "SOURCES.txt", "bin",
+                               "include",        "licenses",   "targets"};
   EXPECT_EQ(entries(root), top);
   std::set<std::string> bin = {"MMC99.exe", "clang.exe", "ld.lld.exe"};
   EXPECT_EQ(entries(root + "\\bin"), bin);
@@ -139,6 +139,7 @@ TEST_F(PackageTest, EveryLicenseItNamesIsShipped) {
       {"glibc", {"copyright"}},
       {"libgcc-linux", {"copyright"}},
       {"linux-libc-dev", {"copyright"}},
+      {"MMC99", {"LICENSE"}},
   };
   std::set<std::string> folders;
   for (const auto &license : licenses) {
@@ -290,7 +291,7 @@ TEST_F(LinuxPackageTest, TheTarballHoldsExactlyTheLayoutWithItsProgramsExecutabl
                   &output),
             0)
       << output;
-  EXPECT_EQ(output, "README.txt SOURCES.txt bin include licenses targets \n"
+  EXPECT_EQ(output, "CONFORMANCE.md README.txt SOURCES.txt bin include licenses targets \n"
                     "MMC99 clang ld.lld \n"
                     "x86_64-pc-linux-gnu x86_64-w64-windows-gnu \n");
 }

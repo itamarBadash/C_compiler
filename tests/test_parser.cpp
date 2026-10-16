@@ -2755,6 +2755,45 @@ static ast_node *function_body_statement(ast_node *program, int decl_index, int 
   return body->block.statements[stmt_index];
 }
 
+TEST(ParserScopeTest, AScopeWithManyNamesFindsEveryOneNewestFirst) {
+  std::string source = "typedef int D;\nenum { D };\ntypedef int t0";
+  for (int i = 1; i < 100; i++)
+    source += ", t" + std::to_string(i);
+  source += ";\nenum { t50 };\n"
+            "void before(void) { D * a; }\n"
+            "void after(void) { t50 * b; }\n"
+            "void kept(void) { t51 * c; }\n"
+            "void inner(void) { int t52; t52 * d; }\n"
+            "void outer(void) { t52 * e; }\n";
+  int errors = -1;
+  ast_node *program = parse_source(source.c_str(), &errors);
+  EXPECT_EQ(errors, 0);
+  const struct {
+    const char *function;
+    int statement;
+    bool declaration;
+  } cases[] = {
+      {"before", 0, false}, {"after", 0, false}, {"kept", 0, true},
+      {"inner", 1, false},  {"outer", 0, true},
+  };
+  for (const auto &c : cases) {
+    SCOPED_TRACE(c.function);
+    ast_node *fn = nullptr;
+    for (int i = 0; i < program->program.count; i++) {
+      ast_node *decl = program->program.declarations[i];
+      if (decl->type == AST_NODE_TYPE_FUNCTION_DEF &&
+          std::strcmp(decl->function_def.name, c.function) == 0)
+        fn = decl;
+    }
+    ASSERT_NE(fn, nullptr);
+    ASSERT_GT(fn->function_def.body->block.count, c.statement);
+    ast_node *statement = fn->function_def.body->block.statements[c.statement];
+    EXPECT_EQ(statement->type == AST_NODE_TYPE_VAR_DECL, c.declaration)
+        << "statement node type " << statement->type;
+  }
+  free_ast(program);
+}
+
 TEST(DeclSpecifierTest, StorageClassIsRecordedOnTheDeclarationWhateverTheTypeShape) {
   int errors = -1;
   ast_node *program =
@@ -4699,6 +4738,158 @@ TEST(GnuSyntaxTest, ALoneSemicolonIsForgivenOnlyInASystemHeader) {
   testing::internal::GetCapturedStderr();
   EXPECT_EQ(errors, 1) << "in the main file a lone ';' stays a syntax error";
   free_ast(program);
+}
+
+TEST(GnuSyntaxTest, AnAsmOperandsNameBecomesItsNumberInTheTemplate) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("void f(int a, int b) {\n"
+                   "  int r;\n"
+                   "  __asm__(\"mov %[in], %[out]; movw %w[in], %%ax; %%[out] %2\"\n"
+                   "          : [out] \"=r\"(r) : [in] \"r\"(a), \"r\"(b));\n"
+                   "}\n",
+                   &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *statement = function_body_statement(program, 0, 1);
+  ASSERT_NE(statement, nullptr);
+  ASSERT_EQ(statement->type, AST_NODE_TYPE_ASM);
+  EXPECT_EQ(std::string(statement->asm_stmt.template_text->literal.bytes,
+                        statement->asm_stmt.template_text->literal.length),
+            "mov %1, %0; movw %w1, %%ax; %%[out] %2")
+      << "a name becomes its number, a letter before it stays and '%%' is left alone";
+  ASSERT_EQ(statement->asm_stmt.operand_count, 3);
+  EXPECT_STREQ(statement->asm_stmt.operand_names[0], "out");
+  EXPECT_STREQ(statement->asm_stmt.operand_names[1], "in");
+  EXPECT_EQ(statement->asm_stmt.operand_names[2], nullptr);
+  EXPECT_EQ(statement->asm_stmt.output_count, 1);
+  free_ast(program);
+}
+
+TEST(GnuSyntaxTest, AnAsmTemplateWithoutNamedOperandsIsNotRewritten) {
+  int errors = -1;
+  ast_node *program =
+      parse_source("void f(int a) { __asm__(\"%[x] %0\" : : \"r\"(a)); }\n", &errors);
+  EXPECT_EQ(errors, 0);
+  ast_node *statement = function_body_statement(program, 0, 0);
+  ASSERT_NE(statement, nullptr);
+  EXPECT_EQ(std::string(statement->asm_stmt.template_text->literal.bytes,
+                        statement->asm_stmt.template_text->literal.length),
+            "%[x] %0");
+  free_ast(program);
+}
+
+TEST(GnuSyntaxTest, MisusedAsmOperandNamesAreErrors) {
+  const struct {
+    const char *statement;
+    const char *message;
+  } cases[] = {
+      {"__asm__(\"%[nope]\" : \"=r\"(r) : [in] \"r\"(a));",
+       "no asm operand has the name used in the template"},
+      {"__asm__(\"%[in\" : \"=r\"(r) : [in] \"r\"(a));",
+       "no asm operand has the name used in the template"},
+      {"__asm__(\"%[i]\" : \"=r\"(r) : [in] \"r\"(a));",
+       "no asm operand has the name used in the template"},
+      {"__asm__(\"\" : [1] \"=r\"(r));", "expected a name and ']' before an asm operand"},
+      {"__asm__(\"\" : [out \"=r\"(r));", "expected a name and ']' before an asm operand"},
+      {"__asm__(\"\" : [out] (r));", "expected an asm constraint after the operand's name"},
+      {"__asm__(\"\" : : : [x] \"memory\");", "expected ')' to close the __asm__ statement"},
+  };
+  for (const auto &c : cases) {
+    SCOPED_TRACE(c.statement);
+    int errors = -1;
+    std::string source = std::string("void f(int a) { int r; ") + c.statement + " }\n";
+    testing::internal::CaptureStderr();
+    ast_node *program = parse_source(source.c_str(), &errors);
+    std::string diagnostics = testing::internal::GetCapturedStderr();
+    EXPECT_GE(errors, 1);
+    EXPECT_NE(diagnostics.substr(0, diagnostics.find('\n')).find(c.message), std::string::npos)
+        << "the first diagnostic names the problem: " << diagnostics;
+    free_ast(program);
+  }
+}
+
+static ast_node *parse_with_header(const char *header, bool as_system, int *errors,
+                                   std::string *diagnostics) {
+  _mkdir("parse_anon_dir");
+  {
+    std::ofstream f("parse_anon_dir/anon.h", std::ios::binary);
+    f << header;
+  }
+  static const char *dirs[] = {"parse_anon_dir"};
+  token_buf tb;
+  pp_run_ex(&tb, "#include <anon.h>\n", "main.c", as_system ? nullptr : dirs, as_system ? 0 : 1,
+            as_system ? dirs : nullptr, as_system ? 1 : 0);
+  parser p;
+  parser_init_from_buf(&p, &tb);
+  testing::internal::CaptureStderr();
+  ast_node *program = parse_program(&p);
+  *diagnostics = testing::internal::GetCapturedStderr();
+  *errors = p.had_error;
+  parser_destroy(&p);
+  remove("parse_anon_dir/anon.h");
+  _rmdir("parse_anon_dir");
+  return program;
+}
+
+TEST(GnuSyntaxTest, ASystemHeaderMayDeclareAnAnonymousRecordMember) {
+  int errors = -1;
+  std::string diagnostics;
+  ast_node *program =
+      parse_with_header("struct S { int x; union { int a; float f; }; struct { char c; }; };\n",
+                        true, &errors, &diagnostics);
+  EXPECT_EQ(errors, 0) << diagnostics;
+  ast_node *s = leading_struct_def(top_decl(program, 0));
+  ASSERT_NE(s, nullptr);
+  ASSERT_EQ(s->struct_def.member_count, 3);
+  const struct {
+    type_kind kind;
+  } anonymous[] = {{TYPE_UNION}, {TYPE_STRUCT}};
+  for (int i = 0; i < 2; i++) {
+    SCOPED_TRACE(i);
+    ast_node *member = s->struct_def.members[i + 1];
+    ASSERT_EQ(member->type, AST_NODE_TYPE_DECL_GROUP);
+    ASSERT_EQ(member->block.count, 2) << "the record's definition, then the member";
+    ast_node *declaration = member->block.statements[1];
+    ASSERT_EQ(declaration->type, AST_NODE_TYPE_VAR_DECL);
+    EXPECT_EQ(declaration->var_decl.var_name, nullptr) << "the member has no name";
+    ASSERT_NE(declaration->var_decl.type, nullptr);
+    EXPECT_EQ(declaration->var_decl.type->kind, anonymous[i].kind);
+    EXPECT_EQ(declaration->loc.line, 1);
+  }
+  free_ast(program);
+}
+
+TEST(GnuSyntaxTest, ASystemHeaderMayDefineATagInsideARecordWithoutAMember) {
+  int errors = -1;
+  std::string diagnostics;
+  ast_node *program =
+      parse_with_header("struct S { struct T { int t; }; int z; };\n", true, &errors, &diagnostics);
+  EXPECT_EQ(errors, 0) << diagnostics;
+  ast_node *s = leading_struct_def(top_decl(program, 0));
+  ASSERT_NE(s, nullptr);
+  ASSERT_EQ(s->struct_def.member_count, 2);
+  ASSERT_EQ(s->struct_def.members[0]->type, AST_NODE_TYPE_STRUCT_DEF)
+      << "only the tag's definition is kept, no member";
+  EXPECT_STREQ(s->struct_def.members[0]->struct_def.tag_name, "T");
+  free_ast(program);
+}
+
+TEST(GnuSyntaxTest, OutsideASystemHeaderARecordMemberMustHaveADeclarator) {
+  const char *headers[] = {
+      "struct S { int x; union { int a; float f; }; };\n",
+      "struct S { int x; struct { int a; }; };\n",
+      "struct S { struct T { int t; }; int z; };\n",
+  };
+  for (const char *header : headers) {
+    SCOPED_TRACE(header);
+    int errors = -1;
+    std::string diagnostics;
+    ast_node *program = parse_with_header(header, false, &errors, &diagnostics);
+    EXPECT_EQ(errors, 1);
+    EXPECT_NE(diagnostics.find("declaration does not declare anything"), std::string::npos)
+        << diagnostics;
+    free_ast(program);
+  }
 }
 
 TEST(GnuSyntaxTest, ExtensionMayPrecedeAnyDeclarationStatementOrExpression) {

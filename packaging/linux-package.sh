@@ -15,6 +15,7 @@ mkdir -p "$root/bin"
 cp -r "$staging/include" "$staging/targets" "$staging/licenses" "$root/"
 cp "$readme" "$root/README.txt"
 cp "$sources" "$root/SOURCES.txt"
+cp "$staging/CONFORMANCE.md" "$root/CONFORMANCE.md"
 cp "$compiler" "$root/bin/MMC99"
 cp "$llvm/clang" "$llvm/ld.lld" "$root/bin/"
 find "$root" -type d -exec chmod 755 {} +

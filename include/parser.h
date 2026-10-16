@@ -13,10 +13,13 @@ typedef struct parser_symbol {
   char *name;
   parser_symbol_kind kind;
   struct parser_symbol *next;
+  struct parser_symbol *bucket_next;
 } parser_symbol;
 
 typedef struct parser_scope {
   parser_symbol *symbols;
+  int count;
+  parser_symbol **index;
   struct parser_scope *parent;
 } parser_scope;
 

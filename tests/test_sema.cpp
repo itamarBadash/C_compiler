@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <direct.h>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <string>
 #include <vector>
@@ -196,6 +198,35 @@ static void check_preprocessed(Checked &c, const char *source) {
   token_buf_free(&tb);
   c.table = symbol_table_create();
   testing::internal::CaptureStderr();
+  c.errors = sema_check(c.table, c.program);
+  c.diagnostics = testing::internal::GetCapturedStderr();
+  collect(c.program, c.nodes);
+}
+
+static void check_with_header(Checked &c, const char *header, const char *source,
+                              bool as_system = true) {
+  _mkdir("sema_header_dir");
+  {
+    std::ofstream f("sema_header_dir/h.h", std::ios::binary);
+    f << header;
+  }
+  static const char *dirs[] = {"sema_header_dir"};
+  token_buf tb;
+  testing::internal::CaptureStderr();
+  int pp_errors = pp_run_ex(&tb, source, "main.c", as_system ? nullptr : dirs, as_system ? 0 : 1,
+                            as_system ? dirs : nullptr, as_system ? 1 : 0);
+  std::string pp_diagnostics = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(pp_errors, 0) << pp_diagnostics;
+  remove("sema_header_dir/h.h");
+  _rmdir("sema_header_dir");
+  parser p;
+  parser_init_from_buf(&p, &tb);
+  testing::internal::CaptureStderr();
+  c.program = parse_program(&p);
+  c.parse_errors = p.had_error;
+  parser_destroy(&p);
+  token_buf_free(&tb);
+  c.table = symbol_table_create();
   c.errors = sema_check(c.table, c.program);
   c.diagnostics = testing::internal::GetCapturedStderr();
   collect(c.program, c.nodes);
@@ -4993,11 +5024,6 @@ TEST(BuiltinTest, EachBuiltinHasItsResultType) {
       {d, "__builtin_llabs(1)", "long long"},
       {d, "__builtin_trap()", "void"},
       {d, "__builtin_unreachable()", "void"},
-      {"", "1.0iF", "float _Complex"},
-      {"", "1.0fi", "float _Complex"},
-      {"", "1.0i", "double _Complex"},
-      {"", "1.0Lj", "long double _Complex"},
-      {"", "0x1p3jL", "long double _Complex"},
   });
   TargetGuard guard(TARGET_LINUX_X64);
   expect_types({{d, "__builtin_offsetof(struct S, a[1])", "unsigned long"}});
@@ -5205,7 +5231,6 @@ TEST(BuiltinTest, TypesCompatibleFollowsGcc) {
                     {"__builtin_types_compatible_p(__typeof__(1.0f), double)", 0},
                     {"__builtin_types_compatible_p(__typeof__((char)1), char)", 1},
                     {"__builtin_types_compatible_p(__typeof__(arr), int[3])", 1},
-                    {"__builtin_types_compatible_p(__typeof__(1.0iF), float _Complex)", 1},
                 });
 }
 
@@ -5284,7 +5309,6 @@ TEST(BuiltinTest, ConstantBuiltinsCanInitializeStaticObjects) {
                     "unsigned long long o = __builtin_offsetof(struct S, a[2]);\n"
                     "int t = __builtin_types_compatible_p(int, int);\n"
                     "double c = __builtin_choose_expr(1, __builtin_huge_val(), 0);\n"
-                    "float _Complex z = 1.0iF;\n"
                     "const char *str;\n"
                     "int k;\n"
                     "float bad1 = __builtin_nanf(str);\n"
@@ -5299,15 +5323,6 @@ TEST(BuiltinTest, ConstantBuiltinsCanInitializeStaticObjects) {
                                error_at(src, "__builtin_isgreater", 1, message) +
                                error_at(src, "__builtin_offsetof(struct S, a[k", 1, message) +
                                error_at(src, "__builtin_choose_expr(0", 1, message));
-}
-
-TEST(BuiltinTest, AnImaginaryConstantHasNoRealPart) {
-  expect_values("", {
-                        {"(int)1.0i", 0},
-                        {"(int)2.5", 2},
-                        {"sizeof(1.0fi)", 8},
-                        {"sizeof(1.0iL)", 32},
-                    });
 }
 
 TEST(BuiltinTest, PrettyFunctionAndFunctionNameTheFunction) {
@@ -6461,7 +6476,7 @@ TEST(StaticValueTest, EachKindOfValueIsRecorded) {
                     "static int ut = ~(int)(1.5 * 2);\n"
                     "void f(void) { int x = 5; }\n";
   Checked c;
-  check(c, src);
+  check_with_header(c, src, "#include <h.h>\n");
   ASSERT_EQ(c.parse_errors, 0);
   ASSERT_EQ(c.errors, 0) << c.diagnostics;
   EXPECT_EQ(constant_text(only_entry(c, "i")), "integer 5");
@@ -6622,7 +6637,7 @@ TEST(StaticValueTest, ArithmeticValuesHaveGccsBytes) {
     TargetGuard guard(kind);
     SCOPED_TRACE(kind == TARGET_LINUX_X64 ? "linux" : "windows");
     Checked c;
-    check(c, src);
+    check_with_header(c, src, "#include <h.h>\n");
     ASSERT_EQ(c.parse_errors, 0);
     ASSERT_EQ(c.errors, 0) << c.diagnostics;
     for (const auto &object : gcc)
@@ -6860,4 +6875,814 @@ TEST(StaticValueTest, ANonConstantInitializerIsNotEvaluated) {
       error_at(src, "+ gv", 1, "an initializer for an object with static storage must be constant"))
       << "the division inside is never reported";
   EXPECT_EQ(constant_text(only_entry(c, "nz")), "none");
+}
+
+static const char *const anonymous_header =
+    "struct S { int x; union { int a; float f; struct { short lo, hi; }; }; double d; };\n";
+
+static ast_node *member_named(const Checked &c, const char *name) {
+  for (ast_node *n : nodes_of(c, AST_NODE_TYPE_MEMBER_ACCESS)) {
+    if (n->member_access.member_name && std::strcmp(n->member_access.member_name, name) == 0)
+      return n;
+  }
+  return nullptr;
+}
+
+TEST(AnonymousMemberTest, AMemberOfAnAnonymousRecordIsReachedThroughIt) {
+  Checked c;
+  check_with_header(c, anonymous_header,
+                    "#include <h.h>\n"
+                    "int use(struct S *p, struct S s) { s.a = 1; p->hi = 2; return s.lo + p->x; }\n"
+                    "float g(struct S s) { return s.f; }\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  ast_node *hi = member_named(c, "hi");
+  ASSERT_NE(hi, nullptr);
+  EXPECT_EQ(describe(hi->expr_type), "short");
+  EXPECT_EQ(hi->is_lvalue, 1);
+  EXPECT_EQ(hi->member_access.is_pointer, 0) << "the '->' moved to the outermost access";
+  ASSERT_NE(hi->member_access.member, nullptr);
+  EXPECT_STREQ(hi->member_access.member->var_decl.var_name, "hi");
+  ast_node *inner = hi->member_access.left;
+  ASSERT_EQ(inner->type, AST_NODE_TYPE_MEMBER_ACCESS);
+  EXPECT_EQ(inner->member_access.is_pointer, 0);
+  EXPECT_EQ(inner->member_access.member->var_decl.var_name, nullptr);
+  EXPECT_EQ(inner->expr_type->kind, TYPE_STRUCT);
+  EXPECT_EQ(inner->is_lvalue, 1);
+  ast_node *outer = inner->member_access.left;
+  ASSERT_EQ(outer->type, AST_NODE_TYPE_MEMBER_ACCESS);
+  EXPECT_EQ(outer->member_access.is_pointer, 1);
+  EXPECT_EQ(outer->member_access.member->var_decl.var_name, nullptr);
+  EXPECT_EQ(outer->is_lvalue, 1);
+  EXPECT_EQ(outer->expr_type->kind, TYPE_UNION);
+  ASSERT_EQ(outer->member_access.left->type, AST_NODE_TYPE_CONVERSION)
+      << "the pointer is loaded once, by the access that follows it";
+  EXPECT_EQ(outer->member_access.left->conversion.kind, CONVERSION_LVALUE);
+  ast_node *f = member_named(c, "f");
+  ASSERT_NE(f, nullptr);
+  EXPECT_EQ(describe(f->expr_type), "float");
+  ast_node *x = member_named(c, "x");
+  ASSERT_NE(x, nullptr);
+  EXPECT_EQ(x->member_access.is_pointer, 1) << "a direct member is not rewritten";
+  EXPECT_EQ(x->member_access.left->type, AST_NODE_TYPE_CONVERSION);
+}
+
+TEST(AnonymousMemberTest, AnAnonymousMemberIsLaidOutLikeANamedOne) {
+  Checked c;
+  check_with_header(c, anonymous_header,
+                    "#include <h.h>\n"
+                    "enum { HI = __builtin_offsetof(struct S, hi), D = __builtin_offsetof(struct "
+                    "S, d), F = __builtin_offsetof(struct S, f) };\n");
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  symbol *s = record_symbol(c, "S");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->size, 16);
+  EXPECT_EQ(s->alignment, 8);
+  const struct {
+    const char *name;
+    long long offset;
+  } offsets[] = {{"HI", 6}, {"D", 8}, {"F", 4}};
+  for (const auto &o : offsets) {
+    SCOPED_TRACE(o.name);
+    symbol *sym = find_symbol(c, o.name, SYMBOL_ENUM_CONSTANT);
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(sym->value, o.offset);
+  }
+}
+
+TEST(AnonymousMemberTest, QualifiersAndLvaluesCarryThroughTheAnonymousRecord) {
+  const char *src = "#include <h.h>\n"
+                    "struct S make(void);\n"
+                    "void w(const struct S *p, const struct S s) {\n"
+                    "  p->a = 1;\n"
+                    "  s.hi = 2;\n"
+                    "  make().lo = 3;\n"
+                    "}\n";
+  Checked c;
+  check_with_header(c, anonymous_header, src);
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  EXPECT_EQ(c.errors, 3) << c.diagnostics;
+  std::string message = "not a modifiable lvalue on the left of '='";
+  EXPECT_EQ(std::count(c.diagnostics.begin(), c.diagnostics.end(), '\n'), 3) << c.diagnostics;
+  for (const char *line : {":4:", ":5:", ":6:"})
+    EXPECT_NE(c.diagnostics.find(std::string(line)), std::string::npos) << line << c.diagnostics;
+  EXPECT_NE(c.diagnostics.find(message), std::string::npos) << c.diagnostics;
+  ast_node *a = member_named(c, "a");
+  ASSERT_NE(a, nullptr);
+  EXPECT_EQ(describe(a->expr_type), "const int");
+  ast_node *lo = member_named(c, "lo");
+  ASSERT_NE(lo, nullptr);
+  EXPECT_EQ(lo->is_lvalue, 0);
+  EXPECT_EQ(lo->member_access.left->is_lvalue, 0);
+}
+
+TEST(AnonymousMemberTest, AQualifiedAnonymousMemberQualifiesWhatIsReachedThroughIt) {
+  Checked c;
+  check_with_header(c, "struct Q { int plain; const struct { int x; }; };\n",
+                    "#include <h.h>\n"
+                    "void w(struct Q *q) { q->plain = 1; q->x = 2; }\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  EXPECT_EQ(c.errors, 1) << c.diagnostics;
+  EXPECT_NE(c.diagnostics.find(":2:"), std::string::npos) << c.diagnostics;
+  ast_node *x = member_named(c, "x");
+  ASSERT_NE(x, nullptr);
+  EXPECT_EQ(describe(x->expr_type), "const int");
+}
+
+TEST(AnonymousMemberTest, OffsetofContinuesFromAMemberInsideAnAnonymousRecord) {
+  Checked c;
+  check_with_header(c, "struct A { int x; struct { char pad; char arr[4]; int b : 3; }; };\n",
+                    "#include <h.h>\n"
+                    "enum { ARR = __builtin_offsetof(struct A, arr[2]) };\n"
+                    "int n = __builtin_offsetof(struct A, b);\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  EXPECT_EQ(c.errors, 1) << c.diagnostics;
+  EXPECT_NE(c.diagnostics.find("offsetof cannot name bit-field 'b'"), std::string::npos)
+      << c.diagnostics;
+  symbol *arr = find_symbol(c, "ARR", SYMBOL_ENUM_CONSTANT);
+  ASSERT_NE(arr, nullptr);
+  EXPECT_EQ(arr->value, 7);
+}
+
+TEST(AnonymousMemberTest, AMemberNameMayNotRepeatAcrossAnonymousRecords) {
+  const char *header = "struct D { int a; union { int a; }; };\n"
+                       "struct E { union { int b; }; struct { int b; }; };\n"
+                       "struct F { union { int c; }; int c; };\n";
+  Checked c;
+  check_with_header(c, header, "#include <h.h>\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  EXPECT_EQ(c.errors, 3) << c.diagnostics;
+  for (const char *name : {"'a'", "'b'", "'c'"})
+    EXPECT_NE(c.diagnostics.find(std::string("duplicate member ") + name), std::string::npos)
+        << c.diagnostics;
+}
+
+TEST(AnonymousMemberTest, AnAnonymousRecordWithANamedMemberGivesItsParentOne) {
+  Checked c;
+  check_with_header(c, "struct M { union { int k; }; };\nstruct N { union { int : 3; }; };\n",
+                    "#include <h.h>\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  EXPECT_EQ(c.errors, 2) << "the empty union and N, but not M: " << c.diagnostics;
+  EXPECT_NE(c.diagnostics.find("h.h:2:"), std::string::npos) << c.diagnostics;
+  EXPECT_EQ(c.diagnostics.find("h.h:1:"), std::string::npos) << c.diagnostics;
+  symbol *m = record_symbol(c, "M");
+  ASSERT_NE(m, nullptr);
+  EXPECT_EQ(m->size, 4);
+}
+
+static std::string entries_of(const Checked &c, const char *name) {
+  std::vector<ast_node *> decl = declarations(c, name);
+  if (decl.size() != 1)
+    return "<no declaration>";
+  std::string out;
+  const initializer_layout &layout = decl[0]->var_decl.init_layout;
+  for (int i = 0; i < layout.count; i++) {
+    const initializer_entry &e = layout.entries[i];
+    out += std::to_string(e.offset) + " " + describe(e.type) + " " + constant_text(&e) + "; ";
+  }
+  return out;
+}
+
+TEST(AnonymousMemberTest, InitializersReachIntoAnonymousRecords) {
+  Checked c;
+  check_with_header(c, anonymous_header,
+                    "#include <h.h>\n"
+                    "struct S positional = { 1, 2, 3.0 };\n"
+                    "struct S designated = { .hi = 5, .x = 1, .d = 2.0 };\n"
+                    "struct S braced = { 1, { .f = 2.5f }, 4.0 };\n"
+                    "struct S nested = { .lo = 6, 7 };\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  EXPECT_EQ(entries_of(c, "positional"), "0 int integer 1; 4 int integer 2; 8 double floating 3; ");
+  EXPECT_EQ(entries_of(c, "designated"),
+            "6 short integer 5; 0 int integer 1; 8 double floating 2; ");
+  EXPECT_EQ(entries_of(c, "braced"),
+            "0 int integer 1; 4 float floating 2.5; 8 double floating 4; ");
+  EXPECT_EQ(entries_of(c, "nested"), "4 short integer 6; 6 short integer 7; ")
+      << "after a designator into an anonymous record, the next value is its next member";
+}
+
+TEST(AnonymousMemberTest, ADesignatorNamingNoMemberIsAnError) {
+  Checked c;
+  check_with_header(c, anonymous_header, "#include <h.h>\nstruct S s = { .nope = 1 };\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  EXPECT_EQ(c.errors, 1);
+  EXPECT_NE(c.diagnostics.find("no member named 'nope'"), std::string::npos) << c.diagnostics;
+}
+
+TEST(BuiltinTest, SyncAndMultiplyHighBuiltinsHaveTheirTypes) {
+  const char *d = "int i; long long q; unsigned char u; char *p; volatile short v;\n";
+  expect_types({
+      {d, "__sync_fetch_and_add(&i, 1)", "int"},
+      {d, "__sync_fetch_and_sub(&q, 1)", "long long"},
+      {d, "__sync_fetch_and_or(&u, 1)", "unsigned char"},
+      {d, "__sync_fetch_and_and(&i, 1)", "int"},
+      {d, "__sync_fetch_and_xor(&i, 1)", "int"},
+      {d, "__sync_fetch_and_nand(&i, 1)", "int"},
+      {d, "__sync_add_and_fetch(&q, 1)", "long long"},
+      {d, "__sync_sub_and_fetch(&i, 1)", "int"},
+      {d, "__sync_or_and_fetch(&i, 1)", "int"},
+      {d, "__sync_and_and_fetch(&i, 1)", "int"},
+      {d, "__sync_xor_and_fetch(&i, 1)", "int"},
+      {d, "__sync_nand_and_fetch(&u, 1)", "unsigned char"},
+      {d, "__sync_bool_compare_and_swap(&i, 0, 1)", "_Bool"},
+      {d, "__sync_val_compare_and_swap(&p, 0, p)", "char *"},
+      {d, "__sync_lock_test_and_set(&v, 1)", "short"},
+      {d, "__sync_lock_test_and_set(&p, 0)", "char *"},
+      {d, "__sync_lock_release(&i)", "void"},
+      {d, "__sync_synchronize()", "void"},
+      {d, "__builtin_ia32_sfence()", "void"},
+      {d, "__umulh(1, 2)", "unsigned long long"},
+      {d, "__mulh(1, 2)", "long long"},
+  });
+}
+
+TEST(BuiltinTest, SyncAndMultiplyHighArgumentsAreConverted) {
+  Checked c;
+  check(c, "unsigned char u; char *p;\n"
+           "void probe(void) { __sync_fetch_and_add(&u, 1); __sync_val_compare_and_swap(&p, 0, "
+           "p); __umulh(1, 2u); }\n");
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  std::vector<std::string> shapes;
+  for (ast_node *n : nodes_of(c, AST_NODE_TYPE_BUILTIN))
+    shapes.push_back(shape(n));
+  EXPECT_EQ(shapes, (std::vector<std::string>{
+                        "__sync_fetch_and_add(&u, (unsigned char)1)",
+                        "__sync_val_compare_and_swap(&p, (char *)0, load(p))",
+                        "__umulh((unsigned long long)1, (unsigned long long)2u)",
+                    }));
+}
+
+TEST(BuiltinTest, SyncAndMultiplyHighMisuseIsReported) {
+  const char *declarations = "int i; float fl; const int ci; char *p; struct T { char c[3]; } t;\n";
+  const struct {
+    const char *call;
+    const char *message;
+  } cases[] = {
+      {"__sync_fetch_and_add(&fl, 1)",
+       "the first argument must point to a modifiable 1, 2, 4 or 8-byte integer for "
+       "'__sync_fetch_and_add'"},
+      {"__sync_add_and_fetch(&ci, 1)",
+       "the first argument must point to a modifiable 1, 2, 4 or 8-byte integer for "
+       "'__sync_add_and_fetch'"},
+      {"__sync_fetch_and_add(&p, 1)",
+       "the first argument must point to a modifiable 1, 2, 4 or 8-byte integer for "
+       "'__sync_fetch_and_add'"},
+      {"__sync_fetch_and_or(i, 1)",
+       "the first argument must point to a modifiable 1, 2, 4 or 8-byte integer for "
+       "'__sync_fetch_and_or'"},
+      {"__sync_lock_test_and_set(&t, t)",
+       "the first argument must point to a modifiable 1, 2, 4 or 8-byte integer or pointer for "
+       "'__sync_lock_test_and_set'"},
+      {"__sync_lock_release(&fl)",
+       "the first argument must point to a modifiable 1, 2, 4 or 8-byte integer or pointer for "
+       "'__sync_lock_release'"},
+      {"__sync_val_compare_and_swap(&i, 1)",
+       "wrong number of arguments to '__sync_val_compare_and_swap'"},
+      {"__sync_synchronize(1)", "wrong number of arguments to '__sync_synchronize'"},
+      {"__sync_lock_release(&i, 1)", "wrong number of arguments to '__sync_lock_release'"},
+      {"__builtin_ia32_sfence(1)", "wrong number of arguments to '__builtin_ia32_sfence'"},
+      {"__sync_fetch_and_add(&i, \"x\")", "incompatible types"},
+      {"__umulh(1)", "wrong number of arguments to '__umulh'"},
+      {"__mulh(p, 1)", "incompatible types"},
+  };
+  for (const auto &test : cases) {
+    std::string source = std::string(declarations) + "void probe(void) { " + test.call + "; }\n";
+    SCOPED_TRACE(source);
+    Checked c;
+    check(c, source.c_str());
+    ASSERT_EQ(c.parse_errors, 0);
+    EXPECT_EQ(c.errors, 1) << c.diagnostics;
+    EXPECT_NE(c.diagnostics.find(test.message), std::string::npos) << c.diagnostics;
+  }
+}
+
+TEST(SystemHeaderTest, AZeroLengthArrayIsAllowedOnlyInASystemHeader) {
+  const char *header = "struct Z { int n; int tail[0]; };\n";
+  for (bool as_system : {true, false}) {
+    SCOPED_TRACE(as_system ? "system" : "user");
+    Checked c;
+    check_with_header(c, header, "#include <h.h>\n", as_system);
+    EXPECT_EQ(c.errors, as_system ? 0 : 1) << c.diagnostics;
+    if (!as_system)
+      EXPECT_NE(c.diagnostics.find("array size must be greater than zero"), std::string::npos)
+          << c.diagnostics;
+  }
+  Checked negative;
+  check_with_header(negative, "int bad[-1];\n", "#include <h.h>\n");
+  EXPECT_EQ(negative.errors, 1) << "a negative size is an error even in a system header";
+  EXPECT_NE(negative.diagnostics.find("array size must be greater than zero"), std::string::npos)
+      << negative.diagnostics;
+}
+
+TEST(SystemHeaderTest, ASystemHeaderMayRepeatATypedef) {
+  const struct {
+    const char *header;
+    bool as_system;
+    int errors;
+  } cases[] = {
+      {"typedef int T;\ntypedef int T;\n", true, 0},
+      {"typedef int T;\ntypedef int T;\n", false, 1},
+      {"typedef int T;\ntypedef long T;\n", true, 1},
+      {"int T;\ntypedef int T;\n", true, 1},
+      {"typedef int T;\nint T;\n", true, 1},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.header);
+    SCOPED_TRACE(test.as_system ? "system" : "user");
+    Checked c;
+    check_with_header(c, test.header, "#include <h.h>\n", test.as_system);
+    EXPECT_EQ(c.errors, test.errors) << c.diagnostics;
+    if (test.errors)
+      EXPECT_NE(c.diagnostics.find("redeclaration of 'T'"), std::string::npos) << c.diagnostics;
+  }
+}
+
+TEST(SystemHeaderTest, ASystemHeaderEnumeratorMayBeAnUnsignedInt) {
+  const char *header = "enum { BIG = 0x80000000 };\n";
+  Checked c;
+  check_with_header(c, header,
+                    "#include <h.h>\n"
+                    "int positive[BIG > 0 ? 1 : -1];\n"
+                    "unsigned u = BIG;\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  symbol *big = find_symbol(c, "BIG", SYMBOL_ENUM_CONSTANT);
+  ASSERT_NE(big, nullptr);
+  EXPECT_EQ(big->value, 2147483648LL);
+  std::vector<ast_node *> u = uses(c, "BIG");
+  ASSERT_EQ(u.size(), 2u);
+  EXPECT_EQ(describe(u[1]->expr_type), "unsigned int");
+  Checked user;
+  check_with_header(user, header, "#include <h.h>\n", false);
+  EXPECT_EQ(user.errors, 1);
+  EXPECT_NE(user.diagnostics.find("enumerator value is not representable as an int"),
+            std::string::npos)
+      << user.diagnostics;
+  Checked huge;
+  check_with_header(huge, "enum { HUGE = 0x100000000 };\n", "#include <h.h>\n");
+  EXPECT_EQ(huge.errors, 1) << "past unsigned int it is an error even in a system header";
+}
+
+static const char *const imaginary_header =
+    "#define IF 1.0iF\n#define FI 1.0fi\n#define ID 1.0i\n"
+    "#define LJ 1.0Lj\n#define HJ 0x1p3jL\n#define IL 1.0iL\n";
+
+TEST(ImaginaryConstantTest, ASystemHeadersImaginaryConstantIsComplexWithNoRealPart) {
+  Checked c;
+  check_with_header(c, imaginary_header,
+                    "#include <h.h>\n"
+                    "void probe(void) { IF; FI; ID; LJ; HJ; }\n"
+                    "enum { SAME = __builtin_types_compatible_p(__typeof__(IF), float _Complex),\n"
+                    "       REAL = (int)ID, SIZE_F = sizeof(FI), SIZE_L = sizeof(IL) };\n"
+                    "static float _Complex z = IF;\n");
+  ASSERT_EQ(c.parse_errors, 0) << c.diagnostics;
+  ASSERT_EQ(c.errors, 0) << c.diagnostics;
+  const std::vector<std::pair<std::string, std::string>> expected = {
+      {"1.0iF", "float _Complex"},         {"1.0fi", "float _Complex"},
+      {"1.0i", "double _Complex"},         {"1.0Lj", "long double _Complex"},
+      {"0x1p3jL", "long double _Complex"}, {"1.0iL", "long double _Complex"},
+  };
+  int seen = 0;
+  for (ast_node *n : nodes_of(c, AST_NODE_TYPE_NUMBER)) {
+    for (const auto &e : expected) {
+      if (n->tok.value && e.first == n->tok.value) {
+        EXPECT_EQ(describe(n->expr_type), e.second) << e.first;
+        seen++;
+      }
+    }
+  }
+  EXPECT_GE(seen, 6);
+  const struct {
+    const char *name;
+    long long value;
+  } values[] = {{"SAME", 1}, {"REAL", 0}, {"SIZE_F", 8}, {"SIZE_L", 32}};
+  for (const auto &v : values) {
+    symbol *sym = find_symbol(c, v.name, SYMBOL_ENUM_CONSTANT);
+    ASSERT_NE(sym, nullptr) << v.name;
+    EXPECT_EQ(sym->value, v.value) << v.name;
+  }
+}
+
+TEST(ImaginaryConstantTest, AProgramsOwnImaginaryConstantIsAnError) {
+  const char *src = "double _Complex z = 2.0i;\nfloat _Complex w = 1.0fi;\n";
+  Checked c;
+  check(c, src);
+  ASSERT_EQ(c.parse_errors, 0);
+  EXPECT_EQ(c.diagnostics,
+            error_at(src, "2.0i", 1, "imaginary constants are not part of C99") +
+                error_at(src, "1.0fi", 1, "imaginary constants are not part of C99"));
+  Checked user_header;
+  check_with_header(user_header, imaginary_header, "#include <h.h>\ndouble _Complex z = ID;\n",
+                    false);
+  EXPECT_EQ(user_header.errors, 1)
+      << "a header found in the program's own folders is the program's";
+  EXPECT_NE(user_header.diagnostics.find("imaginary constants are not part of C99"),
+            std::string::npos)
+      << user_header.diagnostics;
+}
+
+struct ConstraintCase {
+  const char *clause;
+  const char *source;
+  const char *message;
+};
+
+static std::string front_end_diagnostics(const char *source, int *errors) {
+  testing::internal::CaptureStderr();
+  token_buf tb;
+  int count = pp_run(&tb, source);
+  parser p;
+  parser_init_from_buf(&p, &tb);
+  ast_node *program = parse_program(&p);
+  count += p.had_error;
+  parser_destroy(&p);
+  token_buf_free(&tb);
+  symbol_table *table = symbol_table_create();
+  count += sema_check(table, program);
+  symbol_table_destroy(table);
+  free_ast(program);
+  *errors = count;
+  return testing::internal::GetCapturedStderr();
+}
+
+static const char *const not_constant = "enumerator value is not an integer constant expression";
+static const char *const no_lvalue = "not a modifiable lvalue on the left of '='";
+static const char *const vm_member = "variably modified type for member";
+
+static const ConstraintCase constraint_cases[] = {
+    {"6.4p2", "int x = 1 @ 2;", "unexpected character '@' in source"},
+    {"6.4p2", "double _Complex z = 2.0i;", "imaginary constants are not part of C99"},
+    {"6.4.3p2", "int \\u0041b;", "invalid universal character name in identifier"},
+    {"6.4.3p2", "int a\\uD800;", "invalid universal character name in identifier"},
+    {"6.4.4p2", "long long x = 99999999999999999999;", "integer constant is too large"},
+    {"6.4.4p2", "double d = 1e999;", "floating constant is out of range for its type"},
+    {"6.4.4.2p1", "double d = 0x1.0;", "hexadecimal floating constant requires an exponent"},
+    {"6.4.4.4p9", "int c = '\\777';", "octal escape sequence out of range"},
+    {"6.4.4.4p9", "int c = '\\x100';", "hex escape sequence out of range"},
+    {"6.4.4.4p9", "int c = L'\\x10000';", "hex escape sequence out of range"},
+
+    {"6.5.2.1p1", "int i; int f(void) { return i[i]; }",
+     "a subscript needs a pointer to an object and an integer"},
+    {"6.5.2.1p1", "void *v; int f(void) { return v[0]; }",
+     "a subscript needs a pointer to an object and an integer"},
+    {"6.5.2.2p1", "int i; void f(void) { i(); }", "the called expression is not a function"},
+    {"6.5.2.2p2", "void g(int); void f(void) { g(1, 2); }", "too many arguments in call"},
+    {"6.5.2.2p2", "void g(int); void f(void) { g(); }", "too few arguments in call"},
+    {"6.5.2.2p2", "struct S { int a; } s; void g(int); void f(void) { g(s); }",
+     "incompatible types in argument"},
+    {"6.5.2.3p1", "int i; int f(void) { return i.a; }",
+     "the left operand of '.' must be a structure or union"},
+    {"6.5.2.3p1", "struct S { int a; } s; int f(void) { return s.b; }", "no member named 'b'"},
+    {"6.5.2.3p2", "struct S { int a; } s; int f(void) { return s->a; }",
+     "the left operand of '->' must be a pointer to a structure or union"},
+    {"6.5.2.3p2", "struct S { int a; } *p; int f(void) { return p->b; }", "no member named 'b'"},
+    {"6.5.2.3p2", "struct S *p; int f(void) { return p->a; }",
+     "member access into an incomplete structure or union"},
+    {"6.5.2.4p1", "struct S { int a; } s; void f(void) { s++; }", "invalid operand to unary '++'"},
+    {"6.5.2.4p1", "void *v; void f(void) { v++; }", "invalid operand to unary '++'"},
+    {"6.5.2.4p1", "const int c = 0; void f(void) { c--; }",
+     "not a modifiable lvalue as the operand of '--'"},
+    {"6.5.2.5p1", "int n; void f(void) { int *p = (int[n]){1}; }",
+     "a compound literal cannot have a variable length array type"},
+    {"6.5.2.5p1", "void f(void) { (void (void)){0}; }", "a compound literal needs an object type"},
+    {"6.5.2.5p2", "void f(void) { int *p = (int[2]){1, 2, 3}; }", "excess elements in initializer"},
+    {"6.5.2.5p3", "int g(void); int *p = (int[1]){g()};",
+     "an initializer for an object with static storage must be constant"},
+    {"6.5.3.1p1", "double _Complex z; void f(void) { ++z; }", "invalid operand to unary '++'"},
+    {"6.5.3.1p1", "void f(void) { --1; }", "not a modifiable lvalue as the operand of '--'"},
+    {"6.5.3.2p1", "void f(void) { int *p = &1; }",
+     "the operand of '&' must be an lvalue or a function designator"},
+    {"6.5.3.2p1", "struct S { int b : 3; } s; void f(void) { int *p = &s.b; }",
+     "cannot take the address of a bit-field"},
+    {"6.5.3.2p1", "void f(void) { register int r; int *p = &r; }",
+     "cannot take the address of register object 'r'"},
+    {"6.5.3.2p2", "int i; void f(void) { *i = 0; }", "invalid operand to unary '*'"},
+    {"6.5.3.3p1", "int *p; void f(void) { p = -p; }", "invalid operand to unary '-'"},
+    {"6.5.3.3p1", "double d; void f(void) { d = ~d; }", "invalid operand to unary '~'"},
+    {"6.5.3.3p1", "struct S { int a; } s; void f(void) { int i = !s; }",
+     "invalid operand to unary '!'"},
+    {"6.5.3.4p1", "int f(void); int n = sizeof f;",
+     "invalid application of sizeof to a function type"},
+    {"6.5.3.4p1", "int n = sizeof(int(void));", "invalid application of sizeof to a function type"},
+    {"6.5.3.4p1", "struct T; int n = sizeof(struct T);",
+     "invalid application of sizeof to an incomplete type"},
+    {"6.5.3.4p1", "struct S { int b : 3; } s; int n = sizeof s.b;",
+     "invalid application of sizeof to a bit-field"},
+    {"6.5.4p2", "struct S { int a; } s; int i = (int)s;", "a cast needs a scalar operand"},
+    {"6.5.4p2", "int i; void f(void) { (struct S { int a; })i; }",
+     "a cast needs a scalar or void type"},
+    {"6.5.4p2", "int i; void f(void) { (int[2])i; }", "a cast needs a scalar or void type"},
+    {"6.5.5p2", "int *p; void f(void) { int i = p * 2; }", "invalid operands to binary '*'"},
+    {"6.5.5p2", "double d; void f(void) { d = d % 2; }", "invalid operands to binary '%'"},
+    {"6.5.6p2", "int *p, *q; void f(void) { p = p + q; }", "invalid operands to binary '+'"},
+    {"6.5.6p2", "void (*fp)(void); void f(void) { fp = fp + 1; }",
+     "invalid operands to binary '+'"},
+    {"6.5.6p2", "void *v; void f(void) { v = v + 1; }", "invalid operands to binary '+'"},
+    {"6.5.6p3", "int *p; double *q; void f(void) { long n = p - q; }",
+     "invalid operands to binary '-'"},
+    {"6.5.6p3", "void *a, *b; long f(void) { return a - b; }", "invalid operands to binary '-'"},
+    {"6.5.6p3", "int *p; void f(void) { p = 1 - p; }", "invalid operands to binary '-'"},
+    {"6.5.7p2", "double d; void f(void) { int i = d << 1; }", "invalid operands to binary '<<'"},
+    {"6.5.8p2", "int *p; double *q; void f(void) { int i = p < q; }",
+     "invalid operands to binary '<'"},
+    {"6.5.8p2", "int *p; void f(void) { int i = p < 1; }", "invalid operands to binary '<'"},
+    {"6.5.9p2", "int *p; double *q; void f(void) { int i = p == q; }",
+     "invalid operands to binary '=='"},
+    {"6.5.9p2", "int *p; void f(void) { int i = p == 1; }", "invalid operands to binary '=='"},
+    {"6.5.10p2", "double d; void f(void) { int i = d & 1; }", "invalid operands to binary '&'"},
+    {"6.5.11p2", "double d; void f(void) { int i = d ^ 1; }", "invalid operands to binary '^'"},
+    {"6.5.12p2", "double d; void f(void) { int i = d | 1; }", "invalid operands to binary '|'"},
+    {"6.5.13p2", "struct S { int a; } s; void f(void) { int i = s && 1; }",
+     "invalid operands to binary '&&'"},
+    {"6.5.14p2", "struct S { int a; } s; void f(void) { int i = 1 || s; }",
+     "invalid operands to binary '||'"},
+    {"6.5.15p2", "struct S { int a; } s; void f(void) { int i = s ? 1 : 2; }",
+     "the condition of '?:' needs a scalar type"},
+    {"6.5.15p3", "struct S { int a; } s; void f(void) { int i = 1 ? s : 2; }",
+     "type mismatch in conditional expression"},
+    {"6.5.15p3", "int *p; double *q; void f(int c) { c ? p : q; }",
+     "type mismatch in conditional expression"},
+    {"6.5.15p3", "int *p; void f(int c) { c ? p : 1; }", "type mismatch in conditional expression"},
+    {"6.5.15p3", "void f(int c) { int i = c ? (void)0 : 1; }",
+     "type mismatch in conditional expression"},
+    {"6.5.16p2", "void f(void) { 1 = 2; }", no_lvalue},
+    {"6.5.16p2", "const int c = 0; void f(void) { c = 1; }", no_lvalue},
+    {"6.5.16p2", "int a[2], b[2]; void f(void) { a = b; }", no_lvalue},
+    {"6.5.16.1p1", "struct S { int a; } s; void f(void) { int i; i = s; }",
+     "incompatible types in assignment"},
+    {"6.5.16.1p1", "struct S { int a; } s; struct T { int a; } t; void f(void) { s = t; }",
+     "incompatible types in assignment"},
+    {"6.5.16.1p1", "int *p; double *q; void f(void) { p = q; }",
+     "incompatible types in assignment"},
+    {"6.5.16.1p1", "const int *c; int *p; void f(void) { p = c; }",
+     "qualifiers discarded in assignment"},
+    {"6.5.16.1p1", "int *p; void f(void) { p = 1; }", "incompatible types in assignment"},
+    {"6.5.16.1p1", "void (*fp)(void); void *v; void f(void) { v = fp; }",
+     "incompatible types in assignment"},
+    {"6.5.16.1p1", "int f(void); int (*fp)(int) = f;", "incompatible types in initialization"},
+    {"6.5.16.2p1", "int *p, *q; void f(void) { p += q; }", "invalid operands to binary '+='"},
+    {"6.5.16.2p1", "double *p; void f(void) { p -= 1.5; }", "invalid operands to binary '-='"},
+    {"6.5.16.2p2", "double d; void f(void) { d %= 2; }", "invalid operands to binary '%='"},
+    {"6.5.16.2p2", "double d; void f(void) { d <<= 2; }", "invalid operands to binary '<<='"},
+
+    {"6.6p3", "int x; enum { E = (x = 1) };", not_constant},
+    {"6.6p3", "int x; enum { E = x++ };", not_constant},
+    {"6.6p3", "int g(void); enum { E = g() };", not_constant},
+    {"6.6p3", "enum { E = (1, 2) };", not_constant},
+    {"6.6p4", "int a[2147483647 + 1];", "overflow in a constant expression"},
+    {"6.6p4", "enum { E = 1 / 0 };", "division by zero in a constant expression"},
+
+    {"6.7p2", "int;", "declaration does not declare anything"},
+    {"6.7p2", "void f(void) { struct { int a; }; }", "declaration does not declare anything"},
+    {"6.7p3", "void f(void) { int x; int x; }", "redeclaration of 'x'"},
+    {"6.7p3", "typedef int T; typedef long T;", "redeclaration of 'T'"},
+    {"6.7p3", "enum { A }; int A;", "redeclaration of 'A'"},
+    {"6.7p3", "void f(void) { struct S { int a; }; struct S { int b; }; }", "redefinition of 'S'"},
+    {"6.7p4", "int x; long x;", "conflicting types for 'x'"},
+    {"6.7p4", "extern int a[2]; int a[3];", "conflicting types for 'a'"},
+    {"6.7.1p2", "static extern int x;", "more than one storage class in a declaration"},
+    {"6.7.1p2", "void f(void) { auto register int x; }",
+     "more than one storage class in a declaration"},
+    {"6.7.2p2", "x;", "expected a declaration at file scope"},
+    {"6.7.2p2", "struct S { const a; };", "a declaration needs a type specifier"},
+    {"6.7.2p2", "int n = sizeof(const);", "a declaration needs a type specifier"},
+    {"6.7.2p2", "long short x;", "invalid combination of type specifiers"},
+    {"6.7.2p2", "unsigned float x;", "invalid combination of type specifiers"},
+    {"6.7.2p2", "int int x;", "invalid combination of type specifiers"},
+    {"6.7.2p2", "_Complex x;", "invalid combination of type specifiers"},
+    {"6.7.2p2", "_Complex int z;", "invalid combination of type specifiers"},
+    {"6.7.2.1p2", "struct S { void v; };", "incomplete type for member 'v'"},
+    {"6.7.2.1p2", "struct S { int f(void); };", "function type for member 'f'"},
+    {"6.7.2.1p2", "struct S { struct S s; };", "incomplete type for member 's'"},
+    {"6.7.2.1p2", "struct S { int a[]; int b; };",
+     "flexible array member must be the last member, not 'a'"},
+    {"6.7.2.1p2", "struct S { int a[]; };", "flexible array member without another named member"},
+    {"6.7.2.1p2", "struct F { int n; int a[]; }; struct G { struct F f; int x; };",
+     "structure with a flexible array member used for member 'f'"},
+    {"6.7.2.1p2", "struct F { int n; int a[]; }; struct F list[2];",
+     "an array cannot have elements with a flexible array member"},
+    {"6.7.2.1p3", "int n; struct S { int b : n; };",
+     "width is not an integer constant expression for bit-field 'b'"},
+    {"6.7.2.1p3", "struct S { int b : -1; };", "negative width for bit-field 'b'"},
+    {"6.7.2.1p3", "struct S { int b : 33; };", "width exceeds its type for bit-field 'b'"},
+    {"6.7.2.1p3", "struct S { int b : 0; };", "zero width for bit-field 'b'"},
+    {"6.7.2.1p4", "struct S { double d : 3; };", "invalid type for bit-field 'd'"},
+    {"6.7.2.2p2", "int n; enum { E = n };", not_constant},
+    {"6.7.2.2p2", "enum { E = 2147483648 };", "enumerator value is not representable as an int"},
+    {"6.7.2.3p1", "struct S { int a; }; struct S { int a; };", "redefinition of 'S'"},
+    {"6.7.2.3p1", "enum E { A }; enum E { B };", "redefinition of 'E'"},
+    {"6.7.2.3p2", "enum E; enum E { A };", "declaration does not declare anything"},
+    {"6.7.2.3p2", "enum E e;", "use of incomplete enum 'E'"},
+    {"6.7.2.3p3", "struct S; union S *p;", "wrong kind of tag 'S'"},
+    {"6.7.3p2", "int restrict r;", "restrict needs a pointer to an object or incomplete type"},
+    {"6.7.3p2", "void (*restrict g)(void);",
+     "restrict needs a pointer to an object or incomplete type"},
+    {"6.7.3p2", "typedef void (*F)(void); restrict F f;",
+     "restrict needs a pointer to an object or incomplete type"},
+    {"6.7.4p2", "inline int x;", "inline can only declare a function, not 'x'"},
+    {"6.7.4p2", "typedef inline int T;", "inline can only declare a function, not 'T'"},
+    {"6.7.4p3", "inline void f(void) { static int s; }",
+     "an inline definition with external linkage cannot define modifiable static object 's'"},
+    {"6.7.4p3", "static int hidden; inline int f(void) { return hidden; }",
+     "an inline definition with external linkage cannot refer to internal linkage identifier"},
+    {"6.7.4p4", "inline int main(void) { return 0; }", "main cannot be declared inline"},
+    {"6.7.5.2p1", "int a[1.5];", "an array size needs an integer type"},
+    {"6.7.5.2p1", "int a[0];", "array size must be greater than zero"},
+    {"6.7.5.2p1", "int a[-1];", "array size must be greater than zero"},
+    {"6.7.5.2p1", "struct T; struct T a[2];", "an array needs a complete element type"},
+    {"6.7.5.2p1", "int a[2](void);", "an array cannot have elements of function type"},
+    {"6.7.5.2p1", "int a[static 2];",
+     "static and qualifiers in [] belong only to a parameter's outermost array"},
+    {"6.7.5.2p1", "void f(int a[2][static 2]);",
+     "static and qualifiers in [] belong only to a parameter's outermost array"},
+    {"6.7.5.2p1", "void f(void) { int a[const 2]; }",
+     "static and qualifiers in [] belong only to a parameter's outermost array"},
+    {"6.7.5.2p2", "int n; int a[n];", "variably modified type at file scope for 'a'"},
+    {"6.7.5.2p2", "void f(int n) { static int a[n]; }",
+     "variable length array with static storage duration for 'a'"},
+    {"6.7.5.2p2", "void f(int n) { extern int (*p)[n]; }",
+     "variably modified type with linkage for 'p'"},
+    {"6.7.5.2p2", "void f(int n) { struct S { int a[n]; }; }", vm_member},
+    {"6.7.5.2p4", "void f(void) { int a[*]; }", "[*] is only allowed in a function prototype"},
+    {"6.7.5.3p1", "int f(void)(void);", "a function cannot return an array or a function"},
+    {"6.7.5.3p1", "int f(void)[2];", "a function cannot return an array or a function"},
+    {"6.7.5.3p2", "void f(static int x);", "only register may appear in a parameter declaration"},
+    {"6.7.5.3p2", "void f(auto int x);", "only register may appear in a parameter declaration"},
+    {"6.7.5.3p3", "int f(a, b);", "an identifier list is only allowed in a function definition"},
+    {"6.7.5.3p4", "struct T; void f(struct T t) {}", "incomplete type for parameter 't'"},
+    {"6.7.5.3p4", "void f(void x) {}", "incomplete type for parameter 'x'"},
+    {"6.7.8p2", "int a[2] = {1, 2, 3};", "excess elements in initializer"},
+    {"6.7.8p2", "struct S { int a; } s = {1, 2};", "excess elements in initializer"},
+    {"6.7.8p2", "int i = {1, 2};", "excess elements in initializer"},
+    {"6.7.8p2", "char s[2] = \"abc\";", "initializer string is too long for its array"},
+    {"6.7.8p3", "void f(int n) { int a[n] = {1}; }",
+     "a variable length array cannot be initialized"},
+    {"6.7.8p3", "struct T; struct T t = {0};",
+     "an object with incomplete type cannot be initialized"},
+    {"6.7.8p3", "void f(void) = 0;", "cannot initialize function 'f'"},
+    {"6.7.8p4", "int g(void); int x = g();",
+     "an initializer for an object with static storage must be constant"},
+    {"6.7.8p4", "void f(int n) { static int x = n; }",
+     "an initializer for an object with static storage must be constant"},
+    {"6.7.8p5", "void f(void) { extern int x = 1; }",
+     "cannot initialize block-scope declaration with linkage 'x'"},
+    {"6.7.8p6", "int i = {[0] = 1};", "a designator cannot select from a scalar"},
+    {"6.7.8p6", "int n; int a[2] = {[n] = 1};",
+     "an array designator needs an integer constant expression"},
+    {"6.7.8p6", "int a[2] = {[2] = 1};", "an array designator is past the end of the array"},
+    {"6.7.8p6", "int a[2] = {[-1] = 1};", "an array designator cannot be negative"},
+    {"6.7.8p7", "int i = {.a = 1};", "a designator cannot select from a scalar"},
+    {"6.7.8p7", "struct S { int a; } s = {.b = 1};", "no member named 'b'"},
+    {"6.7.8p16", "int a[2] = 1;", "an array needs a brace-enclosed initializer"},
+
+    {"6.8.1p2", "void f(void) { case 1: ; }", "a case label must be inside a switch"},
+    {"6.8.1p2", "void f(void) { default: ; }", "a default label must be inside a switch"},
+    {"6.8.1p3", "void f(void) { L: ; L: ; }", "duplicate label 'L'"},
+    {"6.8.4.1p1", "struct S { int a; } s; void f(void) { if (s) ; }",
+     "the condition of 'if' needs a scalar type"},
+    {"6.8.4.2p1", "double d; void f(void) { switch (d) { } }",
+     "the controlling expression of 'switch' needs an integer type"},
+    {"6.8.4.2p2", "void f(int n) { switch (n) { int a[n]; case 1: ; } }",
+     "a switch cannot jump into the scope of an identifier with variably modified type"},
+    {"6.8.4.2p3", "int k; void f(int n) { switch (n) { case k: ; } }",
+     "a case label needs an integer constant expression"},
+    {"6.8.4.2p3", "void f(int n) { switch (n) { case 1: case 1: ; } }", "duplicate case value"},
+    {"6.8.4.2p3", "void f(char c) { switch (c) { case 1: case 257 - 256: ; } }",
+     "duplicate case value"},
+    {"6.8.4.2p3", "void f(int n) { switch (n) { default: default: ; } }",
+     "duplicate default label"},
+    {"6.8.5p2", "struct S { int a; } s; void f(void) { while (s) ; }",
+     "the condition of 'while' needs a scalar type"},
+    {"6.8.5p2", "struct S { int a; } s; void f(void) { do ; while (s); }",
+     "the condition of 'do' needs a scalar type"},
+    {"6.8.5p2", "struct S { int a; } s; void f(void) { for (; s;) ; }",
+     "the condition of 'for' needs a scalar type"},
+    {"6.8.5p3", "void f(void) { for (static int i = 0; i < 1; i++) ; }",
+     "a for loop declaration may only declare automatic objects, not 'i'"},
+    {"6.8.5p3", "void f(void) { for (typedef int T; ;) ; }",
+     "a for loop declaration may only declare automatic objects, not 'T'"},
+    {"6.8.5p3", "void f(void) { for (int g(void); ;) ; }",
+     "a for loop declaration may only declare automatic objects, not 'g'"},
+    {"6.8.6.1p1", "void f(void) { goto nowhere; }", "use of undeclared label 'nowhere'"},
+    {"6.8.6.1p1", "void f(int n) { goto in; { int a[n]; in: ; } }",
+     "a goto cannot jump into the scope of an identifier with variably modified type"},
+    {"6.8.6.2p1", "void f(void) { continue; }", "a continue statement must be inside a loop"},
+    {"6.8.6.2p1", "void f(int n) { switch (n) { case 1: continue; } }",
+     "a continue statement must be inside a loop"},
+    {"6.8.6.3p1", "void f(void) { break; }", "a break statement must be inside a loop or switch"},
+    {"6.8.6.4p1", "void f(void) { return 1; }", "a function returning void cannot return a value"},
+    {"6.8.6.4p1", "int f(void) { return; }", "a function returning a value needs a return value"},
+
+    {"6.9p2", "auto int x;", "invalid storage class at file scope for 'x'"},
+    {"6.9p2", "register int x;", "invalid storage class at file scope for 'x'"},
+    {"6.9p3", "static int x = 1; static int x = 2;", "redefinition of 'x'"},
+    {"6.9p3", "static void f(void) {} static void f(void) {}", "redefinition of 'f'"},
+    {"6.9p3", "static int g(void); int f(void) { return g(); }",
+     "static function used but never defined 'g'"},
+    {"6.9.1p2", "typedef int F(void); F f { return 0; }", "expected ';' after declaration"},
+    {"6.9.1p3", "struct T; struct T f(void) {}", "incomplete return type in the definition of 'f'"},
+    {"6.9.1p4", "typedef int f(void) { return 0; }", "expected ';' after declaration"},
+    {"6.9.1p4", "auto int f(void) { return 0; }", "invalid storage class at file scope for 'f'"},
+    {"6.9.1p5", "int f(int) { return 0; }", "a parameter in a function definition needs a name"},
+    {"6.9.1p5", "int f(int a, void) { return 0; }",
+     "a parameter in a function definition needs a name"},
+    {"6.9.1p5", "int f(void x) { return 0; }", "incomplete type for parameter 'x'"},
+    {"6.9.1p5", "int f(int a) int b; { return 0; }", "expected ';' after declaration"},
+    {"6.9.1p6", "int f(a) int b; { return 0; }",
+     "this declaration names no parameter of the function"},
+    {"6.9.1p6", "int f(a) int; { return 0; }", "declaration does not declare anything"},
+    {"6.9.1p6", "int f(a) { return 0; }", "a parameter in the identifier list is not declared"},
+    {"6.9.1p6", "int f(a) static int a; { return 0; }",
+     "only register may appear in a parameter declaration"},
+    {"6.9.1p6", "int f(a) int a = 1; { return 0; }", "a parameter cannot have an initializer"},
+
+    {"6.10p5", "#define X\f1\nint x;", "form feed or vertical tab in a preprocessing directive"},
+    {"6.10.1p1", "#if (int)1\n#endif\nint x;", "extra tokens after #if expression"},
+    {"6.10.1p1", "#if 1.0\n#endif\nint x;",
+     "floating point numbers are not supported in preprocessor expressions"},
+    {"6.10.1p1", "#if x = 1\n#endif\nint x;", "extra tokens after #if expression"},
+    {"6.10.1p1", "#if defined\n#endif\nint x;", "operator defined requires an identifier"},
+    {"6.10.3p2", "#define X 1\n#define X 2\nint x;", "macro redefined with a different definition"},
+    {"6.10.3p2", "#define X 1\n#define X() 1\nint x;",
+     "macro redefined with a different definition"},
+    {"6.10.3p2", "#define F(a) a\n#define F(b) b\nint x;",
+     "macro redefined with a different definition"},
+    {"6.10.3p3", "#define X+1\nint x;", "an object-like macro needs whitespace after its name"},
+    {"6.10.3p4", "#define F(a, b) a\nint x = F(1);", "wrong number of arguments to macro 'F'"},
+    {"6.10.3p4", "#define F(a) a\nint x = F(1, 2);", "wrong number of arguments to macro 'F'"},
+    {"6.10.3p4", "#define F(a, ...) a\nint x = F();",
+     "at least one argument is required for '...' in macro 'F'"},
+    {"6.10.3p4", "#define F(a) a\nint x = F(1", "unterminated argument list invoking macro 'F'"},
+    {"6.10.3p5", "#define X __VA_ARGS__\nint x;",
+     "__VA_ARGS__ can only appear in a variadic macro"},
+    {"6.10.3p5", "#define F(a) __VA_ARGS__\nint x;",
+     "__VA_ARGS__ can only appear in a variadic macro"},
+    {"6.10.3p5", "#define F(__VA_ARGS__) 1\nint x;",
+     "__VA_ARGS__ cannot be used as a parameter name"},
+    {"6.10.3p6", "#define F(a, a) a\nint x;", "duplicate macro parameter"},
+    {"6.10.3.2p1", "#define F(a) #b\nint x;", "'#' is not followed by a macro parameter"},
+    {"6.10.3.3p1", "#define X ## 1\nint x;",
+     "'##' cannot appear at either end of a macro replacement list"},
+    {"6.10.3.3p1", "#define X 1 ##\nint x;",
+     "'##' cannot appear at either end of a macro replacement list"},
+    {"6.10.4p3", "#line 0\nint x;", "#line requires a line number from 1 to 2147483647"},
+    {"6.10.4p3", "#line 2147483648\nint x;", "#line requires a line number from 1 to 2147483647"},
+    {"6.10.4p4", "#line 1 x\nint x;", "#line file name must be a string literal"},
+    {"6.10.8p2", "#define __LINE__ 1\nint x;", "this macro name cannot be redefined"},
+    {"6.10.8p2", "#undef __FILE__\nint x;", "this macro name cannot be undefined"},
+    {"6.10.8p2", "#define defined 1\nint x;", "this macro name cannot be redefined"},
+    {"6.10.9p1", "_Pragma(1) int x;", "_Pragma requires a string literal"},
+};
+
+TEST(ConstraintTest, EveryConstraintHasItsDiagnostic) {
+  for (const ConstraintCase &c : constraint_cases) {
+    SCOPED_TRACE(std::string(c.clause) + ": " + c.source);
+    int errors = 0;
+    std::string diagnostics = front_end_diagnostics(c.source, &errors);
+    EXPECT_GE(errors, 1) << diagnostics;
+    EXPECT_NE(diagnostics.find(std::string("error: ") + c.message), std::string::npos)
+        << diagnostics;
+  }
+}
+
+TEST(ConstraintTest, EveryValidTwinIsAccepted) {
+  const char *const valid[] = {
+      "int x = 1 + 2;",
+      "int \\u00C0b;",
+      "long long x = 9223372036854775807;",
+      "int c = '\\377';",
+      "int a[2]; int f(void) { return a[1] + 1[a]; }",
+      "void g(int); void f(void) { g(1); }",
+      "struct S { int a; } s, *p = &s; int f(void) { return s.a + p->a; }",
+      "int i; void f(void) { i++; --i; }",
+      "void f(void) { int *p = (int[2]){1, 2}; }",
+      "int i; void f(void) { int *p = &i; *p = -i + ~i + !i; }",
+      "int n = sizeof(int) + sizeof n;",
+      "int *p; void f(void) { long n = p - p; p = p + 1; p += 2; }",
+      "int x; enum { E = sizeof(x = 1) };",
+      "enum { E = 0 && (1 / 0) };",
+      "typedef int T; void f(void) { T T; }",
+      "struct S { int b : 31; unsigned : 0; };",
+      "enum { E = 2147483647 };",
+      "struct S; struct S { int a; }; struct S *p;",
+      "int *restrict r;",
+      "inline int f(void) { return 0; } extern int f(void);",
+      "void f(int n, int a[static 2], int b[const 3]); void g(int n) { int a[n]; }",
+      "void f(int a, ...);",
+      "int a[] = {[1] = 2}; struct S { int a, b; } s = {.b = 1};",
+      "void f(int n) { switch (n) { case 1: break; default: ; } for (int i = 0; i < n; i++) "
+      "continue; }",
+      "static int g(void); int n = sizeof g();",
+      "int f(a) int a; { return a; }",
+      "#define F(a, ...) a + __VA_ARGS__\nint x = F(1, 2);",
+      "#line 2147483647\nint x;",
+      "#if defined X || defined(Y)\n#endif\nint x;",
+  };
+  for (const char *source : valid) {
+    SCOPED_TRACE(source);
+    int errors = -1;
+    std::string diagnostics = front_end_diagnostics(source, &errors);
+    EXPECT_EQ(errors, 0) << diagnostics;
+  }
 }

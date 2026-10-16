@@ -2,8 +2,54 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define INDEX_BUCKETS 1024
+#define INDEX_THRESHOLD 64
+
 static symbol *find_in_list(symbol *list, const char *name) {
   for (symbol *curr = list; curr; curr = curr->next) {
+    if (strcmp(curr->name, name) == 0)
+      return curr;
+  }
+  return NULL;
+}
+
+static symbol **bucket_of(scope *s, const char *name) {
+  unsigned long hash = 5381;
+  for (const unsigned char *c = (const unsigned char *)name; *c; c++)
+    hash = hash * 33 + *c;
+  return &s->ordinary_index[hash % INDEX_BUCKETS];
+}
+
+static void build_index(scope *s) {
+  s->ordinary_index = (symbol **)calloc(INDEX_BUCKETS, sizeof(symbol *));
+  if (!s->ordinary_index)
+    return;
+  for (symbol *sym = s->ordinary_symbols; sym; sym = sym->next) {
+    symbol **end = bucket_of(s, sym->name);
+    while (*end)
+      end = &(*end)->bucket_next;
+    sym->bucket_next = NULL;
+    *end = sym;
+  }
+}
+
+static void add_ordinary(scope *s, symbol *sym) {
+  sym->next = s->ordinary_symbols;
+  s->ordinary_symbols = sym;
+  s->ordinary_count++;
+  if (s->ordinary_index) {
+    symbol **bucket = bucket_of(s, sym->name);
+    sym->bucket_next = *bucket;
+    *bucket = sym;
+  } else if (s->ordinary_count >= INDEX_THRESHOLD) {
+    build_index(s);
+  }
+}
+
+static symbol *find_ordinary(scope *s, const char *name) {
+  if (!s->ordinary_index)
+    return find_in_list(s->ordinary_symbols, name);
+  for (symbol *curr = *bucket_of(s, name); curr; curr = curr->bucket_next) {
     if (strcmp(curr->name, name) == 0)
       return curr;
   }
@@ -66,6 +112,7 @@ void symbol_table_leave_scope(symbol_table *table) {
     return;
   scope *old_scope = table->current_scope;
   table->current_scope = old_scope->parent;
+  free(old_scope->ordinary_index);
   free(old_scope);
 }
 
@@ -76,8 +123,7 @@ symbol *symbol_table_insert_ordinary(symbol_table *table, const char *name, symb
   symbol *sym = new_symbol(table, name, kind, type, loc);
   if (!sym)
     return NULL;
-  sym->next = table->current_scope->ordinary_symbols;
-  table->current_scope->ordinary_symbols = sym;
+  add_ordinary(table->current_scope, sym);
   return sym;
 }
 
@@ -115,7 +161,7 @@ symbol *symbol_table_lookup_ordinary(symbol_table *table, const char *name) {
   if (!table || !name)
     return NULL;
   for (scope *s = table->current_scope; s; s = s->parent) {
-    symbol *sym = find_in_list(s->ordinary_symbols, name);
+    symbol *sym = find_ordinary(s, name);
     if (sym)
       return sym;
   }
@@ -125,7 +171,7 @@ symbol *symbol_table_lookup_ordinary(symbol_table *table, const char *name) {
 symbol *symbol_table_lookup_ordinary_current(symbol_table *table, const char *name) {
   if (!table || !table->current_scope || !name)
     return NULL;
-  return find_in_list(table->current_scope->ordinary_symbols, name);
+  return find_ordinary(table->current_scope, name);
 }
 
 symbol *symbol_table_lookup_tag(symbol_table *table, const char *name) {

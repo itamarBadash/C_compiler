@@ -29,5 +29,6 @@ pick2 3 -4
 inf -1.#IND 1.#INF
 zero 1.#INF 1.#INF
 big 1 -1
+unit 0 2
 sizes 8 16 32
 exit 0

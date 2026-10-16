@@ -116,6 +116,7 @@ typedef struct source_loc {
   int line;
   int column;
   const char *file;
+  int system_header;
 } source_loc;
 
 typedef enum builtin_kind {
@@ -143,7 +144,27 @@ typedef enum builtin_kind {
   BUILTIN_LLABS,
   BUILTIN_TRAP,
   BUILTIN_UNREACHABLE,
-  BUILTIN_TGMATH
+  BUILTIN_TGMATH,
+  BUILTIN_SYNC_FETCH_AND_ADD,
+  BUILTIN_SYNC_FETCH_AND_SUB,
+  BUILTIN_SYNC_FETCH_AND_OR,
+  BUILTIN_SYNC_FETCH_AND_AND,
+  BUILTIN_SYNC_FETCH_AND_XOR,
+  BUILTIN_SYNC_FETCH_AND_NAND,
+  BUILTIN_SYNC_ADD_AND_FETCH,
+  BUILTIN_SYNC_SUB_AND_FETCH,
+  BUILTIN_SYNC_OR_AND_FETCH,
+  BUILTIN_SYNC_AND_AND_FETCH,
+  BUILTIN_SYNC_XOR_AND_FETCH,
+  BUILTIN_SYNC_NAND_AND_FETCH,
+  BUILTIN_SYNC_BOOL_COMPARE_AND_SWAP,
+  BUILTIN_SYNC_VAL_COMPARE_AND_SWAP,
+  BUILTIN_SYNC_LOCK_TEST_AND_SET,
+  BUILTIN_SYNC_LOCK_RELEASE,
+  BUILTIN_SYNC_SYNCHRONIZE,
+  BUILTIN_IA32_SFENCE,
+  BUILTIN_UMULH,
+  BUILTIN_MULH
 } builtin_kind;
 
 typedef enum conversion_kind {
@@ -374,6 +395,7 @@ typedef struct ast_node {
       int is_basic;
       struct ast_node **constraints;
       struct ast_node **operands;
+      char **operand_names;
       int output_count;
       int operand_count;
       struct ast_node **clobbers;
